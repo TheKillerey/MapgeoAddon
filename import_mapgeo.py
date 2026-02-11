@@ -14,6 +14,7 @@ import os
 from . import mapgeo_parser
 from . import utils
 from . import material_loader as mat_loader
+from . import baron_hash_parser
 
 
 class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
@@ -76,6 +77,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             # Import into Blender
             self.import_mapgeo(context, mapgeo)
             
+            # Update visibility based on current dragon/baron layer filters
+            from . import __init__ as addon_init
+            addon_init.update_environment_visibility(None, context)
+            
             # Set viewport clipping for large maps
             for area in context.screen.areas:
                 if area.type == 'VIEW_3D':
@@ -101,6 +106,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         collection = bpy.data.collections.new(collection_name)
         context.scene.collection.children.link(collection)
         
+        # Create a "Meshes" sub-collection to hold all actual mesh objects
+        meshes_collection = bpy.data.collections.new(f"{collection_name}_Meshes")
+        collection.children.link(meshes_collection)
+        
         # Layer names for Summoner's Rift
         layer_names = {
             mapgeo_parser.EnvironmentVisibility.LAYER_1: "Base",
@@ -110,23 +119,35 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             mapgeo_parser.EnvironmentVisibility.LAYER_5: "Cloud",
             mapgeo_parser.EnvironmentVisibility.LAYER_6: "Hextech",
             mapgeo_parser.EnvironmentVisibility.LAYER_7: "Chemtech",
-            mapgeo_parser.EnvironmentVisibility.LAYER_8: "Unused",
+            mapgeo_parser.EnvironmentVisibility.LAYER_8: "Void",
         }
         
-        # Create layer collections if grouping by layer
+        # Always create layer collections for organization
         layer_collections = {}
-        if self.merge_by_layer:
-            for layer_flag, layer_name in layer_names.items():
-                layer_col = bpy.data.collections.new(f"{collection_name}_{layer_name}")
-                collection.children.link(layer_col)
-                layer_collections[layer_flag] = layer_col
+        for layer_flag, layer_name in layer_names.items():
+            layer_col = bpy.data.collections.new(f"{collection_name}_{layer_name}")
+            collection.children.link(layer_col)
+            layer_collections[layer_flag] = layer_col
+        
+        # Create baron state collections for baron hash visibility
+        baron_state_names = {
+            0: "BaronBase",
+            1: "BaronCup",
+            2: "BaronTunnel",
+            3: "BaronUpgraded"
+        }
+        baron_collections = {}
+        for state_idx, state_name in baron_state_names.items():
+            baron_col = bpy.data.collections.new(f"{collection_name}_{state_name}")
+            collection.children.link(baron_col)
+            baron_collections[state_idx] = baron_col
         
         print(f"Importing {len(mapgeo.meshes)} meshes from {collection_name}")
         print(f"  Vertex buffers: {len(mapgeo.vertex_buffers)}")
         print(f"  Index buffers: {len(mapgeo.index_buffers)}")
         print(f"  Vertex buffer descriptions: {len(mapgeo.vertex_buffer_descriptions)}")
-        if self.merge_by_layer:
-            print(f"  Group by Layer: Enabled")
+        print(f"  Created layer collections for multi-layer support")
+        print(f"  Created baron state collections for baron hash support")
         
         # Store materials
         materials = {}
@@ -134,6 +155,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Load materials from JSON if available
         materials_db = {}
         material_loader = None
+        baron_parser = None
         settings = context.scene.mapgeo_settings
         
         if settings.materials_json_path and os.path.exists(settings.materials_json_path):
@@ -143,6 +165,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 material_loader = mat_loader.MaterialLoader(settings.assets_folder)
                 materials_db = material_loader.load_materials_from_json(settings.materials_json_path)
+                
+                # Initialize baron hash parser for visibility decoding
+                baron_parser = baron_hash_parser.MaterialsBinParser(settings.materials_json_path)
+                print(f"  Baron hash parser initialized")
             else:
                 print(f"  Warning: Assets folder not set or doesn't exist")
                 print(f"  Materials will be created without textures")
@@ -308,21 +334,26 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Create object
                 obj = bpy.data.objects.new(mesh_name, bl_mesh)
                 
-                # Link to collections based on layer grouping
-                if self.merge_by_layer and mesh_data.visibility:
-                    # Link to layer-specific collections based on visibility flags
-                    linked = False
+                # Link object to main Meshes collection (this owns the object data)
+                meshes_collection.objects.link(obj)
+                
+                # Link to layer-specific collections based on visibility flags
+                if mesh_data.visibility:
                     for layer_flag, layer_col in layer_collections.items():
                         if mesh_data.visibility & layer_flag:
                             layer_col.objects.link(obj)
-                            linked = True
-                    
-                    # If not linked to any specific layer, link to main collection
-                    if not linked:
-                        collection.objects.link(obj)
-                else:
-                    # Normal import - link to main collection
-                    collection.objects.link(obj)
+                
+                # Link to baron state collections if baron hash is decoded
+                # This provides better organization for meshes with baron visibility
+                if "baron_layers_decoded" in obj and obj["baron_layers_decoded"]:
+                    try:
+                        import ast
+                        baron_layers = ast.literal_eval(obj["baron_layers_decoded"])
+                        for baron_state_idx in baron_layers:
+                            if baron_state_idx in baron_collections:
+                                baron_collections[baron_state_idx].objects.link(obj)
+                    except Exception as e:
+                        print(f"    Warning: Could not link mesh to baron collections: {e}")
                 
                 # Apply transform
                 matrix = self.convert_transform_matrix(mesh_data.transform_matrix)
@@ -331,43 +362,58 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Apply scale
                 obj.scale *= self.scale_factor
                 
-                # Store comprehensive custom properties for mapgeo
-                # Basic mesh info
-                obj["mapgeo_mesh_index"] = mesh_idx
-                obj["mapgeo_vertex_count"] = mesh_data.vertex_count
-                obj["mapgeo_index_count"] = mesh_data.index_count
-                
-                # Vertex/Index buffer references
-                obj["mapgeo_vertex_declaration_id"] = mesh_data.vertex_declaration_id
-                obj["mapgeo_vertex_declaration_count"] = mesh_data.vertex_declaration_count
-                obj["mapgeo_vertex_buffer_ids"] = str(mesh_data.vertex_buffer_ids)  # Store as string
-                obj["mapgeo_index_buffer_id"] = mesh_data.index_buffer_id
+                # Store essential custom properties for mapgeo export
                 
                 # Visibility and quality
-                obj["mapgeo_visibility"] = int(mesh_data.visibility)
-                obj["mapgeo_quality"] = int(mesh_data.quality)
+                obj["visibility_layer"] = int(mesh_data.visibility)
+                obj["quality"] = int(mesh_data.quality)
                 
                 # Render flags
-                obj["mapgeo_is_bush"] = mesh_data.is_bush
-                obj["mapgeo_render_flags"] = mesh_data.render_flags
+                obj["is_bush"] = mesh_data.is_bush
+                obj["render_flags"] = mesh_data.render_flags
                 
-                # Version-specific fields (store uint32 as strings to avoid overflow)
+                # Version-specific fields (hex without 0x prefix)
                 if mesh_data.unknown_version18_int:
-                    obj["mapgeo_unknown_v18"] = f"0x{mesh_data.unknown_version18_int:08X}"  # Store as hex
+                    obj["render_region_hash"] = f"{mesh_data.unknown_version18_int:08X}"  # Hex without 0x
                 if mesh_data.visibility_controller_path_hash:
-                    obj["mapgeo_visibility_controller_hash"] = str(mesh_data.visibility_controller_path_hash)
-                
-                # Original transform (for round-trip export)
-                obj["mapgeo_transform"] = str(mesh_data.transform_matrix)
-                
-                # Bounding box
-                if mesh_data.bounding_box:
-                    bb = mesh_data.bounding_box
-                    obj["mapgeo_bbox_min"] = str(bb.min)
-                    obj["mapgeo_bbox_max"] = str(bb.max)
-                
-                # Material primitives info
-                obj["mapgeo_primitive_count"] = len(mesh_data.primitives)
+                    # Baron Hash System: When set (non-zero), this OVERRIDES the dragon layer system
+                    # The hash references a ChildMapVisibilityController in materials.bin
+                    # which defines complex visibility behavior combining multiple dragon layers
+                    # See baron_hash_system.md for full documentation
+                    baron_hash_str = f"{mesh_data.visibility_controller_path_hash:08X}"
+                    obj["baron_hash"] = baron_hash_str  # Hex without 0x
+                    
+                    # Decode baron hash to determine actual layer visibility
+                    if baron_parser:
+                        try:
+                            controller = baron_parser.decode_baron_hash(baron_hash_str)
+                            
+                            # Store decoded baron layers (if any)
+                            if controller.baron_layers:
+                                # Convert set to sorted list for storage
+                                baron_layers_list = sorted(list(controller.baron_layers))
+                                obj["baron_layers_decoded"] = str(baron_layers_list)
+                            
+                            # Store decoded dragon layers (if any)
+                            if controller.dragon_layers:
+                                # Convert set to sorted list for storage
+                                dragon_layers_list = sorted(list(controller.dragon_layers))
+                                obj["baron_dragon_layers_decoded"] = str(dragon_layers_list)
+                            
+                            # Store parent mode for reference
+                            obj["baron_parent_mode"] = controller.parent_mode
+                            
+                            if imported_count <= 5:
+                                print(f"    Baron Hash {baron_hash_str}:")
+                                print(f"      ParentMode: {controller.parent_mode} ({'AND - visible on all' if controller.parent_mode == 3 else 'OR - visible on any' if controller.parent_mode == 1 else 'Unknown'})")
+                                if controller.baron_layers:
+                                    baron_names = [baron_hash_parser.get_baron_layer_name(l) for l in controller.baron_layers]
+                                    print(f"      Baron Layers: {', '.join(baron_names)}")
+                                if controller.dragon_layers:
+                                    dragon_names = [baron_hash_parser.get_dragon_layer_name(l) for l in controller.dragon_layers]
+                                    print(f"      Dragon Layers: {', '.join(dragon_names)}")
+                        except Exception as e:
+                            print(f"    Warning: Could not decode baron hash {baron_hash_str}: {e}")
                 
                 imported_count += 1
                 if imported_count <= 5 or imported_count % 100 == 0:
@@ -382,13 +428,12 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         
         print(f"\n✓ Successfully imported {imported_count}/{len(mapgeo.meshes)} meshes")
         
-        # Print layer statistics if grouping by layer
-        if self.merge_by_layer:
-            print(f"\nLayer Distribution:")
-            for layer_flag, layer_col in layer_collections.items():
-                layer_name = layer_names[layer_flag]
-                mesh_count = len(layer_col.objects)
-                print(f"  {layer_name}: {mesh_count} meshes")
+        # Print layer statistics
+        print(f"\nLayer Distribution:")
+        for layer_flag, layer_col in layer_collections.items():
+            layer_name = layer_names[layer_flag]
+            mesh_count = len(layer_col.objects)
+            print(f"  {layer_name}: {mesh_count} meshes")
             
     def parse_vertex_buffer(self, vb: mapgeo_parser.VertexBuffer, vb_description: mapgeo_parser.VertexBufferDescription, mesh_data, mesh_idx: int = -1):
         """Parse vertex buffer data"""

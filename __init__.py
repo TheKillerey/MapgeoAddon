@@ -5,9 +5,9 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 """
 
 bl_info = {
-    "name": "League of Legends Mapgeo Tools",
+    "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (1, 0, 0),
+    "version": (0, 0, 6),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo",
     "description": "Import, edit and export League of Legends .mapgeo files (Riot's map format)",
@@ -38,41 +38,96 @@ from . import (
 
 # Callback function for environment visibility
 def update_environment_visibility(self, context):
-    """Update object visibility based on selected environment layer"""
-    selected_layer = self.environment_visibility
+    """Update object visibility based on selected dragon and baron layer filters (League engine logic)"""
+    dragon_filter = self.dragon_layer_filter
+    baron_filter = self.baron_layer_filter
     
-    # Map enum values to layer flags
-    layer_flags = {
-        'ALL': 0xFF,  # All layers (255)
-        'LAYER_1': 1 << 0,  # 0b00000001
-        'LAYER_2': 1 << 1,  # 0b00000010
-        'LAYER_3': 1 << 2,  # 0b00000100
-        'LAYER_4': 1 << 3,  # 0b00001000
-        'LAYER_5': 1 << 4,  # 0b00010000
-        'LAYER_6': 1 << 5,  # 0b00100000
-        'LAYER_7': 1 << 6,  # 0b01000000
-        'LAYER_8': 1 << 7,  # 0b10000000
+    # Map dragon layer enum values to layer flags
+    dragon_layer_flags = {
+        'LAYER_1': 1 << 0,  # Base
+        'LAYER_2': 1 << 1,  # Inferno
+        'LAYER_3': 1 << 2,  # Mountain
+        'LAYER_4': 1 << 3,  # Ocean
+        'LAYER_5': 1 << 4,  # Cloud
+        'LAYER_6': 1 << 5,  # Hextech
+        'LAYER_7': 1 << 6,  # Chemtech
+        'LAYER_8': 1 << 7,  # Void
     }
     
-    selected_flag = layer_flags.get(selected_layer, 0xFF)
+    # Map baron layer enum values to indices
+    baron_layer_indices = {
+        'BARON_BASE': 0,
+        'BARON_CUP': 1,
+        'BARON_TUNNEL': 2,
+        'BARON_UPGRADED': 3
+    }
+    
+    # Get current filter values
+    current_dragon_flag = dragon_layer_flags.get(dragon_filter, 1)  # Default to Base if not found
+    current_baron_idx = baron_layer_indices.get(baron_filter, 0)  # Default to Base if not found
     
     # Track how many objects were shown/hidden
     visible_count = 0
     hidden_count = 0
     
-    # Update visibility for all mesh objects with mapgeo_visibility property
+    # Update visibility for all mesh objects (League engine logic)
     for obj in context.scene.objects:
-        if obj.type == 'MESH' and "mapgeo_visibility" in obj:
-            obj_visibility = obj.get("mapgeo_visibility", 255)
+        if obj.type == 'MESH':
+            should_be_visible = False
             
-            # Check if the object's visibility includes the selected layer
-            # For 'ALL', show everything
-            # For specific layer, show if that layer bit is set in the object's visibility
-            if selected_layer == 'ALL':
-                should_be_visible = True
+            has_baron_hash = "baron_hash" in obj and obj["baron_hash"] != "00000000"
+            visibility_layer = obj.get("visibility_layer", 0)
+            
+            # STEP 1: Check dragon layer visibility
+            dragon_visible = False
+            
+            # Baron hash OVERRIDES dragon layer system when it has dragon_layers
+            if has_baron_hash and "baron_dragon_layers_decoded" in obj:
+                # Use dragon layers from baron hash (OVERRIDE mode)
+                try:
+                    import ast
+                    dragon_layers = ast.literal_eval(obj["baron_dragon_layers_decoded"])
+                    if len(dragon_layers) > 0:
+                        # Check if current dragon flag is in baron's dragon layers
+                        # Also check for base layer (bit 1) - always visible
+                        dragon_visible = (1 in dragon_layers) or (current_dragon_flag in dragon_layers)
+                    else:
+                        # Empty dragon layers - not visible on any dragon variation
+                        dragon_visible = False
+                except:
+                    # Parse error - fallback to visibility_layer
+                    if visibility_layer == 255:
+                        dragon_visible = True
+                    elif visibility_layer & 1:
+                        dragon_visible = True
+                    elif visibility_layer & current_dragon_flag:
+                        dragon_visible = True
             else:
-                # Check if the selected layer bit is set in the object's visibility flags
-                should_be_visible = bool(obj_visibility & selected_flag)
+                # No baron hash or no dragon layers in baron hash - use visibility_layer
+                if visibility_layer == 255:
+                    # AllLayers - always visible on all dragon variations
+                    dragon_visible = True
+                elif visibility_layer & 1:
+                    # Base layer (bit 0) - always visible on all dragon maps (foundation)
+                    dragon_visible = True
+                elif visibility_layer & current_dragon_flag:
+                    # Current dragon layer flag is set - visible on this dragon variation
+                    dragon_visible = True
+            
+            # STEP 2: Check baron pit state
+            baron_visible = True  # Default: visible on all baron states
+            
+            if has_baron_hash and "baron_layers_decoded" in obj:
+                # Baron hash specifies which baron pit states this mesh is visible on
+                try:
+                    import ast
+                    baron_layers = ast.literal_eval(obj["baron_layers_decoded"])
+                    baron_visible = (current_baron_idx in baron_layers)
+                except:
+                    baron_visible = True  # Parse error - default to visible
+            
+            # Final visibility: must pass BOTH dragon check AND baron check
+            should_be_visible = dragon_visible and baron_visible
             
             # Update viewport and render visibility
             obj.hide_viewport = not should_be_visible
@@ -84,37 +139,37 @@ def update_environment_visibility(self, context):
                 hidden_count += 1
     
     # Print feedback
-    if selected_layer == 'ALL':
-        print(f"Showing all layers: {visible_count} meshes visible")
-    else:
-        layer_names = {
-            'LAYER_1': 'Base',
-            'LAYER_2': 'Inferno',
-            'LAYER_3': 'Mountain',
-            'LAYER_4': 'Ocean',
-            'LAYER_5': 'Cloud',
-            'LAYER_6': 'Hextech',
-            'LAYER_7': 'Chemtech',
-            'LAYER_8': 'Unused'
-        }
-        layer_name = layer_names.get(selected_layer, selected_layer)
-        print(f"Showing {layer_name} layer: {visible_count} meshes visible, {hidden_count} meshes hidden")
+    dragon_name = {
+        'LAYER_1': 'Base',
+        'LAYER_2': 'Inferno',
+        'LAYER_3': 'Mountain',
+        'LAYER_4': 'Ocean',
+        'LAYER_5': 'Cloud',
+        'LAYER_6': 'Hextech',
+        'LAYER_7': 'Chemtech',
+        'LAYER_8': 'Void',
+    }.get(dragon_filter, 'Base')
+    
+    baron_name = {
+        'BARON_BASE': 'Base',
+        'BARON_CUP': 'Cup',
+        'BARON_TUNNEL': 'Tunnel',
+        'BARON_UPGRADED': 'Upgraded'
+    }.get(baron_filter, 'Base')
+    
+    print(f"Showing - Dragon: {dragon_name}, Baron: {baron_name} | {visible_count} visible, {hidden_count} hidden")
 
 # Property Groups for storing mapgeo data
 class MapgeoLayerItem(PropertyGroup):
     """Represents a layer in the mapgeo file"""
     name: StringProperty(name="Layer Name", default="Layer")
     visibility: BoolProperty(name="Visible", default=True)
-    quality: EnumProperty(
+    quality: IntProperty(
         name="Quality",
-        items=[
-            ('VERY_LOW', "Very Low", "Very Low Quality"),
-            ('LOW', "Low", "Low Quality"),
-            ('MEDIUM', "Medium", "Medium Quality"),
-            ('HIGH', "High", "High Quality"),
-            ('VERY_HIGH', "Very High", "Very High Quality"),
-        ],
-        default='MEDIUM'
+        description="Quality level (0-255)",
+        default=127,
+        min=0,
+        max=255
     )
 
 class MapgeoSettings(PropertyGroup):
@@ -155,7 +210,7 @@ class MapgeoSettings(PropertyGroup):
     export_version: IntProperty(
         name="Mapgeo Version",
         description="Version of mapgeo format to export",
-        default=17,
+        default=18,
         min=13,
         max=18
     )
@@ -200,22 +255,34 @@ class MapgeoSettings(PropertyGroup):
         subtype='FILE_PATH'
     )
     
-    # Visibility flags
-    environment_visibility: EnumProperty(
-        name="Environment Visibility",
-        description="Filter meshes by visibility layer",
+    # Visibility filters (League engine style)
+    dragon_layer_filter: EnumProperty(
+        name="Dragon Layer",
+        description="Current dragon/elemental variation",
         items=[
-            ('ALL', "All Layers", "Show all layers (all meshes visible)"),
-            ('LAYER_1', "Layer 1 - Base", "Show Base layer"),
-            ('LAYER_2', "Layer 2 - Inferno", "Show Inferno layer"),
-            ('LAYER_3', "Layer 3 - Mountain", "Show Mountain layer"),
-            ('LAYER_4', "Layer 4 - Ocean", "Show Ocean layer"),
-            ('LAYER_5', "Layer 5 - Cloud", "Show Cloud layer"),
-            ('LAYER_6', "Layer 6 - Hextech", "Show Hextech layer"),
-            ('LAYER_7', "Layer 7 - Chemtech", "Show Chemtech layer"),
-            ('LAYER_8', "Layer 8 - Unused", "Show Unused layer"),
+            ('LAYER_1', "Base", "Base map (default)"),
+            ('LAYER_2', "Inferno", "Inferno drake variation"),
+            ('LAYER_3', "Mountain", "Mountain drake variation"),
+            ('LAYER_4', "Ocean", "Ocean drake variation"),
+            ('LAYER_5', "Cloud", "Cloud drake variation"),
+            ('LAYER_6', "Hextech", "Hextech drake variation"),
+            ('LAYER_7', "Chemtech", "Chemtech drake variation"),
+            ('LAYER_8', "Void", "Void drake variation"),
         ],
-        default='ALL',
+        default='LAYER_1',
+        update=update_environment_visibility
+    )
+    
+    baron_layer_filter: EnumProperty(
+        name="Baron Layer",
+        description="Current baron pit state",
+        items=[
+            ('BARON_BASE', "Base", "Default baron pit"),
+            ('BARON_CUP', "Cup", "Baron Cup variation"),
+            ('BARON_TUNNEL', "Tunnel", "Baron Tunnel variation"),
+            ('BARON_UPGRADED', "Upgraded", "Baron Upgraded variation"),
+        ],
+        default='BARON_BASE',
         update=update_environment_visibility
     )
 
@@ -227,10 +294,16 @@ classes = (
     export_mapgeo.EXPORT_SCENE_OT_mapgeo,
     ui_panel.MAPGEO_OT_assign_layer,
     ui_panel.MAPGEO_OT_set_quality,
+    ui_panel.MAPGEO_OT_toggle_bush,
+    ui_panel.MAPGEO_OT_assign_bush,
+    ui_panel.MAPGEO_OT_assign_baron_hash,
+    ui_panel.MAPGEO_OT_assign_render_region_hash,
+    ui_panel.MAPGEO_OT_set_test_paths,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
     ui_panel.VIEW3D_PT_mapgeo_export_panel,
+    ui_panel.VIEW3D_PT_mapgeo_properties_panel,
 )
 
 def menu_func_import(self, context):
@@ -253,7 +326,7 @@ def register():
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
     
-    print("League of Legends Mapgeo Tools registered successfully")
+    print("Rey's Mapgeo Blender Addon registered successfully")
 
 def unregister():
     """Unregister all addon classes and handlers"""
@@ -268,7 +341,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     
-    print("League of Legends Mapgeo Tools unregistered")
+    print("Rey's Mapgeo Blender Addon unregistered")
 
 if __name__ == "__main__":
     register()

@@ -6,8 +6,8 @@
 
 A comprehensive Blender addon for importing and working with League of Legends `.mapgeo` files (Riot Games' map environment format).
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
-![Status](https://img.shields.io/badge/status-stable-green)
+![Version](https://img.shields.io/badge/version-0.0.6-blue)
+![Status](https://img.shields.io/badge/status-beta-yellow)
 
 ## ✨ Features
 
@@ -32,10 +32,17 @@ A comprehensive Blender addon for importing and working with League of Legends `
 - **Custom properties**: Stores all metadata for potential export functionality
 - **Bush flag support**: Toggle and edit bush render flags via UI panel
 
+### 🎮 Baron Hash Visibility System
+- **Baron pit state filtering**: Filter by baron pit states (Base, Cup, Tunnel, Upgraded)
+- **Dragon layer override**: Baron hash meshes use decoded dragon layers instead of visibility_layer
+- **Automatic decoding**: Parses materials.bin.json to decode ChildMapVisibilityController structures
+- **Complex visibility logic**: Supports AND/OR parent modes for multi-layer visibility
+- **Test paths button**: Quick setup for Map11 assets and materials paths
+
 ### 🖥️ User Interface
-- **3D View Properties Panel**: View and edit mesh properties (visibility, quality, bush flag)
+- **3D View Properties Panel**: View and edit mesh properties (visibility, quality, bush flag, baron hash)
 - **Import operator**: Located in `File > Import > League of Legends Mapgeo (.mapgeo)`
-- **Layer visibility dropdown**: Real-time filtering with environment presets
+- **Split layer filters**: Separate dragon layer and baron pit state dropdowns
 - **Material settings**: Configure assets folder and materials database path
 
 ## 📋 Requirements
@@ -242,7 +249,23 @@ Based on and compatible with:
 
 ## 📝 Changelog
 
-### Version 1.0.0 (2026-02-11)
+### Version 0.0.6 (2026-02-11) - Current
+- 🐛 Fixed baron hash visibility logic (override behavior)
+- 🐛 Fixed import error with update_environment_visibility
+- ✅ Baron hash dragon layers now properly override visibility_layer
+- ✅ Split dragon/baron filter system working correctly
+
+### Version 0.0.5 (2026-02-11)
+- ✅ Baron state viewport filtering (4 states)
+- ✅ Baron state collections
+- ✅ Split dragon/baron layer filters UI
+
+### Version 0.0.4 (2026-02-11)
+- ✅ Baron hash decoding system
+- ✅ materials.bin.json parser
+- ✅ Automatic visibility controller resolution
+
+### Version 0.0.3 (2026-02-11)
 - ✅ Full mapgeo import for versions 13-18 (focused on v18)
 - ✅ Multi-vertex buffer support with correct description indexing
 - ✅ Complete material loading system with JSON parsing
