@@ -7,6 +7,256 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.0] - 2026-02-13
+
+### 🎉 **Stable Release - Full Export Support**
+
+This release marks the first stable version with complete round-trip import/export functionality for League of Legends `.mapgeo` files.
+
+### ✨ Features Added
+
+#### Complete Export System
+- **Full Export Operator** - Export edited maps back to `.mapgeo` format with all data preserved
+  - Located in `File > Export > League of Legends Mapgeo (.mapgeo)`
+  - Supports versions 13-18 (focus on v18)
+  - Collection-based export filtering to avoid exporting bucket grid visualization meshes
+  - Apply modifiers and triangulation options
+  
+#### Sampler Definitions Support
+- **Sampler Def Round-trip** - Shader sampler definitions now cached and restored on export
+  - Cached during import: `BAKED_DIFFUSE_TEXTURE`, `BAKED_DIFFUSE_TEXTURE_ALPHA`
+  - Automatically restored during export for correct shader binding
+  - Fallback to default samplers if cache unavailable
+  
+#### Vertex Buffer Optimization
+- **Smart VB Deduplication** - Reduces file size by sharing identical vertex buffer descriptions
+  - Original: 748 per-mesh descriptions → Export: 2 shared descriptions
+  - Saves ~95 KB per typical map
+  - Each mesh's `vertex_declaration_id` correctly remapped to shared description
+
+#### Bush Animation Support (TEXCOORD5)
+- **Bush Sway Preservation** - Full support for animated bush meshes
+  - TEXCOORD5 (3 floats XYZ) stores world-space animation anchor positions
+  - Blender stores as `FLOAT_VECTOR` attribute "TEXCOORD5" on mesh
+  - Export applies Y↔Z coordinate swap for League format
+  - PRIMARY_COLOR (BGRA8) contains animation weights (0=base, 255=tip)
+  
+#### Transform Matrix Preservation
+- **Non-Identity Transforms** - Meshes with transforms now export correctly
+  - Vertices stored in LOCAL space (matching vertex buffer data)
+  - Transform matrix stored separately and converted between coordinate systems
+  - 27 bush meshes with animated transforms now work in-game
+  
+#### Bounding Box Fixes
+- **Local-Space Bounding Boxes** - Critical fix for render region visibility
+  - Previous: World-space bbox (broke all 12 render region meshes)
+  - Fixed: Local-space bbox computed from vertex positions
+  - Matches C# reference: `Box.FromVertices(vertexBufferView...)`
+  - All 12 render region meshes now match original exactly
+
+#### Render Region Support (Version 18)
+- **Render Region Hash Export** - Version 18 `unknown_version18_int` field now preserved
+  - Stored as custom property `render_region_hash` during import
+  - Exported correctly in write order (after visibility flags, before primitives)
+  - All 12 render region meshes verified working in-game
+
+#### Baron Hash Support (Version 15+)
+- **Visibility Controller Export** - Baron pit visibility system fully preserved
+  - `visibility_controller_path_hash` cached and exported
+  - Custom property `baron_hash` round-tripped
+  - Complex visibility logic maintained
+
+#### Metadata Preservation
+- **All Custom Properties** - Every field from import is preserved for export:
+  - `layer_transition_behavior` (0=Unaffected, 1=TurnInvisible, 2=TurnVisible)
+  - `render_flags` (16-bit flags for decals, eye candy, distortion, etc.)
+  - `disable_backface_culling` (boolean flag)
+  - `quality` (environment quality level 0-4)
+  - `visibility_layer` (8-bit layer mask)
+  - `baked_paint_scale/bias` (UV transform for baked paint)
+  - `texture_overrides` (per-mesh texture remapping)
+  
+#### Bucket Grid Preservation
+- **Spatial Partitioning** - Bucket grids cached and exported
+  - All 27 bucket grids verified matching original
+  - Geometry data, face visibility flags, stickout distances preserved
+  - Path hashes correctly map to render region hashes
+
+### 🔧 Improved
+
+- **Coordinate System Handling** - Consistent Y↔Z swap on both import and export
+  - Vertices: Blender(X, Y, Z) ↔ Mapgeo(X, Z, Y)
+  - Transforms: Proper matrix conversion with coordinate system change
+  - Normals: Same coordinate swap as vertices
+  
+- **Vertex Element Formats** - Correct format usage for all vertex data
+  - POSITION: XYZ_FLOAT32 (12 bytes)
+  - NORMAL: XYZ_FLOAT32 (12 bytes)
+  - PRIMARY_COLOR: BGRA_PACKED8888 (4 bytes) - League native format
+  - TEXCOORD0: XY_FLOAT32 (8 bytes) - Primary UV with V-flip
+  - TEXCOORD5: XYZ_FLOAT32 (12 bytes) - Bush animation anchors
+  
+- **UI Enhancements**
+  - Version number now displayed in Properties Panel (v0.1.0)
+  - Export operator integrated into File > Export menu
+  
+### 🐛 Bug Fixes
+
+- **Bounding Box Calculation** - Fixed world-space vs local-space bug
+  - Was computing bbox from `obj.matrix_world @ v.co` (world space)
+  - Now computes from `v.co` (local space, matching vertex buffer)
+  - Critical for render regions - meshes are culled based on bbox + transform
+  
+- **Sampler Definitions** - Fixed missing samplers causing crashes
+  - Was writing count=0, causing binary format mismatch at offset 8
+  - Now writes count=2 with proper index and name for each sampler
+  
+- **Vertex Declaration ID** - Fixed per-mesh duplication causing file bloat
+  - Was creating 748 unique descriptions with `vertex_declaration_id = vertex_buffer_id`
+  - Now creates 2 shared descriptions and remaps IDs correctly
+  
+### 🧹 Code Cleanup
+
+- **Debug Print Removal** - Removed all `DEBUG:` print statements for production
+- **Test File Exclusion** - Added `.gitignore` patterns for test/debug scripts
+  - All files starting with `_` (except `__init__.py`) excluded from releases
+  - Update script now skips test files automatically
+  
+### 📝 Documentation
+
+- **README Updates** - Comprehensive export documentation added
+  - Export feature list with all preserved fields
+  - Usage guide for export operator
+  - Technical details about coordinate systems and formats
+  
+- **Status Update** - Badge changed from "beta" to "stable"
+- **Version Badge** - Updated to v0.1.0
+
+### ⚠️ Known Limitations
+
+- Original files have 10 VB descriptions (including instanced/secondary buffers), export creates 2
+  - Difference: ~5.1 MB due to always exporting POSITION+NORMAL+TEXCOORD0
+  - Does not affect functionality - game ignores extra vertex data
+  - Some original meshes have POSITION-only or POSITION+NORMAL-only (no UVs)
+  
+### 🎮 Tested On
+
+- **Test Map**: `sodapop_srs_original.mapgeo` (Map11 - Summoner's Rift)
+- **Mesh Count**: 748 meshes all matching
+- **Bucket Grids**: 27 grids all matching
+- **Render Regions**: 12 meshes with v18 hash all working
+- **Bush Animations**: 98/99 meshes with TEXCOORD5 preserved
+- **File Size**: Original 95.7 MB → Export 100.9 MB (+5.2 MB from VB format difference)
+
+---
+
+## [0.0.9] - 2026-02-12
+
+### ✨ Features Added
+
+#### Lightmap Support
+- **Baked Lightmap Textures** - Meshes now load per-mesh lightmap textures from the mapgeo BakedLight channel
+  - Reads lightmap texture path, UV scale, and bias per mesh from .mapgeo file
+  - Applies scale+bias transform to TEXCOORD7 (lightmap UV) for correct atlas sampling
+  - Creates dedicated "LightmapUV" UV layer in Blender
+- **Lightmap Shader Nodes** - Materials with baked lighting get proper lightmap shader setup
+  - Diffuse Texture × Lightmap × lightMapColorScale → Base Color
+  - Lightmap set to Non-Color data for correct intensity
+  - Materials with `NO_BAKED_LIGHTING` shader macro correctly skip lightmap
+  - Each mesh gets a unique material instance when it has a different lightmap region
+- **Map Settings Parsing** - Reads MapSunProperties and MapBakeProperties from materials file
+  - `lightMapColorScale` - Global lightmap intensity multiplier
+  - `sunColor`, `sunDirection`, `skyLightColor`, etc. parsed for future use
+  - `MapBakeProperties` - Light grid and bake settings extracted
+  - Supports both .json and .py materials formats
+- **Import Lightmaps Toggle** - New import option to enable/disable lightmap loading
+  - Available in Import Settings panel and import operator options
+  - Lightmaps are enabled by default
+- **Lightmap Custom Properties** - Per-mesh lightmap data stored as custom properties
+  - `lightmap_texture`: Path to BakedLight texture
+  - `lightmap_scale`/`lightmap_bias`: UV transform values
+  - `stationary_light_texture`/scale/bias: StationaryLight channel data
+
+### 🔧 Improved
+- **Mapgeo Parser** - Now reads and stores BakedLight/StationaryLight channels instead of skipping them
+  - New `LightChannel` dataclass for texture path + scale + bias
+  - Write path also exports light channel data for round-trip fidelity
+- **Texture Node System** - Refactored to create texture nodes with explicit UV map selection
+  - `_load_texture_node()` creates TexImage + UVMap node pair
+  - Diffuse uses "UVMap", lightmap uses "LightmapUV"
+- **Material Roughness** - Set to 1.0 for League's diffuse-dominant shading style
+
+---
+
+## [0.0.8] - 2026-02-12
+
+### 🐛 Fixed
+
+#### ParentMode Visibility Logic Correction
+- **Corrected ParentMode Interpretation** - Fixed baron hash visibility system to properly handle ParentMode values
+  - **ParentMode = 1 (Visible)**: Mesh is visible on the referenced layers (normal mode)
+  - **ParentMode = 3 (Not Visible)**: Mesh is NOT visible on the referenced layers, but visible on all other layers (inverted mode)
+- **Updated Visibility Filtering** - Applied ParentMode logic to both dragon layers and baron pit states
+  - Dragon layer filtering now respects ParentMode (visible/not visible)
+  - Baron pit state filtering now respects ParentMode (visible/not visible)
+  - Meshes with ParentMode=3 are now correctly hidden on referenced layers and shown on unreferenced layers
+- **Documentation Updates** - Updated all references to ParentMode throughout codebase
+  - baron_hash_system.md now correctly explains Visible vs Not Visible modes
+  - UI panel shows "Visible" or "Not Visible" instead of "AND" or "OR"
+  - Example meshes now properly demonstrate the visibility behavior
+
+### ✨ Features Added
+
+#### Enhanced Texture Format Support
+- **Multiple Extension Fallback** - Texture loading now supports flexible file format resolution
+  - **Primary path**: .tex → .dds → .png (converts if needed)
+  - **Secondary path**: .dds → .png (skips .tex when not available)
+  - Automatically tries alternative extensions: .tex, .dds, .png in order
+  - Helps with different asset extraction workflows and tools
+- **DDS to PNG Conversion** - Added direct DDS to PNG conversion capability
+  - Converts .dds files to .png when PIL/Pillow is available
+  - Caches conversions to avoid redundant processing
+  - Falls back to loading DDS directly if conversion fails
+- **Improved Texture Resolution** - Enhanced `resolve_texture_path()` to try multiple extensions
+  - Checks exact path first
+  - Falls back to .tex, .dds, .png alternatives
+  - Works with materials that reference any supported texture format
+
+### 🔄 Changed
+- **UI Display** - "Parent Mode" now shows "Visible" or "Not Visible" instead of "AND (visible on ALL)" or "OR (visible on ANY)"
+- **Debug Output** - Import console messages updated to reflect new ParentMode interpretation
+- **Texture Loading** - Refactored texture loading to handle different file extensions more intelligently
+
+---
+
+## [0.0.7] - 2026-02-12
+
+### ✨ Features Added
+
+#### Python Materials Format Support
+- **".py" Materials Files** - Added full support for `.materials.py` files in addition to `.materials.bin.json`
+  - Most League modding tools export to `.py` format
+  - Automatically detects format based on file extension
+  - Converts `.py` format to internal format compatible with existing parser
+  - No user configuration needed - just select either `.json` or `.py` file
+- **Improved Baron Hash Parser** - Enhanced to handle both file formats
+  - `.py` format: `0x8e6a128e = 0xc406a533 { ... }`
+  - `.json` format: `"{8e6a128e}": { "__type": "{c406a533}", ... }`
+  - Properly handles nested braces in Parents lists
+  - Converts property names between formats automatically
+
+### 🔄 Changed
+- **UI Label** - "Materials JSON" renamed to "Materials (.json/.py)" to reflect both supported formats
+- **Help Text** - Added info box showing supported formats (.json and .py)
+- **Property Description** - Updated to mention both file formats
+
+### 📝 Notes
+- `.py` files are typically larger but more human-readable than `.json`
+- Both formats provide identical baron hash decoding results
+- Parser loads 4300+ visibility controllers from typical Map11 materials files
+
+---
+
 ## [0.0.6] - 2026-02-11
 
 ### 🐛 Critical Fixes

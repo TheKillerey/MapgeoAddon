@@ -6,8 +6,8 @@
 
 A comprehensive Blender addon for importing and working with League of Legends `.mapgeo` files (Riot Games' map environment format).
 
-![Version](https://img.shields.io/badge/version-0.0.6-blue)
-![Status](https://img.shields.io/badge/status-beta-yellow)
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Status](https://img.shields.io/badge/status-stable-green)
 
 ## ✨ Features
 
@@ -24,19 +24,39 @@ A comprehensive Blender addon for importing and working with League of Legends `
   - Bush render flags
   - Quality levels
 
+### 📤 Full Export System
+- **Round-trip editing**: Import → Edit → Export with full data preservation
+- **Sampler definitions**: Automatic restoration of shader samplers (BAKED_DIFFUSE_TEXTURE, etc.)
+- **Vertex buffer optimization**: Intelligent deduplication of vertex buffer descriptions
+- **Local-space bounding boxes**: Correct bounding box calculation for render regions
+- **Bush animations**: Full support for TEXCOORD5 (animation anchors) and vertex colors
+- **Transform matrices**: Preserves mesh transforms for animated objects
+- **Bucket grids**: Preserves spatial partitioning data for culling
+- **All metadata preserved**:
+  - Render region hashes (v18)
+  - Baron visibility controller hashes (v15+)
+  - Layer transition behavior
+  - Render flags and backface culling
+  - Lightmap UV channels with scale/bias
+  - Texture overrides
+
 ### 🎯 Advanced Features
 - **Environment visibility filtering**: Filter meshes by layer with dropdown selection
 - **Layer-based grouping**: Organize imported meshes into layer collections
 - **Material auto-loading**: Automatically finds and converts textures from game files
 - **Multi-material meshes**: Proper material slot assignment for complex meshes
-- **Custom properties**: Stores all metadata for potential export functionality
+- **Custom properties**: Full metadata storage for lossless export
 - **Bush flag support**: Toggle and edit bush render flags via UI panel
-
+### 🎨 Advanced Material System
+- **Dual format support**: Works with both `.materials.bin.json` and `.materials.py` files
+- **Automatic format detection**: Just select the file, format is detected automatically
+- **Baron hash decoding**: Parses visibility controllers from materials files
+- **Common format**: Most League modding tools (Obsidian, Ritobin) export to `.py` format
 ### 🎮 Baron Hash Visibility System
 - **Baron pit state filtering**: Filter by baron pit states (Base, Cup, Tunnel, Upgraded)
 - **Dragon layer override**: Baron hash meshes use decoded dragon layers instead of visibility_layer
 - **Automatic decoding**: Parses materials.bin.json to decode ChildMapVisibilityController structures
-- **Complex visibility logic**: Supports AND/OR parent modes for multi-layer visibility
+- **Complex visibility logic**: Supports Visible/Not Visible parent modes for layer-specific visibility control
 - **Test paths button**: Quick setup for Map11 assets and materials paths
 
 ### 🖥️ User Interface
@@ -158,6 +178,32 @@ After import, select any mesh and check the **Properties Panel** (`N` key) under
 
 Select one or more meshes and click **"Toggle Bush Flag"** to enable/disable bush rendering.
 
+### Exporting Mapgeo Files
+
+After editing your map in Blender, you can export it back to `.mapgeo` format:
+
+1. **Open export dialog**:
+   - Go to `File > Export > League of Legends Mapgeo (.mapgeo)`
+
+2. **Configure export options**:
+
+   | Option | Description |
+   |--------|-------------|
+   | **Export Version** | Mapgeo format version (default: 18 for current League) |
+   | **Export Selected Only** | Export only selected meshes (deselect to export all) |
+   | **Apply Modifiers** | Apply Blender modifiers before export |
+   | **Triangulate** | Automatically triangulate faces |
+   | **Bucket Grid Mode** | ORIGINAL: Use imported bucket grids (recommended) |
+
+3. **Click "Export Mapgeo"**
+
+**Important notes**:
+- Vertices are automatically converted from Blender space (X, Y, Z) to League space (X, Z, Y)
+- Bounding boxes are computed in local space (matching vertex buffer data)
+- Transform matrices are preserved for animated meshes (e.g., bush sway)
+- Bush meshes require TEXCOORD5 attribute (animation anchors) and vertex colors
+- All custom properties (visibility, quality, render flags, etc.) are preserved from import
+
 ## 🗂️ Project Structure
 
 ```
@@ -249,7 +295,13 @@ Based on and compatible with:
 
 ## 📝 Changelog
 
-### Version 0.0.6 (2026-02-11) - Current
+### Version 0.0.7 (2026-02-12) - Current
+- ✨ Python materials format support (.materials.py files)
+- ✨ Automatic format detection (JSON vs Python)
+- 🔄 UI updates to show both supported formats
+- ✅ Compatible with most League modding tool exports
+
+### Version 0.0.6 (2026-02-11)
 - 🐛 Fixed baron hash visibility logic (override behavior)
 - 🐛 Fixed import error with update_environment_visibility
 - ✅ Baron hash dragon layers now properly override visibility_layer

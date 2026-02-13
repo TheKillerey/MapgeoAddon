@@ -23,12 +23,14 @@ Defined in Map11.bin as `VisibilityFlagDefines` (hash: default)
 ### 2. Baron Hash System (Override)
 Used for Baron-specific map variations. Controlled by the `baron_hash` property.
 
-Defined in Map11.bin as hash `0xd31ac6ce` with 4 states:
+Defined in Map11.bin as hash `0xd31ac6ce` with bit-based states (stored in `0x8bff8cdf` property):
 
-- **Base** (Bit 0): Default state
-- **Cup** (Bit 1): Cup variation
-- **Tunnel** (Bit 2): Tunnel variation
-- **Upgraded** (Bit 3): Upgraded variation
+- **Base** (Bit value 1): Default state
+- **Cup** (Bit value 2): Cup variation
+- **Tunnel** (Bit value 4): Tunnel variation
+- **Upgraded** (Bit value 8): Upgraded variation
+
+**Note**: Custom maps may have different baron states with different bit values. The system supports any combination of baron states defined in the materials file.
 
 ## How It Works
 
@@ -57,15 +59,27 @@ Defined in Map11.bin as hash `0xd31ac6ce` with 4 states:
 ```python
 # STEP 1: Dragon visibility
 if has_baron_hash and has_baron_dragon_layers:
-    # OVERRIDE: Use baron dragon layers
-    dragon_visible = (current_dragon in baron_dragon_layers)
+    # OVERRIDE: Use baron dragon layers with ParentMode
+    is_in_list = (current_dragon in baron_dragon_layers) or (base in baron_dragon_layers)
+    if parent_mode == 3:  # Not Visible mode
+        dragon_visible = not is_in_list  # Visible when NOT in list
+    else:  # Visible mode (default)
+        dragon_visible = is_in_list  # Visible when in list
 else:
     # STANDARD: Use visibility_layer
-    dragon_visible = (visibility_layer & current_dragon_flag)
+    # visibility_layer == 0 means no dragon restriction (always visible)
+    if visibility_layer == 0 or visibility_layer == 255:
+        dragon_visible = True
+    else:
+        dragon_visible = (visibility_layer & current_dragon_flag)
 
-# STEP 2: Baron pit visibility
+# STEP 2: Baron pit visibility (ParentMode also applies here)
 if has_baron_hash and has_baron_layers:
-    baron_visible = (current_baron_state in baron_layers)
+    is_in_list = (current_baron_state in baron_layers)
+    if parent_mode == 3:  # Not Visible mode
+        baron_visible = not is_in_list  # Visible when NOT in list
+    else:  # Visible mode (default)
+        baron_visible = is_in_list  # Visible when in list
 else:
     baron_visible = True  # Visible on all baron states
 
@@ -126,14 +140,14 @@ Baron hash controllers are defined in materials.bin with several types:
 
 ## ParentMode Values
 
-- **1**: OR mode - visible if ANY parent is active
-- **3**: AND mode - visible only if ALL parents are active (common for complex combinations)
+- **1**: Visible mode - visible on this layer
+- **3**: Not Visible mode - not visible on this layer (but visible on any other layers)
 
 ## Example: Baron Hash 5E652742
 
-This hash references parents for all 6 dragon layers with ParentMode=3 (AND):
-- Requires ALL elemental variations (Inferno, Mountain, Ocean, Cloud, Hextech, Chemtech) to be active
-- Used for meshes that appear in all elemental states when Baron system is active
+This hash references parents for all 6 dragon layers with ParentMode=3 (Not Visible):
+- Mesh is NOT visible on these specific dragon layers
+- Used for meshes that should be hidden in elemental states (visible on other layers only)
 
 ## In Blender Addon
 
@@ -141,7 +155,7 @@ This hash references parents for all 6 dragon layers with ParentMode=3 (AND):
 - **Properties Panel**: Shows baron hash status with decoded layers
 - **Baron Pit Layers**: Displays which baron pit states the mesh is visible on (Base, Cup, Tunnel, Upgraded)
 - **Referenced Dragon Layers**: Shows dragon layers from baron hash (OVERRIDES visibility_layer when present)
-- **Parent Mode**: Displays whether visibility uses AND (all) or OR (any) logic
+- **Parent Mode**: Displays whether mesh is Visible (1) or Not Visible (3) on referenced layers
 - **Baron Hash Assignment**: Can assign custom baron hash values (8 hex characters)
 - **Layer Collections**: Meshes organized into both dragon layer and baron state collections
 - **Automatic Decoding**: When materials.bin.json is loaded during import, baron hashes are automatically decoded
@@ -157,18 +171,25 @@ This hash references parents for all 6 dragon layers with ParentMode=3 (AND):
    - Check if it's a dragon layer controller (`__type`: `"{c406a533}"` with `"{27639032}"` property)
    - Check if it's a baron layer controller (`__type`: `"{ec733fe2}"` with `"{8bff8cdf}"` property)
    - If it's another child controller, recursively resolve its parents
-6. **Apply ParentMode** - Combine parent visibility using AND or OR logic
+6. **Apply ParentMode** - Apply visibility mode (1=Visible, 3=Not Visible) for referenced layers
 7. **Store Results** - Save decoded layers and parent mode as custom properties
 
 **Note**: JSON format uses curly braces around hash values: `"{5e652742}"` instead of `0x5e652742`
 
-## visibility_layer`: Standard dragon layer bitfield (0-255) - IGNORED if baron hash has dragon_layers
+## Custom Properties
+
+- `visibility_layer`: Standard dragon layer bitfield (0-255) - IGNORED if baron hash has dragon_layers
 - `baron_hash`: The raw hash value (e.g., "5E652742")
-- `baron_parent_mode`: The parent mode (1=OR, 3=AND)
-- `baron_layers_decoded`: List of baron pit layer indices (e.g., "[0, 1, 2, 3]")
+- `baron_parent_mode`: The parent mode (1=Visible, 3=Not Visible)
+- `baron_layers_decoded`: List of baron pit layer bit values (e.g., "[1, 2, 4, 8]") - uses actual bit values from 0x8bff8cdf property
 - `baron_dragon_layers_decoded`: List of dragon layer bits (e.g., "[2, 4, 8, 16, 32, 64]") - OVERRIDES visibility_layer when present
 
 ## Version History
+
+### v0.0.9 (2026-02-13)
+- **Fixed**: Baron layer system now uses bit values (1, 2, 4, 8) instead of hardcoded indices (0-3)
+- Supports custom baron variations in different maps (not just Base/Cup/Tunnel/Upgraded)
+- Baron collections keyed by bit values
 
 ### v0.0.6 (2026-02-11)
 - **Fixed**: Baron hash visibility logic corrected

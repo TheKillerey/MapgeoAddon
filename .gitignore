@@ -43,6 +43,10 @@ desktop.ini
 test_output/
 temp/
 
+# Test and debug scripts
+_*.py
+!__init__.py
+
 # Keep test data folders
 !LeagueTestMap/
 !LeagueToolkit/

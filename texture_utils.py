@@ -86,6 +86,54 @@ class TexConverter:
             print(f"  Error converting {os.path.basename(tex_path)}: {e}")
             return None
     
+    def convert_dds_to_png(self, dds_path: str, output_path: str = None) -> Optional[str]:
+        """
+        Convert a .dds file to .png
+        
+        Args:
+            dds_path: Path to .dds file
+            output_path: Optional output path for .png (defaults to same location)
+        
+        Returns:
+            Path to converted .png file, or None if conversion failed
+        """
+        if not PIL_AVAILABLE:
+            print("  Warning: PIL not available, skipping DDS conversion")
+            return None
+        
+        if not os.path.exists(dds_path):
+            print(f"  Warning: DDS file not found: {dds_path}")
+            return None
+        
+        # Use cache if already converted
+        if dds_path in self.cache:
+            return self.cache[dds_path]
+        
+        # Determine output path
+        if output_path is None:
+            output_path = os.path.splitext(dds_path)[0] + ".png"
+        
+        # Skip if already converted
+        if os.path.exists(output_path):
+            self.cache[dds_path] = output_path
+            return output_path
+        
+        try:
+            # Load DDS and convert to PNG using PIL
+            img = Image.open(dds_path)
+            
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Save as PNG
+            img.save(output_path, 'PNG')
+            self.cache[dds_path] = output_path
+            return output_path
+        
+        except Exception as e:
+            print(f"  Error converting {os.path.basename(dds_path)}: {e}")
+            return None
+    
     @staticmethod
     def tex_to_dds(data: bytes) -> bytes:
         """
@@ -184,7 +232,8 @@ class TexConverter:
 
 def resolve_texture_path(texture_path: str, assets_folder: str) -> Optional[str]:
     """
-    Resolve a texture path from the materials file
+    Resolve a texture path from the materials file.
+    Tries multiple extensions in order: .tex -> .dds -> .png
     
     Args:
         texture_path: Path from materials file (e.g., "ASSETS/Maps/.../texture.tex")
@@ -205,7 +254,17 @@ def resolve_texture_path(texture_path: str, assets_folder: str) -> Optional[str]
     # Join with assets folder
     full_path = os.path.join(assets_folder, texture_path)
     
+    # Try exact path first
     if os.path.exists(full_path):
         return full_path
+    
+    # Try alternative extensions in order: .tex -> .dds -> .png
+    base_path = os.path.splitext(full_path)[0]
+    extensions = ['.tex', '.dds', '.png']
+    
+    for ext in extensions:
+        test_path = base_path + ext
+        if os.path.exists(test_path):
+            return test_path
     
     return None

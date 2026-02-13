@@ -25,7 +25,8 @@ def main():
     
     # Copy Python files
     for item in os.listdir(source):
-        if item in exclude or item.endswith('.md'):
+        # Skip excluded items, markdown files, and test/debug scripts (starting with _)
+        if item in exclude or item.endswith('.md') or (item.startswith('_') and item != '__init__.py'):
             continue
             
         source_path = os.path.join(source, item)
