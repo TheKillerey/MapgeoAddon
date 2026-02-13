@@ -61,16 +61,16 @@ Open `.mapgeo` files from League in Blender:
 
 ## 🌟 Key Features Explained
 
-### Dragon Elemental States
+### Dragon Elemental States (Summoners Rift only and a few TFT maps)
 League's map changes based on which dragon spawns. Each element has different props:
-- **Base** - Default map
-- **Infernal** (Red) - Fire and lava themed
-- **Mountain** (Gray) - Rocks and stone
-- **Ocean** (Blue) - Water and coral
-- **Cloud** (White) - Sky and wind
-- **Hextech** (Cyan) - Technology themed
-- **Chemtech** (Green) - Toxic/industrial themed  
-- **Void** (Purple) - Cosmic void themed
+- **Base** - Layer 1
+- **Infernal**  - Layer 2
+- **Mountain** - Layer 3
+- **Ocean** - Layer 4
+- **Cloud** - Layer 5
+- **Hextech** - Layer 6
+- **Chemtech** - Layer 7
+- **Void** - Layer 8 (Not used)
 
 **The addon lets you:**
 - View each dragon state separately
@@ -80,7 +80,7 @@ League's map changes based on which dragon spawns. Each element has different pr
 ### Baron Pit Transformations
 The baron pit changes appearance when captured:
 - **Base** - Normal pit before any baron kills
-- **Cup** - After first baron is killed
+- **Cup** - Cup passage state
 - **Tunnel** - Underground passage state
 - **Upgraded** - Enhanced pit state
 
@@ -114,51 +114,24 @@ Each mesh has a quality tag. You can:
 
 ### Importing a Map
 
-1. **Get the map file**
-   - Extract `.mapgeo` files from League using tools like Obsidian
-   - Common location: `Map11.mapgeo` (Summoner's Rift)
+1. **Configure import** (optional)
+   - **Assets Folder**: Path to textures (if you want them to load)
+   - **Materials File**: `.materials.bin.json` / `.materials.py` (recommended) for full materials
+   - **Levels Folder**: Path to get grass tint maps (if you want them to load)
+   - **Map*.py File**: Check this to get grass tint maps working in viewport
 
-2. **Open in Blender**
+2. **Get the map file**
+   - Extract `.mapgeo` files from League using tools like Obsidian
+   - Common location: `Map11.wad\data\maps\mapgeometry\map11\base_srx.mapgeo` (Summoner's Rift)
+
+3. **Open in Blender**
    - `File` → `Import` → `League of Legends Mapgeo (.mapgeo)`
    - Select your `.mapgeo` file
-
-3. **Configure import** (optional)
-   - **Assets Folder**: Path to textures (if you want them to load)
-   - **Materials File**: `.materials.bin.json` for full materials
-   - **Dragon Layer**: Choose which dragon state to view
-   - **Baron State**: Choose which baron state to view
-   - **Load Materials**: Check this to get textures
 
 4. **Click Import**
 
 The map will load! It might take a minute for large maps like Summoner's Rift (748 objects).
 
-### Editing the Map
-
-After import, you can use normal Blender tools:
-
-**Move objects:**
-- Select object → Press `G` → Move mouse → Click to place
-
-**Rotate objects:**
-- Select object → Press `R` → Move mouse → Click
-
-**Scale objects:**
-- Select object → Press `S` → Move mouse → Click
-
-**Delete objects:**
-- Select object → Press `X` → Confirm delete
-
-**Add your own models:**
-- `File` → `Import` → Choose format (FBX, OBJ, etc.)
-
-### Viewing Mesh Properties
-
-Select any object and press `N` to open the sidebar:
-- **Layer panel** shows which dragon states it appears in
-- **Quality** shows which graphics settings use it
-- **Bush Flag** shows if it's a wind-animated bush
-- **Baron Hash** shows if it's baron-pit controlled
 
 ### Exporting Your Changes
 
@@ -296,73 +269,6 @@ Everything:
 
 ---
 
-## 🎯 Example Workflows
-
-### Workflow 1: Remove Decorations
-Goal: Make a cleaner version of Summoner's Rift
-
-1. Import `Map11.mapgeo`
-2. Set Dragon Layer to "Base"
-3. Select decorative objects (flags, crystals, etc.)
-4. Delete them (press X)
-5. Export as `Map11_clean.mapgeo`
-6. Replace original in League folder
-
-### Workflow 2: Add Custom Trees
-Goal: Add your own 3D tree models
-
-1. Import `Map11.mapgeo`
-2. Import your tree model (File → Import → FBX/OBJ)
-3. Scale and position your tree
-4. In Properties panel:
-   - Set Visibility Layer to 1 (base map)
-   - Set Quality to "AllQualities"
-5. Select both original map and your tree
-6. Export (your tree will be included)
-
-### Workflow 3: Study Dragon Variants
-Goal: See all dragon states side-by-side
-
-1. Import map 8 times (once per dragon state)
-2. Set each import to a different dragon layer
-3. Arrange them in a row in Blender
-4. Study the differences
-5. Take screenshots or renders
-
-### Workflow 4: Create a Custom Dragon State
-Goal: Make a new themed dragon variant
-
-1. Import base map (Layer 1)
-2. Import one dragon variant (e.g., Layer 2 Infernal)
-3. Duplicate the Infernal props
-4. Modify colors/textures  
-5. Tag with a different layer (e.g., Layer 6)
-6. Export
-
----
-
-## 💡 Tips and Tricks
-
-### Performance Tips
-- **Import only what you need** - Use layer filters
-- **Disable materials initially** - Speeds up import
-- **Work on smaller sections** - Delete far-away objects
-- **Save often** - Large maps can be heavy on RAM
-
-### Modding Tips
-- **Always backup originals** - Keep untouched copies
-- **Test in Practice Tool** - Safest way to test changes
-- **Use collections** - Keep imports organized
-- **Name your exports** - Track different versions
-
-### Learning Tips
-- **Start with small changes** - Move one object first
-- **Study the original** - See how Riot structured things
-- **Use layer filters** - Understand what each layer does
-- **Experiment!** - You can't break anything permanently
-
----
-
 ## 📁 Addon Files Explained
 
 ```
@@ -466,12 +372,15 @@ Using this tool is at your own risk. Modifying game files may violate Terms of S
 ## 🚀 Future Plans
 
 Potential features for future versions:
-- [ ] Batch export multiple maps
-- [ ] Preview render in Blender
-- [ ] Automated UV unwrapping for custom models
+- [ ] Automated Bucketgrid creation
 - [ ] Material template library
-- [ ] One-click League folder detection
-- [ ] Drag-and-drop import
+- [ ] Lightmap Baking
+- [ ] Full particle support
+- [ ] Full project workflow
+- [ ] Direct reading of TEX files in blender without converting them
+- [ ] Map Object Support
+- [ ] Dynamic Light Support
+- [ ] ....
 
 Suggestions welcome - open an issue!
 
