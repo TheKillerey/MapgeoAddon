@@ -21,10 +21,10 @@ Perfect for:
 Download Blender 5.0+ from [blender.org](https://www.blender.org/download/) (it's free!)
 
 ### 2. Install This Addon
-1. Download this addon (green "Code" button → Download ZIP)
-2. In Blender: `Edit` → `Preferences` → `Add-ons` → `Install...`
-3. Choose the `__init__.py` file from the addon folder
-4. Check the box next to "Import-Export: League of Legends Mapgeo Tools"
+1. Download this addon (green "Code" button → Download ZIP) https://github.com/TheKillerey/MapgeoAddon/archive/refs/heads/main.zip
+2. In Blender: `Edit` → `Preferences` → `Add-ons`
+3. Drag and Drop the `.zip` file into the window
+4. A new sidebar UI will appear
 
 ### 3. Install Pillow (for textures)
 1. In Blender, go to `Scripting` workspace (top menu)
@@ -88,6 +88,74 @@ The baron pit changes appearance when captured:
 - Filter to see each state
 - Edit any transformation state
 - Control when objects appear/disappear
+
+### Baron Hash System (Advanced)
+
+**What is it?**
+The Baron Hash is an advanced visibility system that **overrides** the dragon layer system for certain objects. It's like a VIP pass that gives objects special rules for when they appear.
+
+**Why does it exist?**
+Some objects need complex visibility rules. For example:
+- An object might need to appear ONLY during Infernal dragon AND baron cup state
+- An object might need to be HIDDEN on specific dragon types
+- Baron pit decorations need different rules than normal dragon decorations
+
+**How it works:**
+1. **Normal objects** use dragon layers (Layer 1-8)
+2. **Baron hash objects** have special visibility rules that override dragon layers
+3. The baron hash points to a "visibility controller" in the materials file
+4. This controller defines exactly when the object appears
+
+**Two types of baron hash control:**
+
+1. **Baron Pit State Control** (Most common)
+   - Controls when object appears based on baron pit state
+   - Example: An object only visible when baron pit is in "Cup" state
+   - Still uses normal dragon layer system for dragon variants
+
+2. **Full Override Control** (Advanced)
+   - Completely overrides dragon layer system
+   - Example: Object appears on Infernal ONLY, regardless of its layer setting
+   - Also controls baron pit state visibility
+   - Uses "ParentMode" to determine if visible or hidden on listed states
+
+**ParentMode explained:**
+- **Mode 1 (Visible)**: Object IS visible on the listed dragon/baron states
+- **Mode 3 (Not Visible)**: Object is NOT visible on the listed states (but visible on all others)
+
+**In Blender:**
+When you select an object with a baron hash, the properties panel shows:
+- **Baron Hash**: The ID (8 hex characters, e.g., "5E652742")
+- **Parent Mode**: Whether it's "Visible" or "Not Visible" mode
+- **Baron Layers**: Which baron pit states it appears in (Base/Cup/Tunnel/Upgraded)
+- **Referenced Dragon Layers**: Which dragon layers it's linked to (overrides normal layers)
+
+**Example:**
+```
+Object: Baron_Pit_Crystal
+Baron Hash: 5E652742
+Parent Mode: Not Visible (3)
+Referenced Dragon Layers: [Infernal, Mountain, Ocean, Cloud, Hextech, Chemtech]
+Baron Layers: [Cup, Tunnel]
+
+This means:
+- NOT visible on Infernal/Mountain/Ocean/Cloud/Hextech/Chemtech dragons
+- IS visible on Base and Void dragons (not in the list)
+- Only visible when baron pit is Cup or Tunnel state
+- Ignores the normal visibility_layer setting
+```
+
+**When importing:**
+- Baron hashes are automatically decoded from the materials file
+- Objects are organized into collections by baron state
+- Filter dropdown lets you switch between baron pit states
+
+**When exporting:**
+- Baron hash data is preserved
+- All visibility rules are maintained
+- Objects will appear correctly in-game
+
+**Pro tip:** If you see an object that doesn't follow normal layer rules, check if it has a baron hash - that's why it behaves differently!
 
 ### Bush Animations
 League's bushes sway in the wind - this addon preserves that!
