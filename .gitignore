@@ -47,6 +47,9 @@ temp/
 _*.py
 !__init__.py
 
+# Release artifacts
+MapgeoAddon_v*.zip
+
 # Keep test data folders
 !LeagueTestMap/
 !LeagueToolkit/
