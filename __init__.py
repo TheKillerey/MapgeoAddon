@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo",
     "description": "Import, edit and export League of Legends .mapgeo files (Riot's map format)",
@@ -402,6 +402,8 @@ classes = (
     MapgeoSettings,
     import_mapgeo.IMPORT_SCENE_OT_mapgeo,
     export_mapgeo.EXPORT_SCENE_OT_mapgeo,
+    ui_panel.MAPGEO_OT_setup_mesh,
+    ui_panel.MAPGEO_OT_initialize_custom_mesh,
     ui_panel.MAPGEO_OT_assign_layer,
     ui_panel.MAPGEO_OT_set_quality,
     ui_panel.MAPGEO_OT_toggle_bush,

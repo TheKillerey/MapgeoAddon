@@ -7,6 +7,345 @@ import bpy
 from bpy.types import Panel, UIList
 
 
+def _material_items(self, context):
+    items = [("", "(No Material)", "Leave material unchanged")]
+    for mat in bpy.data.materials:
+        items.append((mat.name, mat.name, ""))
+    return items
+
+
+
+class MAPGEO_OT_setup_mesh(bpy.types.Operator):
+    """Setup wizard to assign mapgeo properties for selected meshes"""
+    bl_idname = "mapgeo.setup_mesh"
+    bl_label = "Mapgeo Setup Wizard"
+    bl_description = "Assign mapgeo fields for selected meshes in one dialog"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    set_visibility_layer: bpy.props.BoolProperty(
+        name="Set Dragon Layer",
+        default=True
+    )
+    visibility_mode: bpy.props.EnumProperty(
+        name="Visibility Mode",
+        description="How to apply the dragon layer value",
+        items=[
+            ('REPLACE', "Replace", "Replace existing visibility_layer"),
+            ('ADD', "Add", "Add bits to existing visibility_layer"),
+        ],
+        default='REPLACE'
+    )
+    layer_base: bpy.props.BoolProperty(name="Base", default=True)
+    layer_inferno: bpy.props.BoolProperty(name="Inferno", default=True)
+    layer_mountain: bpy.props.BoolProperty(name="Mountain", default=True)
+    layer_ocean: bpy.props.BoolProperty(name="Ocean", default=True)
+    layer_cloud: bpy.props.BoolProperty(name="Cloud", default=True)
+    layer_hextech: bpy.props.BoolProperty(name="Hextech", default=True)
+    layer_chemtech: bpy.props.BoolProperty(name="Chemtech", default=True)
+    layer_void: bpy.props.BoolProperty(name="Void", default=True)
+
+    set_quality: bpy.props.BoolProperty(
+        name="Set Quality",
+        default=True
+    )
+    quality: bpy.props.IntProperty(
+        name="Quality Bitmask",
+        description="Quality visibility bitmask (0-31 typical, 31 = all levels)",
+        default=31,
+        min=0,
+        max=255
+    )
+
+    set_bush: bpy.props.BoolProperty(
+        name="Set Bush Flag",
+        default=False
+    )
+    is_bush: bpy.props.BoolProperty(
+        name="Is Bush",
+        default=False
+    )
+
+    set_baron_hash: bpy.props.BoolProperty(
+        name="Set Baron Hash",
+        default=False
+    )
+    baron_hash: bpy.props.StringProperty(
+        name="Baron Hash",
+        description="Baron hash in hex format (8 characters, no 0x prefix)",
+        default="00000000",
+        maxlen=8
+    )
+
+    set_baron_layers: bpy.props.BoolProperty(
+        name="Set Baron Layers",
+        default=False
+    )
+    baron_base: bpy.props.BoolProperty(name="Base", default=True)
+    baron_cup: bpy.props.BoolProperty(name="Cup", default=False)
+    baron_tunnel: bpy.props.BoolProperty(name="Tunnel", default=False)
+    baron_upgraded: bpy.props.BoolProperty(name="Upgraded", default=False)
+    baron_parent_mode: bpy.props.EnumProperty(
+        name="Parent Mode",
+        description="Baron visibility mode",
+        items=[
+            ('1', "Visible", "Visible on listed baron states"),
+            ('3', "Not Visible", "Hidden on listed baron states"),
+        ],
+        default='1'
+    )
+
+    set_render_region_hash: bpy.props.BoolProperty(
+        name="Set Render Region Hash",
+        default=False
+    )
+    render_region_hash: bpy.props.StringProperty(
+        name="Render Region Hash",
+        description="Render region hash in hex format (8 characters, no 0x prefix)",
+        default="00000000",
+        maxlen=8
+    )
+
+    set_render_flags: bpy.props.BoolProperty(
+        name="Set Render Flags",
+        default=False
+    )
+    render_flags: bpy.props.IntProperty(
+        name="Render Flags",
+        description="Render flags value (U16)",
+        default=0,
+        min=0,
+        max=65535
+    )
+
+    set_layer_transition: bpy.props.BoolProperty(
+        name="Set Layer Transition",
+        default=False
+    )
+    layer_transition_behavior: bpy.props.IntProperty(
+        name="Layer Transition",
+        description="Layer transition behavior value",
+        default=0,
+        min=0,
+        max=255
+    )
+
+    set_backface_culling: bpy.props.BoolProperty(
+        name="Set Backface Culling",
+        default=False
+    )
+    disable_backface_culling: bpy.props.BoolProperty(
+        name="Disable Backface Culling",
+        default=False
+    )
+
+    set_material: bpy.props.BoolProperty(
+        name="Set Material",
+        default=False
+    )
+    material_name: bpy.props.EnumProperty(
+        name="Material",
+        description="Assign material to selected meshes",
+        items=_material_items
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Assign Mapgeo Properties", icon='OUTLINER_DATA_MESH')
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_visibility_layer")
+        if self.set_visibility_layer:
+            row = box.row()
+            row.prop(self, "visibility_mode", expand=True)
+            grid = box.grid_flow(columns=4, align=True)
+            grid.prop(self, "layer_base")
+            grid.prop(self, "layer_inferno")
+            grid.prop(self, "layer_mountain")
+            grid.prop(self, "layer_ocean")
+            grid.prop(self, "layer_cloud")
+            grid.prop(self, "layer_hextech")
+            grid.prop(self, "layer_chemtech")
+            grid.prop(self, "layer_void")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_quality")
+        if self.set_quality:
+            box.prop(self, "quality")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_bush")
+        if self.set_bush:
+            box.prop(self, "is_bush")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_baron_hash")
+        if self.set_baron_hash:
+            box.prop(self, "baron_hash")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_baron_layers")
+        if self.set_baron_layers:
+            grid = box.grid_flow(columns=4, align=True)
+            grid.prop(self, "baron_base")
+            grid.prop(self, "baron_cup")
+            grid.prop(self, "baron_tunnel")
+            grid.prop(self, "baron_upgraded")
+            box.prop(self, "baron_parent_mode")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_render_region_hash")
+        if self.set_render_region_hash:
+            box.prop(self, "render_region_hash")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_render_flags")
+        if self.set_render_flags:
+            box.prop(self, "render_flags")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_layer_transition")
+        if self.set_layer_transition:
+            box.prop(self, "layer_transition_behavior")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_backface_culling")
+        if self.set_backface_culling:
+            box.prop(self, "disable_backface_culling")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(self, "set_material")
+        if self.set_material:
+            box.prop(self, "material_name")
+
+    def execute(self, context):
+        def update_layer_collections(obj, visibility_mask):
+            layer_map = {
+                1: "Base", 2: "Inferno", 4: "Mountain", 8: "Ocean",
+                16: "Cloud", 32: "Hextech", 64: "Chemtech", 128: "Void"
+            }
+            for flag, name in layer_map.items():
+                for coll in bpy.data.collections:
+                    if coll.name.endswith(f"_{name}"):
+                        if visibility_mask & flag:
+                            if obj.name not in coll.objects:
+                                coll.objects.link(obj)
+                        else:
+                            if obj.name in coll.objects:
+                                coll.objects.unlink(obj)
+
+        count = 0
+        warn_no_baron_hash = False
+
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+
+            if self.set_visibility_layer:
+                new_mask = 0
+                if self.layer_base:
+                    new_mask |= 1
+                if self.layer_inferno:
+                    new_mask |= 2
+                if self.layer_mountain:
+                    new_mask |= 4
+                if self.layer_ocean:
+                    new_mask |= 8
+                if self.layer_cloud:
+                    new_mask |= 16
+                if self.layer_hextech:
+                    new_mask |= 32
+                if self.layer_chemtech:
+                    new_mask |= 64
+                if self.layer_void:
+                    new_mask |= 128
+                if self.visibility_mode == 'ADD':
+                    new_mask = obj.get("visibility_layer", 0) | new_mask
+                obj["visibility_layer"] = new_mask
+                update_layer_collections(obj, new_mask)
+
+            if self.set_quality:
+                obj["quality"] = int(self.quality)
+
+            if self.set_bush:
+                obj["is_bush"] = bool(self.is_bush)
+
+            if self.set_baron_hash:
+                try:
+                    int(self.baron_hash, 16)
+                except ValueError:
+                    self.report({'ERROR'}, "Invalid Baron Hash: use 8 hex characters")
+                    return {'CANCELLED'}
+                obj["baron_hash"] = self.baron_hash.upper()
+
+            if self.set_baron_layers:
+                baron_layers = []
+                if self.baron_base:
+                    baron_layers.append(1)
+                if self.baron_cup:
+                    baron_layers.append(2)
+                if self.baron_tunnel:
+                    baron_layers.append(4)
+                if self.baron_upgraded:
+                    baron_layers.append(8)
+                obj["baron_layers_decoded"] = str(baron_layers)
+                obj["baron_parent_mode"] = int(self.baron_parent_mode)
+
+                current_hash = obj.get("baron_hash", "00000000")
+                if current_hash == "00000000":
+                    warn_no_baron_hash = True
+
+            if self.set_render_region_hash:
+                try:
+                    int(self.render_region_hash, 16)
+                except ValueError:
+                    self.report({'ERROR'}, "Invalid Render Region Hash: use 8 hex characters")
+                    return {'CANCELLED'}
+                obj["render_region_hash"] = self.render_region_hash.upper()
+
+            if self.set_render_flags:
+                obj["render_flags"] = int(self.render_flags)
+
+            if self.set_layer_transition:
+                obj["layer_transition_behavior"] = int(self.layer_transition_behavior)
+
+            if self.set_backface_culling:
+                obj["disable_backface_culling"] = int(self.disable_backface_culling)
+
+            if self.set_material and self.material_name:
+                mat = bpy.data.materials.get(self.material_name)
+                if mat:
+                    if obj.data.materials:
+                        obj.data.materials[0] = mat
+                    else:
+                        obj.data.materials.append(mat)
+
+            count += 1
+
+        # Trigger visibility update to show/hide based on current filter
+        settings = context.scene.mapgeo_settings
+        if hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+
+        if warn_no_baron_hash:
+            self.report({'WARNING'}, "Baron layers set but baron_hash is 00000000; visibility filter will ignore baron layers")
+        self.report({'INFO'}, f"Applied mapgeo settings to {count} mesh objects")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+
 class VIEW3D_PT_mapgeo_panel(Panel):
     """Main Mapgeo Tools Panel"""
     bl_space_type = 'VIEW_3D'
@@ -20,7 +359,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.1.0"
+        addon_version = "0.1.1"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -31,6 +370,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         col = box.column(align=True)
         col.operator("import_scene.mapgeo", text="Import Mapgeo", icon='IMPORT')
         col.operator("export_scene.mapgeo", text="Export Mapgeo", icon='EXPORT')
+        col.operator("mapgeo.setup_mesh", text="Setup Wizard", icon='PREFERENCES')
         
         # Info section
         layout.separator()
@@ -89,6 +429,19 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         
         # Layer operations
         layout.separator()
+        
+        # Custom mesh initialization
+        box = layout.box()
+        box.label(text="Custom Mesh Setup", icon='MESH_CUBE')
+        row = box.row()
+        row.scale_y = 1.2
+        row.operator("mapgeo.setup_mesh", text="Open Setup Wizard", icon='PREFERENCES')
+        row = box.row()
+        row.operator("mapgeo.initialize_custom_mesh", text="Quick Initialize", icon='CHECKMARK')
+        box.label(text="Wizard sets all mapgeo fields", icon='INFO')
+        
+        layout.separator()
+        
         box = layout.box()
         box.label(text="Layer Operations (Toggle)", icon='OUTLINER_DATA_MESH')
         
@@ -419,6 +772,72 @@ class VIEW3D_PT_mapgeo_properties_panel(Panel):
             row.label(text=f"{region_hash}")
 
 
+
+class MAPGEO_OT_initialize_custom_mesh(bpy.types.Operator):
+    """Initialize selected custom meshes with mapgeo properties for layer system"""
+    bl_idname = "mapgeo.initialize_custom_mesh"
+    bl_label = "Initialize for Mapgeo"
+    bl_description = "Set up custom meshes with required properties for layer visibility system"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    visibility_layer: bpy.props.EnumProperty(
+        name="Dragon Layer",
+        description="Which dragon/elemental variation this mesh should appear on",
+        items=[
+            ('0', "All Layers (0)", "Visible on all dragon variations"),
+            ('1', "Base Only (1)", "Visible only on Base map"),
+            ('2', "Inferno Only (2)", "Visible only on Inferno drake"),
+            ('4', "Mountain Only (4)", "Visible only on Mountain drake"),
+            ('8', "Ocean Only (8)", "Visible only on Ocean drake"),
+            ('16', "Cloud Only (16)", "Visible only on Cloud drake"),
+            ('32', "Hextech Only (32)", "Visible only on Hextech drake"),
+            ('64', "Chemtech Only (64)", "Visible only on Chemtech drake"),
+            ('128', "Void Only (128)", "Visible only on Void drake"),
+            ('255', "All Layers (255)", "Visible on all dragon variations"),
+        ],
+        default='255'
+    )
+    
+    quality: bpy.props.EnumProperty(
+        name="Quality Levels",
+        description="Which quality settings this mesh should appear on (bitmask)",
+        items=[
+            ('31', "All Levels (31)", "Visible at all quality settings"),
+            ('1', "Very Low Only", "Visible only at Very Low quality"),
+            ('2', "Low Only", "Visible only at Low quality"),
+            ('4', "Medium Only", "Visible only at Medium quality"),
+            ('8', "High Only", "Visible only at High quality"),
+            ('16', "Very High Only", "Visible only at Very High quality"),
+        ],
+        default='31'
+    )
+    
+    def execute(self, context):
+        count = 0
+        
+        for obj in context.selected_objects:
+            if obj.type == 'MESH':
+                # Initialize essential mapgeo properties
+                obj["visibility_layer"] = int(self.visibility_layer)
+                obj["quality"] = int(self.quality)
+                obj["layer_transition_behavior"] = 0
+                obj["render_flags"] = 0
+                obj["disable_backface_culling"] = 0
+                count += 1
+        
+        # Trigger visibility update to show/hide based on current filter
+        settings = context.scene.mapgeo_settings
+        if hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+        
+        self.report({'INFO'}, f"Initialized {count} custom meshes for mapgeo layer system")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
 # Operators for layer management
 class MAPGEO_OT_assign_layer(bpy.types.Operator):
     """Toggle layer assignment for selected objects"""
@@ -469,11 +888,18 @@ class MAPGEO_OT_assign_layer(bpy.types.Operator):
                 
                 count += 1
         
+        # Trigger visibility update to apply layer filters immediately
+        settings = context.scene.mapgeo_settings
+        if hasattr(settings, 'dragon_layer_filter'):
+            # This will update viewport visibility based on current filters
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+        
         # Report status
         if enabled_count > 0:
-            self.report({'INFO'}, f"Added {enabled_count} objects to {target_layer_name} layer")
+            self.report({'INFO'}, f"Added {enabled_count} objects to {target_layer_name} layer (visibility updated)")
         else:
-            self.report({'INFO'}, f"Removed {count} objects from {target_layer_name} layer")
+            self.report({'INFO'}, f"Removed {count} objects from {target_layer_name} layer (visibility updated)")
         
         return {'FINISHED'}
 
@@ -1160,6 +1586,8 @@ classes = (
     VIEW3D_PT_mapgeo_import_panel,
     VIEW3D_PT_mapgeo_export_panel,
     VIEW3D_PT_mapgeo_properties_panel,
+    MAPGEO_OT_setup_mesh,
+    MAPGEO_OT_initialize_custom_mesh,
     MAPGEO_OT_assign_layer,
     MAPGEO_OT_set_quality,
     MAPGEO_OT_toggle_bush,

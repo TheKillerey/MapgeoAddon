@@ -499,7 +499,14 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Visibility and quality
                 obj["visibility_layer"] = int(mesh_data.visibility)
-                obj["quality"] = int(mesh_data.quality)
+                # Quality is a BITMASK (0-31), not enum. Each bit enables a quality level:
+                # Bit 0 (1)=Very Low, Bit 1 (2)=Low, Bit 2 (4)=Medium, Bit 3 (8)=High, Bit 4 (16)=Very High
+                # Value 31 (0b11111) = visible at ALL quality levels (most common)
+                quality_value = int(mesh_data.quality)
+                if quality_value < 0 or quality_value > 31:
+                    print(f"WARNING: Mesh {mesh_data.name} has invalid quality {quality_value}, setting to 31 (all levels)")
+                    quality_value = 31  # Default to all quality levels
+                obj["quality"] = quality_value
                 
                 # Render flags, layer transition behavior, backface culling
                 obj["layer_transition_behavior"] = mesh_data.layer_transition_behavior

@@ -63,7 +63,24 @@ class EnvironmentVisibility(IntFlag):
     ALL_LAYERS = LAYER_1 | LAYER_2 | LAYER_3 | LAYER_4 | LAYER_5 | LAYER_6 | LAYER_7 | LAYER_8
 
 class EnvironmentQuality(IntEnum):
-    """Quality levels for environment meshes"""
+    """Quality levels for environment meshes (BITMASK)
+    
+    Quality is a BITMASK, not a single value. Each bit enables visibility at that quality level:
+    - Bit 0 (1): Very Low
+    - Bit 1 (2): Low
+    - Bit 2 (4): Medium
+    - Bit 3 (8): High
+    - Bit 4 (16): Very High
+    
+    Common values:
+    - 31 (0b11111): Visible at ALL quality levels (most terrain)
+    - 1: Visible only at Very Low
+    - 2: Visible only at Low
+    - 4: Visible only at Medium
+    - 8: Visible only at High
+    - 16: Visible only at Very High
+    - 15 (0b01111): Visible at Low through High (exclude Very Low)
+    """
     VERY_LOW = 0
     LOW = 1
     MEDIUM = 2

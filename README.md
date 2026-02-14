@@ -6,13 +6,6 @@
 ![Status](https://img.shields.io/badge/status-stable-green)
 
 **Edit League of Legends maps in Blender!** Open Summoner's Rift, ARAM, or any League map as a 3D model, make changes, and save them back.
-
-Perfect for:
-- 🎨 Creating custom map mods
-- 🔍 Studying League's map design
-- 🎮 Exploring Summoner's Rift in 3D
-- 🛠️ Learning 3D game development
-
 ---
 
 ## ⚡ Quick Start (3 Steps)
@@ -21,7 +14,7 @@ Perfect for:
 Download Blender 5.0+ from [blender.org](https://www.blender.org/download/) (it's free!)
 
 ### 2. Install This Addon
-1. Download this addon (green "Code" button → Download ZIP) https://github.com/TheKillerey/MapgeoAddon/archive/refs/heads/main.zip
+1. Download latest version ([Download ZIP](https://github.com/TheKillerey/MapgeoAddon/archive/refs/heads/main.zip))
 2. In Blender: `Edit` → `Preferences` → `Add-ons`
 3. Drag and Drop the `.zip` file into the window
 4. A new sidebar UI will appear
@@ -43,27 +36,20 @@ Open `.mapgeo` files from League in Blender:
 - All terrain and objects load as editable 3D models
 - Textures automatically convert to PNG
 - Materials and colors preserved
-- Organized by dragon type (Infernal, Ocean, etc.)
-
-### ✏️ Edit Everything
-- **Move objects**: Drag trees, rocks, buildings anywhere
-- **Delete things**: Remove decorations you don't want
-- **Add new models**: Import your own 3D creations
-- **Change textures**: Replace with custom images
-- **Modify terrain**: Reshape hills, paths, rivers
+- Organized by dragon and baron layer's starting with Base (Same how Riot does)
 
 ### 💾 Export Back to Game
 - Save your changes as a new `.mapgeo` file
-- Everything is preserved: animations, visibility, quality settings
+- Everything is preserved: layers, visibility, quality settings
 - Works with all League features (dragon states, baron pit, etc.)
 
 ---
 
 ## 🌟 Key Features Explained
 
-### Dragon Elemental States (Summoners Rift only and a few TFT maps)
+### Dragon Elemental States (Summoners Rift only) - TFT Maps have also different states using this layer system
 League's map changes based on which dragon spawns. Each element has different props:
-- **Base** - Layer 1
+- **Base** - Layer 1 - (Starting Layer)
 - **Infernal**  - Layer 2
 - **Mountain** - Layer 3
 - **Ocean** - Layer 4
@@ -73,16 +59,16 @@ League's map changes based on which dragon spawns. Each element has different pr
 - **Void** - Layer 8 (Not used)
 
 **The addon lets you:**
-- View each dragon state separately
+- View each dragon state separately (Exact how Riot does ingame)
 - Toggle visibility to see specific variants
 - Edit props for any dragon state
 
 ### Baron Pit Transformations
 The baron pit changes appearance when captured:
-- **Base** - Normal pit before any baron kills
-- **Cup** - Cup passage state
-- **Tunnel** - Underground passage state
-- **Upgraded** - Enhanced pit state
+- **Base** - Normal pit before any baron spawns
+- **Cup** - Cup passage state after baron spawns
+- **Tunnel** - Underground passage state after baron spawns
+- **Upgraded** - Enhanced pit state after baron spawns
 
 **You can:**
 - Filter to see each state
@@ -91,77 +77,200 @@ The baron pit changes appearance when captured:
 
 ### Baron Hash System (Advanced)
 
-**What is it?**
-The Baron Hash is an advanced visibility system that **overrides** the dragon layer system for certain objects. It's like a VIP pass that gives objects special rules for when they appear.
+## Overview
 
-**Why does it exist?**
-Some objects need complex visibility rules. For example:
-- An object might need to appear ONLY during Infernal dragon AND baron cup state
-- An object might need to be HIDDEN on specific dragon types
-- Baron pit decorations need different rules than normal dragon decorations
+The Baron Hash system is a **secondary visibility controller system** that **overrides the Dragon Layer System** when a mesh has a baron_hash assigned.
 
-**How it works:**
-1. **Normal objects** use dragon layers (Layer 1-8)
-2. **Baron hash objects** have special visibility rules that override dragon layers
-3. The baron hash points to a "visibility controller" in the materials file
-4. This controller defines exactly when the object appears
+## Two Visibility Systems
 
-**Two types of baron hash control:**
+### 1. Dragon Layer System (Standard)
+Used for elemental rift variations. Controlled by the `visibility_layer` property (bits 0-7):
 
-1. **Baron Pit State Control** (Most common)
-   - Controls when object appears based on baron pit state
-   - Example: An object only visible when baron pit is in "Cup" state
-   - Still uses normal dragon layer system for dragon variants
+- **Bit 0 (1)**: Base
+- **Bit 1 (2)**: Inferno (Fire)
+- **Bit 2 (4)**: Mountain (Earth)
+- **Bit 3 (8)**: Ocean
+- **Bit 4 (16)**: Cloud
+- **Bit 5 (32)**: Hextech
+- **Bit 6 (64)**: Chemtech
+- **Bit 7 (128)**: Void
 
-2. **Full Override Control** (Advanced)
-   - Completely overrides dragon layer system
-   - Example: Object appears on Infernal ONLY, regardless of its layer setting
-   - Also controls baron pit state visibility
-   - Uses "ParentMode" to determine if visible or hidden on listed states
+Defined in Map11.bin as `VisibilityFlagDefines` (hash: default)
 
-**ParentMode explained:**
-- **Mode 1 (Visible)**: Object IS visible on the listed dragon/baron states
-- **Mode 3 (Not Visible)**: Object is NOT visible on the listed states (but visible on all others)
+### 2. Baron Hash System (Override)
+Used for Baron-specific map variations. Controlled by the `baron_hash` property.
 
-**In Blender:**
-When you select an object with a baron hash, the properties panel shows:
-- **Baron Hash**: The ID (8 hex characters, e.g., "5E652742")
-- **Parent Mode**: Whether it's "Visible" or "Not Visible" mode
-- **Baron Layers**: Which baron pit states it appears in (Base/Cup/Tunnel/Upgraded)
-- **Referenced Dragon Layers**: Which dragon layers it's linked to (overrides normal layers)
+Defined in Map11.bin as hash `0xd31ac6ce` with bit-based states (stored in `0x8bff8cdf` property):
 
-**Example:**
+- **Base** (Bit value 1): Default state
+- **Cup** (Bit value 2): Cup variation
+- **Tunnel** (Bit value 4): Tunnel variation
+- **Upgraded** (Bit value 8): Upgraded variation
+
+**Note**: Custom maps may have different baron states with different bit values. The system supports any combination of baron states defined in the materials file.
+
+## How It Works
+
+### Visibility Logic (Corrected in v0.0.6)
+
+1. **When baron_hash is NOT set (00000000)**:
+   - Mesh uses the Dragon Layer System
+   - Visibility controlled by `visibility_layer` bits
+   - Mesh appears in corresponding elemental rift variations
+   - Visible on ALL baron pit states (Base, Cup, Tunnel, Upgraded)
+
+2. **When baron_hash IS set BUT has no dragon_layers**:
+   - Mesh uses the Dragon Layer System for dragon visibility
+   - Visibility controlled by `visibility_layer` bits
+   - Baron pit state controlled by `baron_layers_decoded` 
+   - Appears only on specified baron pit states
+
+3. **When baron_hash IS set AND has dragon_layers** (OVERRIDE MODE):
+   - **Baron hash OVERRIDES the Dragon Layer System**
+   - `visibility_layer` is **IGNORED** for dragon visibility
+   - Dragon visibility determined by `baron_dragon_layers_decoded`
+   - Baron pit state controlled by `baron_layers_decoded`
+   - **Example**: If baron hash decodes to dragon_layers=[32] (Hextech), mesh appears ONLY on Hextech, regardless of `visibility_layer` value
+   
+### Visibility Check Priority
+```python
+# STEP 1: Dragon visibility
+if has_baron_hash and has_baron_dragon_layers:
+    # OVERRIDE: Use baron dragon layers with ParentMode
+    is_in_list = (current_dragon in baron_dragon_layers) or (base in baron_dragon_layers)
+    if parent_mode == 3:  # Not Visible mode
+        dragon_visible = not is_in_list  # Visible when NOT in list
+    else:  # Visible mode (default)
+        dragon_visible = is_in_list  # Visible when in list
+else:
+    # STANDARD: Use visibility_layer
+    # visibility_layer == 0 means no dragon restriction (always visible)
+    if visibility_layer == 0 or visibility_layer == 255:
+        dragon_visible = True
+    else:
+        dragon_visible = (visibility_layer & current_dragon_flag)
+
+# STEP 2: Baron pit visibility (ParentMode also applies here)
+if has_baron_hash and has_baron_layers:
+    is_in_list = (current_baron_state in baron_layers)
+    if parent_mode == 3:  # Not Visible mode
+        baron_visible = not is_in_list  # Visible when NOT in list
+    else:  # Visible mode (default)
+        baron_visible = is_in_list  # Visible when in list
+else:
+    baron_visible = True  # Visible on all baron states
+
+# FINAL
+visible = dragon_visible AND baron_visible
 ```
-Object: Baron_Pit_Crystal
-Baron Hash: 5E652742
-Parent Mode: Not Visible (3)
-Referenced Dragon Layers: [Infernal, Mountain, Ocean, Cloud, Hextech, Chemtech]
-Baron Layers: [Cup, Tunnel]
 
-This means:
-- NOT visible on Infernal/Mountain/Ocean/Cloud/Hextech/Chemtech dragons
-- IS visible on Base and Void dragons (not in the list)
-- Only visible when baron pit is Cup or Tunnel state
-- Ignores the normal visibility_layer setting
+## Materials.bin Structure
+
+Baron hash controllers are defined in materials.bin with several types:
+
+### Type 1: Direct Layer Controllers ({c406a533})
+```json
+"{8e6a128e}": {
+  "PathHash": "{8e6a128e}",
+  "name": "{5086eb70}",
+  "DefaultVisible": false,
+  "{27639032}": 64,
+  "__type": "{c406a533}"
+}
 ```
 
-**When importing:**
-- Baron hashes are automatically decoded from the materials file
-- Objects are organized into collections by baron state
-- Filter dropdown lets you switch between baron pit states
+### Type 2: Child Controllers (ChildMapVisibilityController)
+```json
+"{5e652742}": {
+  "PathHash": "{5e652742}",
+  "Parents": [
+    "{8e6a128e}",
+    "{4f0b2a3e}",
+    "{48106271}",
+    "{d1a17399}",
+    "{2b8dbdee}",
+    "{3c5b24f7}"
+  ],
+  "ParentMode": 3,
+  "__type": "ChildMapVisibilityController"
+}
+```
 
-**When exporting:**
-- Baron hash data is preserved
-- All visibility rules are maintained
-- Objects will appear correctly in-game
+### Type 3: Named Controllers ({e07edfa4})
+```json
+"{7dcbc884}": {
+  "PathHash": "{7dcbc884}",
+  "name": "{34e04176}",
+  "__type": "{e07edfa4}"
+}
+```
 
-**Pro tip:** If you see an object that doesn't follow normal layer rules, check if it has a baron hash - that's why it behaves differently!
+### Type 4: Baron State Controllers ({ec733fe2})
+```json
+"{f4968631}": {
+  "PathHash": "{f4968631}",
+  "name": "{6204d1e5}",
+  "{8bff8cdf}": 1,
+  "__type": "{ec733fe2}"
+}
+```
+
+## ParentMode Values
+
+- **1**: Visible mode - visible on this layer
+- **3**: Not Visible mode - not visible on this layer (but visible on any other layers)
+- **Not added**: Changes to default value 1 - Visible mode
+
+## Example: Baron Hash 5E652742
+
+This hash references parents for all 6 dragon layers with ParentMode=3 (Not Visible):
+- Mesh is NOT visible on these specific dragon layers
+- Used for meshes that should be hidden in elemental states (visible on other layers only)
+
+## In Blender Addon
+
+- **Split Filter System**: Separate dropdowns for dragon layer (8 variants) and baron pit state (4 states)
+- **Properties Panel**: Shows baron hash status with decoded layers
+- **Baron Pit Layers**: Displays which baron pit states the mesh is visible on (Base, Cup, Tunnel, Upgraded)
+- **Referenced Dragon Layers**: Shows dragon layers from baron hash (OVERRIDES visibility_layer when present)
+- **Parent Mode**: Displays whether mesh is Visible (1) or Not Visible (3) on referenced layers
+- **Baron Hash Assignment**: Can assign custom baron hash values (8 hex characters)
+- **Layer Collections**: Meshes organized into both dragon layer and baron state collections
+- **Automatic Decoding**: When materials.bin.json / materials.py is loaded during import, baron hashes are automatically decoded
+- **Override Behavior**: Baron dragon layers take precedence over visibility_layer when present
+
+## Baron Hash Decoding Process
+
+1. **Parse materials.bin.json / .py** - Index all visibility controllers by PathHash (format: `"{5e652742}"`)
+2. **Find Controller** - Look up the baron hash in the indexed controllers
+3. **Check Type** - Identify if it's a ChildMapVisibilityController via `__type` field
+4. **Get Parents** - Extract parent references from the Parents list
+5. **Resolve Parents** - For each parent:
+   - Check if it's a dragon layer controller (`__type`: `"{c406a533}"` with `"{27639032}"` property)
+   - Check if it's a baron layer controller (`__type`: `"{ec733fe2}"` with `"{8bff8cdf}"` property)
+   - If it's another child controller, recursively resolve its parents
+6. **Apply ParentMode** - Apply visibility mode (1=Visible, 3=Not Visible) for referenced layers
+7. **Store Results** - Save decoded layers and parent mode as custom properties
+
+**Note**: JSON format uses curly braces around hash values: `"{5e652742}"` instead of `0x5e652742` in python
+
+## Custom Properties
+
+- `visibility_layer`: Standard dragon layer bitfield (0-255) - IGNORED if baron hash has dragon_layers
+- `baron_hash`: The raw hash value (e.g., "5E652742") (You can put any name also in it if you link it also in materials.py / materials.bin.json)
+- `baron_parent_mode`: The parent mode (1=Visible, 3=Not Visible)
+- `baron_layers_decoded`: List of baron pit layer bit values (e.g., "[1, 2, 4, 8]") - uses actual bit values from 0x8bff8cdf property
+- `baron_dragon_layers_decoded`: List of dragon layer bits (e.g., "[2, 4, 8, 16, 32, 64]") - OVERRIDES visibility_layer when present
 
 ### Bush Animations
 League's bushes sway in the wind - this addon preserves that!
 - Import keeps animation data (called TEXCOORD5)
 - Export saves it back perfectly
 - No setup needed, it just works
+- Using the `LEVELS` folder and `map*.py` give the feature to use GRASS Tint. Same how Riot does it ingame
+`*` -> This is the map number. For Summoners Rift we use `map11.py`
+
+We can't create it yet but this feature will be planned
 
 ### Quality Levels
 League has 5 graphics quality settings. The addon handles all of them:
@@ -175,6 +284,20 @@ Each mesh has a quality tag. You can:
 - See which quality level each object uses
 - Filter to show only certain quality levels
 - Change quality settings per object
+
+Default Value for a mesh in League is `31`
+Why `31`? because of this:
+Very Low -> `1`
+Low -> `2`
+Medium -> `4`
+High -> `8`
+Very High -> `16`
+
+`1 + 2 + 4 + 8 + 16` = `31`
+ `31` just means that we load the mesh on all quality settings
+
+Some meshes have the value `255` - This just means that you have full quality and your mesh is not affected by the quality settings.
+Currently using `32` -> `254` will be the same as `31` but the usage for that is currently unknown.
 
 ---
 
@@ -213,11 +336,11 @@ When you're ready to test in-game:
    - **Export Selected Only**: Check to export only selected objects
    - **Apply Modifiers**: Check if you used Blender modifiers
    - **Triangulate**: Always keep checked (League needs triangles)
-   - **Bucket Grid Mode**: Keep as "ORIGINAL"
+   - **Bucket Grid Mode**: Keep as "ORIGINAL" / "CUSTOM" is broken and will not work
 
 3. **Click Export**
 
-Your edited map is ready! Replace the original file in League to test.
+Your edited map is ready! Replace the original file in League to test using your favorite Custom Skin manager
 
 ⚠️ **Always backup the original file first!**
 
@@ -235,7 +358,7 @@ For textures to load automatically:
 
 2. **In the import dialog:**
    - **Assets Folder**: Point to extracted `assets/` folder
-   - **Materials JSON**: Point to `.materials.bin.json` file
+   - **Materials JSON/PY**: Point to `.materials.bin.json` / `.materials.py` file
    - **Check "Load Materials"**
 
 3. **Import**
@@ -244,7 +367,7 @@ Textures will automatically:
 - Convert from League's `.tex` format → PNG
 - Create Blender materials with proper colors
 - Apply to correct objects
-- Load lightmaps for realistic lighting
+- Load lightmaps for realistic lighting same as how Riot does it ingame.
 
 ### Manual Material Setup
 
@@ -270,7 +393,7 @@ If auto-loading doesn't work:
 ### Textures don't load
 **Check:**
 - Assets folder path is correct
-- Materials JSON file path is correct
+- Materials JSON / PY file path is correct
 - "Load Materials" checkbox is enabled
 - Pillow is installed
 - `.tex` files exist in the assets folder
@@ -283,9 +406,8 @@ If auto-loading doesn't work:
 - Update to latest Blender version
 
 ### Some objects have no textures
-**This is normal** - Not al objects need textures:
-- Collision geometry (invisible in-game)
-- Shadow casters (just for shadows)
+**This is normal** - Not all objects need textures:
+- Collision geometry (invisible in-game) named Bucketgrid
 - Visual effects objects (use particle systems instead)
 
 ### Export file is larger than original
@@ -361,12 +483,12 @@ MapgeoAddon/
 
 ### Where to Ask Questions
 - **Issues tab** on GitHub - Report bugs or ask questions
-- **League modding communities** - Discord servers and forums
+- **League modding communities** - My Discord Server  [PROJECT: Rey](https://discord.gg/V3UWZbDGqj)
 - **Blender communities** - For general 3D questions
 
 ### What to Include in Bug Reports
 1. Blender version (e.g., "5.0.0")
-2. What map you're trying to import (e.g., "Map11.mapgeo")
+2. What map you're trying to import (e.g., "base_srx.mapgeo")
 3. Error message from Blender console
 4. What you were doing when it broke
 
@@ -388,7 +510,6 @@ This tool is for:
 - ✅ Educational purposes
 
 This tool is NOT for:
-- ❌ Creating cheating tools
 - ❌ Gaining unfair advantages online
 - ❌ Distributing modified game files
 - ❌ Commercial use
@@ -412,7 +533,7 @@ Using this tool is at your own risk. Modifying game files may violate Terms of S
 **Built with:**
 - Blender 5.0+
 - Python
-- Love for League and modding ❤️
+- Love for League and the custom skin community ❤️
 
 ---
 
@@ -448,7 +569,7 @@ Potential features for future versions:
 - [ ] Direct reading of TEX files in blender without converting them
 - [ ] Map Object Support
 - [ ] Dynamic Light Support
-- [ ] ....
+- [ ] Vertex Animations
 
 Suggestions welcome - open an issue!
 

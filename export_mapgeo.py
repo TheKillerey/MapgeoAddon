@@ -77,15 +77,16 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
     
     default_quality: EnumProperty(
         name="Default Quality",
-        description="Default quality level for meshes",
+        description="Default quality bitmask for meshes (each bit enables a quality level)",
         items=[
-            ('0', "Very Low", "Very Low Quality"),
-            ('1', "Low", "Low Quality"),
-            ('2', "Medium", "Medium Quality"),
-            ('3', "High", "High Quality"),
-            ('4', "Very High", "Very High Quality"),
+            ('31', "All Levels (31)", "Visible at all quality settings (Very Low to Very High)"),
+            ('1', "Very Low Only (1)", "Visible only at Very Low quality"),
+            ('2', "Low Only (2)", "Visible only at Low quality"),
+            ('4', "Medium Only (4)", "Visible only at Medium quality"),
+            ('8', "High Only (8)", "Visible only at High quality"),
+            ('16', "Very High Only (16)", "Visible only at Very High quality"),
         ],
-        default='2'
+        default='31'
     )
     
     bucket_grid_mode: EnumProperty(
@@ -227,6 +228,13 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 
                 # Create mesh entry
                 mesh_entry = self.create_mesh_entry(mesh, obj, vertex_buffer_id, index_buffer_id)
+                
+                # Validate vertex count consistency (prevent crashes from buffer overruns)
+                if mesh_entry.vertex_count != vertex_buffer.vertex_count:
+                    print(f"ERROR: Vertex count mismatch for {obj.name}: mesh_entry claims {mesh_entry.vertex_count} but vertex_buffer has {vertex_buffer.vertex_count}")
+                    print(f"  Correcting mesh_entry to match vertex_buffer")
+                    mesh_entry.vertex_count = vertex_buffer.vertex_count
+                
                 mapgeo.meshes.append(mesh_entry)
                 
                 # Clean up if we created a temporary mesh
@@ -471,7 +479,11 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         
         # Get quality and visibility from custom properties (set during import)
         # Try both old property names (mapgeo_*) and new names (*) for compatibility
-        mesh_entry.quality = obj.get("quality", obj.get("mapgeo_quality", int(self.default_quality)))
+        raw_quality = obj.get("quality", obj.get("mapgeo_quality", int(self.default_quality)))
+        # Quality is a BITMASK (0-31), not enum. Clamp to valid range to prevent crashes
+        mesh_entry.quality = max(0, min(31, int(raw_quality)))
+        if raw_quality != mesh_entry.quality:
+            print(f"WARNING: Object {obj.name} had invalid quality {raw_quality}, clamped to {mesh_entry.quality}")
         mesh_entry.visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility", 
                                                                     mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
         mesh_entry.layer_transition_behavior = obj.get("layer_transition_behavior", 0)
