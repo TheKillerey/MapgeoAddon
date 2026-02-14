@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2026-02-14
+
+### 🛠 Fixes
+
+- **Quality bitmask correctness** - `quality` is treated as a bitmask (0-31) instead of a single enum
+  - Prevents meshes from only showing at Medium quality
+  - Preserves visibility across all quality levels (31 = all)
+
+- **Crash prevention** - Added validation and clamping for invalid quality values
+  - Handles corrupted imports safely
+  - Prevents invalid quality from crashing the game
+
+- **Layer visibility refresh** - Assigning a layer now updates visibility immediately
+  - No need to toggle filters to see changes
+
+- **Operator registration** - Setup/initialize operators are registered correctly
+  - Fixes missing UI button errors in Blender console
+
+### ✨ UI Improvements
+
+- **Setup Wizard** - New dialog to assign mapgeo fields in one place
+  - Dragon layers, quality, baron hash, baron layers, render region hash, render flags
+  - Material assignment and backface culling options
+
+- **Layer panel polish** - Added “Open Setup Wizard” + quick initialize
+
+---
+
 ## [0.1.0] - 2026-02-13
 
 ### 🎉 **Stable Release - Full Export Support**
