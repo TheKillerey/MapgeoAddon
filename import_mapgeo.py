@@ -573,6 +573,37 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                         except Exception as e:
                             print(f"    Warning: Could not decode baron hash {baron_hash_str}: {e}")
                 
+                # Create Blender point light if mesh has point_light custom properties
+                # This is a CUSTOM FEATURE (stationary_light field is unused in official maps)
+                if obj.get("point_light_enabled", False):
+                    try:
+                        light_color = obj.get("point_light_color", [1.0, 0.95, 0.8])
+                        light_intensity = obj.get("point_light_intensity", 500.0)
+                        light_radius = obj.get("point_light_radius", 5.0)
+                        offset_z = obj.get("point_light_offset_z", 0.0)
+                        
+                        # Create light data
+                        light_data = bpy.data.lights.new(name=f"{mesh_name}_PointLight", type='POINT')
+                        light_data.energy = light_intensity
+                        light_data.color = light_color
+                        light_data.shadow_soft_size = light_radius
+                        
+                        # Create light object
+                        light_obj = bpy.data.objects.new(name=f"{mesh_name}_PointLight", object_data=light_data)
+                        light_obj.location = obj.location.copy()
+                        light_obj.location.z += offset_z
+                        
+                        # Link to same collection as mesh
+                        meshes_collection.objects.link(light_obj)
+                        
+                        # Parent to mesh
+                        light_obj.parent = obj
+                        
+                        if imported_count <= 5:
+                            print(f"    Created point light (Custom feature)")
+                    except Exception as e:
+                        print(f"    Warning: Could not create point light: {e}")
+                
                 imported_count += 1
                 if imported_count <= 5 or imported_count % 100 == 0:
                     uv_info = f", {uv_channels_created} UV" if uv_channels_created > 0 else ", no UV"

@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 1, 1),
+    "version": (0, 2, 0),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo",
     "description": "Import, edit and export League of Legends .mapgeo files (Riot's map format)",
@@ -33,6 +33,7 @@ from . import (
     import_mapgeo,
     export_mapgeo,
     ui_panel,
+    material_editor_ui,
     utils,
 )
 
@@ -341,6 +342,13 @@ class MapgeoSettings(PropertyGroup):
         default="",
         subtype='FILE_PATH'
     )
+
+    material_diffuse_tex_path: StringProperty(
+        name="Diffuse Texture Path",
+        description="Diffuse texture path (.tex) for the active material",
+        default="",
+        subtype='FILE_PATH'
+    )
     
     map_py_path: StringProperty(
         name="Map File Path",
@@ -410,11 +418,15 @@ classes = (
     ui_panel.MAPGEO_OT_assign_bush,
     ui_panel.MAPGEO_OT_assign_baron_hash,
     ui_panel.MAPGEO_OT_assign_render_region_hash,
+    ui_panel.MAPGEO_OT_set_diffuse_texture,
     ui_panel.MAPGEO_OT_set_test_paths,
     ui_panel.MAPGEO_OT_show_all,
     ui_panel.MAPGEO_OT_show_not_used,
     ui_panel.MAPGEO_OT_toggle_bucket_grid_selectable,
     ui_panel.MAPGEO_OT_create_bucket_grid,
+    ui_panel.MAPGEO_OT_add_point_light,
+    ui_panel.MAPGEO_OT_remove_point_light_from_selected,
+    ui_panel.MAPGEO_OT_export_point_lights,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
@@ -434,9 +446,15 @@ def register():
     """Register all addon classes and handlers"""
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
     # Register properties
     bpy.types.Scene.mapgeo_settings = bpy.props.PointerProperty(type=MapgeoSettings)
+
+    # Register material editor UI
+    try:
+        material_editor_ui.register()
+    except Exception as e:
+        print(f"[MaterialEditor] Registration failed: {e}")
     
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -446,6 +464,11 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister material editor UI
+    try:
+        material_editor_ui.unregister()
+    except Exception as e:
+        print(f"[MaterialEditor] Unregister failed: {e}")
     # Remove menu entries
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)

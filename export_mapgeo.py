@@ -504,33 +504,39 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             except (ValueError, TypeError):
                 mesh_entry.visibility_controller_path_hash = 0
         
-        # Calculate bounding volumes in LOCAL space (matching vertex buffer data)
-        # The C# reference computes bbox from vertex buffer positions which are in local space
-        # The transform matrix handles world positioning separately
+        # Calculate bounding volumes in WORLD space
+        # The game engine uses bounding sphere/box for frustum culling in world space.
+        # Vertex data is stored in local space, but bounds must reflect actual world position.
         if mesh.vertices:
-            # Bounding box from local-space vertices with Y/Z swap for mapgeo format
-            # Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
-            min_x = min(v.co.x for v in mesh.vertices)
-            min_y = min(v.co.z for v in mesh.vertices)  # Blender Z -> Mapgeo Y (height)
-            min_z = min(v.co.y for v in mesh.vertices)  # Blender Y -> Mapgeo Z
-            max_x = max(v.co.x for v in mesh.vertices)
-            max_y = max(v.co.z for v in mesh.vertices)  # Blender Z -> Mapgeo Y (height)
-            max_z = max(v.co.y for v in mesh.vertices)  # Blender Y -> Mapgeo Z
+            # Transform each vertex to world space, then convert to League coords
+            # Blender world -> League: (X, Z, Y)
+            world_positions = []
+            for v in mesh.vertices:
+                world_pos = obj.matrix_world @ v.co
+                # Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
+                world_positions.append((world_pos.x, world_pos.z, world_pos.y))
+            
+            min_x = min(p[0] for p in world_positions)
+            min_y = min(p[1] for p in world_positions)
+            min_z = min(p[2] for p in world_positions)
+            max_x = max(p[0] for p in world_positions)
+            max_y = max(p[1] for p in world_positions)
+            max_z = max(p[2] for p in world_positions)
             
             mesh_entry.bounding_box = mapgeo_parser.BoundingBox(
                 min=(min_x, min_y, min_z),
                 max=(max_x, max_y, max_z)
             )
             
-            # Bounding sphere (also in local space)
+            # Bounding sphere from world-space positions
             center_x = (min_x + max_x) / 2
             center_y = (min_y + max_y) / 2
             center_z = (min_z + max_z) / 2
             center = Vector((center_x, center_y, center_z))
             
             radius = max(
-                (Vector((v.co.x, v.co.z, v.co.y)) - center).length 
-                for v in mesh.vertices
+                (Vector(p) - center).length 
+                for p in world_positions
             )
             
             mesh_entry.bounding_sphere = mapgeo_parser.BoundingSphere(

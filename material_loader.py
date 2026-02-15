@@ -262,6 +262,8 @@ class MaterialLoader:
                     value.setdefault('cullEnable', False)
                     value.setdefault('switches', {})
                     value.setdefault('shaderMacros', {})
+                    value.setdefault('techniques', [])
+                    value.setdefault('childTechniques', [])
                     
                     # Normalize switches from list to dict if needed
                     switches_raw = value.get('switchValues', value.get('switches', {}))
@@ -309,6 +311,32 @@ class MaterialLoader:
             with open(py_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
+            def _iter_blocks(content: str, block_type: str):
+                blocks = []
+                pattern = re.compile(rf'{re.escape(block_type)}\s*\{{')
+
+                for match in pattern.finditer(content):
+                    start_idx = match.end() - 1
+                    brace_depth = 0
+                    end_idx = None
+
+                    for idx in range(start_idx, len(content)):
+                        char = content[idx]
+                        if char == '{':
+                            brace_depth += 1
+                        elif char == '}':
+                            brace_depth -= 1
+                            if brace_depth == 0:
+                                end_idx = idx
+                                break
+
+                    if end_idx is None:
+                        continue
+
+                    blocks.append(content[start_idx + 1:end_idx])
+
+                return blocks
+
             # Find all StaticMaterialDef blocks
             mat_pattern = re.compile(
                 r'"([^"]+)"\s*=\s*StaticMaterialDef\s*\{',
@@ -339,6 +367,8 @@ class MaterialLoader:
                     'paramValues': [],
                     'shaderMacros': {},
                     'switches': {},
+                    'techniques': [],
+                    'childTechniques': [],
                     'shader': '',
                     'blendEnable': False,
                     'cullEnable': False,
@@ -390,12 +420,9 @@ class MaterialLoader:
                         mat_data['samplerValues'].append(sampler)
                 
                 # Parse paramValues (shader parameters)
-                param_pattern = re.compile(
-                    r'StaticMaterialShaderParamDef\s*\{([^}]+)\}',
-                    re.DOTALL
-                )
-                for param_match in param_pattern.finditer(body):
-                    param_body = param_match.group(1)
+                # Use _iter_blocks for proper nested brace handling
+                # (vec4 = { ... } is nested inside the param block)
+                for param_body in _iter_blocks(body, "StaticMaterialShaderParamDef"):
                     param = {}
                     
                     param_name = re.search(r'name:\s*string\s*=\s*"([^"]+)"', param_body)
@@ -422,6 +449,64 @@ class MaterialLoader:
                     macros_body = macros_match.group(1)
                     for macro_match in re.finditer(r'"([^"]+)"\s*=\s*"([^"]+)"', macros_body):
                         mat_data['shaderMacros'][macro_match.group(1)] = macro_match.group(2)
+
+                # Parse techniques
+                for technique_content in _iter_blocks(body, "StaticMaterialTechniqueDef"):
+                    name_match = re.search(r'name:\s*string\s*=\s*"([^"]*)"', technique_content)
+                    if not name_match:
+                        continue
+                    technique = {
+                        "name": name_match.group(1),
+                        "passes": []
+                    }
+
+                    for pass_content in _iter_blocks(technique_content, "StaticMaterialPassDef"):
+                        pass_dict = {
+                            "shader": "",
+                            "blendEnable": False,
+                            "srcColorBlendFactor": 1,
+                            "srcAlphaBlendFactor": 1,
+                            "dstColorBlendFactor": 0,
+                            "dstAlphaBlendFactor": 0,
+                        }
+
+                        shader_match = re.search(r'shader:\s*link\s*=\s*"([^"]*)"', pass_content)
+                        if shader_match:
+                            pass_dict["shader"] = shader_match.group(1)
+
+                        blend_match = re.search(r'blendEnable:\s*bool\s*=\s*(true|false)', pass_content)
+                        if blend_match:
+                            pass_dict["blendEnable"] = blend_match.group(1) == 'true'
+
+                        for factor in ['srcColorBlendFactor', 'srcAlphaBlendFactor',
+                                       'dstColorBlendFactor', 'dstAlphaBlendFactor']:
+                            factor_match = re.search(rf'{factor}:\s*u32\s*=\s*(\d+)', pass_content)
+                            if factor_match:
+                                pass_dict[factor] = int(factor_match.group(1))
+
+                        technique["passes"].append(pass_dict)
+
+                    mat_data['techniques'].append(technique)
+
+                # Parse child techniques
+                for child_content in _iter_blocks(body, "StaticMaterialChildTechniqueDef"):
+                    name_match = re.search(r'name:\s*string\s*=\s*"([^"]*)"', child_content)
+                    parent_match = re.search(r'parentName:\s*string\s*=\s*"([^"]*)"', child_content)
+                    if not name_match or not parent_match:
+                        continue
+
+                    child = {
+                        "name": name_match.group(1),
+                        "parentName": parent_match.group(1),
+                        "shaderMacros": {}
+                    }
+
+                    macros_match = re.search(r'shaderMacros:\s*map\[string,string\]\s*=\s*\{(.*?)\}', child_content, re.DOTALL)
+                    if macros_match:
+                        for line in re.finditer(r'"([^"]+)"\s*=\s*"([^"]*)"', macros_match.group(1)):
+                            child["shaderMacros"][line.group(1)] = line.group(2)
+
+                    mat_data['childTechniques'].append(child)
                 
                 # Parse switches (StaticMaterialSwitchDef)
                 switch_pattern = re.compile(
@@ -1013,9 +1098,57 @@ class MaterialLoader:
         # Determine shader type
         shader_name = self._get_shader_short_name(mat_data)
         
-        # Store shader type as custom property on the material
-        bl_mat["league_shader"] = shader_name or "Unknown"
-        bl_mat["league_shader_path"] = mat_data.get('shader', '')
+        # Store League material data for editor compatibility
+        bl_mat["league_material_name"] = mat_name
+        bl_mat["league_material_type"] = mat_data.get('type', 0)
+
+        samplers_json = []
+        for sampler in mat_data.get('samplerValues', []):
+            tex_name = sampler.get('textureName', sampler.get('TextureName', ''))
+            tex_path = sampler.get('texturePath', '')
+            if not tex_name and not tex_path:
+                continue
+            samplers_json.append({
+                "textureName": tex_name,
+                "texturePath": tex_path,
+                "addressU": sampler.get('addressU', 1),
+                "addressV": sampler.get('addressV', 1),
+                "addressW": sampler.get('addressW', 1),
+            })
+        bl_mat["samplers"] = json.dumps(samplers_json)
+
+        params_json = []
+        for param in mat_data.get('paramValues', []):
+            if 'name' not in param:
+                continue
+            param_entry = {"name": param.get('name', '')}
+            if 'value' in param:
+                param_entry["value"] = param.get('value')
+            params_json.append(param_entry)
+        bl_mat["parameters"] = json.dumps(params_json)
+
+        switches_raw = mat_data.get('switches', {})
+        switches_json = []
+        if isinstance(switches_raw, dict):
+            for name, enabled in switches_raw.items():
+                switches_json.append({"name": name, "on": bool(enabled)})
+        elif isinstance(switches_raw, list):
+            for sw in switches_raw:
+                if isinstance(sw, dict) and "name" in sw:
+                    switches_json.append({"name": sw.get("name", ""), "on": bool(sw.get("on", False))})
+        bl_mat["switches"] = json.dumps(switches_json)
+
+        shader_macros = mat_data.get('shaderMacros', {})
+        if shader_macros:
+            bl_mat["shader_macros"] = json.dumps(shader_macros)
+
+        techniques = mat_data.get('techniques', [])
+        if techniques:
+            bl_mat["techniques"] = json.dumps(techniques)
+
+        child_techniques = mat_data.get('childTechniques', mat_data.get('child_techniques', []))
+        if child_techniques:
+            bl_mat["child_techniques"] = json.dumps(child_techniques)
         
         # --- Dispatch to shader-specific builder ---
         if shader_name in ('ENV_Glass', 'ENV_Glass_Vertex_Offset', 'ENV_Glass_Diffuse'):
@@ -1079,13 +1212,6 @@ class MaterialLoader:
             bl_mat.show_transparent_back = False
         else:
             bl_mat.surface_render_method = 'DITHERED'
-        
-        # Store all shader switches as custom properties for reference
-        switches = mat_data.get('switches', {})
-        if switches:
-            bl_mat["league_switches"] = str(switches)
-        if shader_macros:
-            bl_mat["league_macros"] = str(shader_macros)
         
         # Cache and return
         self.materials_cache[cache_key] = bl_mat
@@ -1211,17 +1337,17 @@ class MaterialLoader:
                 scale_y.inputs[1].default_value = map_scale
                 links.new(separate_xyz.outputs['Y'], scale_y.inputs[0])
                 
-                # Offset to center (0.5, 0.5)
+                # Offset to center (1.0, 1.0)
                 offset_x = nodes.new('ShaderNodeMath')
                 offset_x.operation = 'ADD'
                 offset_x.location = (-650, -350)
-                offset_x.inputs[1].default_value = 0.5
+                offset_x.inputs[1].default_value = 1.0
                 links.new(scale_x.outputs[0], offset_x.inputs[0])
                 
                 offset_y = nodes.new('ShaderNodeMath')
                 offset_y.operation = 'ADD'
                 offset_y.location = (-650, -450)
-                offset_y.inputs[1].default_value = 0.5
+                offset_y.inputs[1].default_value = 1.0
                 links.new(scale_y.outputs[0], offset_y.inputs[0])
                 
                 links.new(offset_x.outputs[0], combine_xy.inputs['X'])

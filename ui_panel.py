@@ -4,7 +4,11 @@ Sidebar panels for layer management and import/export settings
 """
 
 import bpy
+import json
+import os
 from bpy.types import Panel, UIList
+
+from .texture_utils import TexConverter, resolve_texture_path
 
 
 def _material_items(self, context):
@@ -12,6 +16,69 @@ def _material_items(self, context):
     for mat in bpy.data.materials:
         items.append((mat.name, mat.name, ""))
     return items
+
+
+def _get_diffuse_sampler_entry(samplers):
+    sampler_names = {
+        "diffusetexture",
+        "diffuse_texture",
+        "baked_diffuse_texture",
+        "colortexture",
+        "_maintex",
+    }
+    for sampler in samplers:
+        name = (sampler.get("textureName") or "").lower()
+        if name in sampler_names:
+            return sampler
+    return None
+
+
+def _update_material_diffuse_node(mat, texture_path, assets_folder):
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return False
+
+    nodes = mat.node_tree.nodes
+    diffuse_node = None
+
+    for node in nodes:
+        if node.type != 'TEX_IMAGE':
+            continue
+        for link in node.outputs.get('Color', []).links:
+            if link.to_node and link.to_node.type == 'BSDF_PRINCIPLED' and link.to_socket.name == 'Base Color':
+                diffuse_node = node
+                break
+        if diffuse_node:
+            break
+
+    if diffuse_node is None:
+        for node in nodes:
+            if node.type == 'TEX_IMAGE':
+                diffuse_node = node
+                break
+
+    if diffuse_node is None:
+        return False
+
+    resolved_path = resolve_texture_path(texture_path, assets_folder) if assets_folder else None
+    if not resolved_path:
+        return False
+
+    converter = TexConverter()
+    png_path = None
+    if resolved_path.lower().endswith('.dds'):
+        png_path = converter.convert_dds_to_png(resolved_path)
+    else:
+        png_path = converter.convert_tex_to_png(resolved_path)
+
+    if not png_path:
+        return False
+
+    try:
+        img = bpy.data.images.load(png_path, check_existing=True)
+        diffuse_node.image = img
+        return True
+    except Exception:
+        return False
 
 
 
@@ -359,7 +426,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.1.1"
+        addon_version = "0.2.0"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -443,19 +510,32 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         layout.separator()
         
         box = layout.box()
-        box.label(text="Layer Operations (Toggle)", icon='OUTLINER_DATA_MESH')
+        box.label(text="Layer Operations", icon='OUTLINER_DATA_MESH')
+        
+        # Get active object's visibility layer for state display
+        active_obj = context.active_object
+        visibility = active_obj.get("visibility_layer", 0) if active_obj and active_obj.type == 'MESH' else 0
+        
+        layer_info = [
+            (1, "Base"), (2, "Inferno"), (3, "Mountain"), (4, "Ocean"),
+            (5, "Cloud"), (6, "Hextech"), (7, "Chemtech"), (8, "Void"),
+        ]
         
         col = box.column(align=True)
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 1 (Base)").layer = 1
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 2 (Inferno)").layer = 2
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 3 (Mountain)").layer = 3
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 4 (Ocean)").layer = 4
+        for layer_num, name in layer_info[:4]:
+            flag = 1 << (layer_num - 1)
+            is_assigned = bool(visibility & flag)
+            icon = 'CHECKMARK' if is_assigned else 'X'
+            op = col.operator("mapgeo.assign_layer", text=f"Layer {layer_num} ({name})", icon=icon, depress=is_assigned)
+            op.layer = layer_num
         
         col = box.column(align=True)
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 5 (Cloud)").layer = 5
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 6 (Hextech)").layer = 6
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 7 (Chemtech)").layer = 7
-        col.operator("mapgeo.assign_layer", text="Toggle Layer 8 (Void)").layer = 8
+        for layer_num, name in layer_info[4:]:
+            flag = 1 << (layer_num - 1)
+            is_assigned = bool(visibility & flag)
+            icon = 'CHECKMARK' if is_assigned else 'X'
+            op = col.operator("mapgeo.assign_layer", text=f"Layer {layer_num} ({name})", icon=icon, depress=is_assigned)
+            op.layer = layer_num
         
         layout.separator()
         
@@ -464,14 +544,14 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         box.label(text="Quality Settings (0-255)", icon='MODIFIER')
         
         col = box.column(align=True)
-        col.label(text="Common Presets:", icon='PRESET')
+        col.label(text="Quality Levels (Bitmask):", icon='PRESET')
         row = col.row(align=True)
-        row.operator("mapgeo.set_quality", text="0").quality = 0
-        row.operator("mapgeo.set_quality", text="63").quality = 63
-        row.operator("mapgeo.set_quality", text="127").quality = 127
+        row.operator("mapgeo.set_quality", text="Very Low").quality = 1
+        row.operator("mapgeo.set_quality", text="Low").quality = 2
+        row.operator("mapgeo.set_quality", text="Medium").quality = 4
         row = col.row(align=True)
-        row.operator("mapgeo.set_quality", text="191").quality = 191
-        row.operator("mapgeo.set_quality", text="255").quality = 255
+        row.operator("mapgeo.set_quality", text="High").quality = 8
+        row.operator("mapgeo.set_quality", text="Very High").quality = 16
         
         col.separator()
         col.operator("mapgeo.set_quality", text="Custom Quality...", icon='PROPERTIES')
@@ -528,6 +608,30 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
                 break
         if bg_count > 0:
             box.label(text=f"Grids in scene: {bg_count}", icon='INFO')
+        
+        # Point Light Section (Custom Feature)
+        layout.separator()
+        box = layout.box()
+        box.label(text="Point Lights (Custom Feature)", icon='LIGHT_POINT')
+        
+        # Warning box
+        warning_box = box.box()
+        warning_box.alert = True
+        warning_box.label(text="⚠️ NOT used in official maps!", icon='ERROR')
+        warning_box.label(text="For custom/modded maps only")
+        
+        col = box.column(align=True)
+        col.operator("mapgeo.add_point_light", text="Add Point Light to Selected", icon='LIGHT_POINT')
+        col.operator("mapgeo.remove_point_light_from_selected", text="Remove from Selected", icon='X')
+        col.separator()
+        col.operator("mapgeo.export_point_lights", text="Export Lights to JSON", icon='EXPORT')
+        
+        # Show point light count
+        light_count = sum(1 for obj in context.scene.objects if obj.type == 'MESH' and obj.get("point_light_enabled", False))
+        if light_count > 0:
+            box.label(text=f"Meshes with lights: {light_count}", icon='INFO')
+        
+        box.label(text="Research: stationary_light field unused", icon='INFO')
 
 
 class VIEW3D_PT_mapgeo_import_panel(Panel):
@@ -565,6 +669,9 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         col.prop(settings, "levels_folder", text="Levels Folder")
         col.prop(settings, "materials_json_path", text="Materials (.json/.py)")
         col.prop(settings, "map_py_path", text="Map File (.py/.json)")
+
+        col.separator()
+        col.operator("mapgeo.import_materials_file", text="Import Materials File", icon='IMPORT')
         
         # Testing Quick Set Buttons
         col.separator()
@@ -770,6 +877,35 @@ class VIEW3D_PT_mapgeo_properties_panel(Panel):
             row = box.row()
             region_hash = obj["render_region_hash"]
             row.label(text=f"{region_hash}")
+
+        # Material texture overrides
+        mat = obj.active_material if obj else None
+        if mat:
+            layout.separator()
+            box = layout.box()
+            box.label(text="Material Textures", icon='TEXTURE')
+            row = box.row()
+            row.label(text=f"Material: {mat.name}")
+
+            current_path = ""
+            if "samplers" in mat:
+                try:
+                    samplers = json.loads(mat["samplers"])
+                    sampler = _get_diffuse_sampler_entry(samplers)
+                    if sampler:
+                        current_path = sampler.get("texturePath", "")
+                except Exception:
+                    current_path = ""
+
+            if current_path:
+                box.label(text=f"Diffuse: {current_path}")
+            else:
+                box.label(text="Diffuse: (not set)")
+
+            settings = context.scene.mapgeo_settings
+            col = box.column(align=True)
+            col.prop(settings, "material_diffuse_tex_path", text="Diffuse .tex")
+            col.operator("mapgeo.set_diffuse_texture", text="Apply Diffuse", icon='CHECKMARK')
 
 
 
@@ -978,7 +1114,7 @@ class MAPGEO_OT_assign_bush(bpy.types.Operator):
 
 
 class MAPGEO_OT_assign_baron_hash(bpy.types.Operator):
-    """Assign baron hash to selected objects"""
+    """Assign baron hash to selected objects and decode visibility from materials file"""
     bl_idname = "mapgeo.assign_baron_hash"
     bl_label = "Assign Baron Hash"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1002,13 +1138,58 @@ class MAPGEO_OT_assign_baron_hash(bpy.types.Operator):
             self.report({'ERROR'}, "Invalid hex format. Use characters 0-9 and A-F only")
             return {'CANCELLED'}
         
+        hash_upper = self.baron_hash.upper()
+        
+        # Try to decode baron hash from materials file
+        settings = context.scene.mapgeo_settings
+        materials_path = settings.materials_json_path if hasattr(settings, 'materials_json_path') else ""
+        
+        baron_parser = None
+        controller = None
+        if materials_path and os.path.exists(materials_path):
+            try:
+                from . import baron_hash_parser
+                baron_parser = baron_hash_parser.MaterialsBinParser(materials_path)
+                controller = baron_parser.decode_baron_hash(hash_upper)
+            except Exception as e:
+                self.report({'WARNING'}, f"Could not decode baron hash from materials file: {e}")
+        
         count = 0
         for obj in context.selected_objects:
             if obj.type == 'MESH':
-                obj["baron_hash"] = self.baron_hash.upper()
+                obj["baron_hash"] = hash_upper
+                
+                if controller:
+                    # Store decoded baron layers
+                    if controller.baron_layers:
+                        baron_layers_list = sorted(list(controller.baron_layers))
+                        obj["baron_layers_decoded"] = str(baron_layers_list)
+                    else:
+                        obj["baron_layers_decoded"] = "[]"
+                    
+                    # Store decoded dragon layers
+                    if controller.dragon_layers:
+                        dragon_layers_list = sorted(list(controller.dragon_layers))
+                        obj["baron_dragon_layers_decoded"] = str(dragon_layers_list)
+                    else:
+                        obj["baron_dragon_layers_decoded"] = "[]"
+                    
+                    # Store parent mode
+                    obj["baron_parent_mode"] = controller.parent_mode
+                
                 count += 1
         
-        self.report({'INFO'}, f"Assigned baron hash {self.baron_hash.upper()} to {count} objects")
+        # Trigger visibility update
+        if hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+        
+        if controller:
+            self.report({'INFO'}, f"Assigned baron hash {hash_upper} to {count} objects (decoded from materials file)")
+        elif not materials_path:
+            self.report({'WARNING'}, f"Assigned baron hash {hash_upper} to {count} objects — set Materials path in Import Settings to decode visibility")
+        else:
+            self.report({'WARNING'}, f"Assigned baron hash {hash_upper} to {count} objects — could not decode, visibility may not update correctly")
         return {'FINISHED'}
     
     def invoke(self, context, event):
@@ -1051,6 +1232,67 @@ class MAPGEO_OT_assign_render_region_hash(bpy.types.Operator):
     
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
+
+
+class MAPGEO_OT_set_diffuse_texture(bpy.types.Operator):
+    """Update diffuse texture in the selected object's material"""
+    bl_idname = "mapgeo.set_diffuse_texture"
+    bl_label = "Set Diffuse Texture"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        tex_path = settings.material_diffuse_tex_path
+        
+        if not tex_path:
+            self.report({'ERROR'}, "No texture path specified")
+            return {'CANCELLED'}
+        
+        # Get active object and material
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "No active mesh object")
+            return {'CANCELLED'}
+        
+        mat = obj.active_material
+        if not mat:
+            self.report({'ERROR'}, "Active object has no active material")
+            return {'CANCELLED'}
+        
+        # Update sampler JSON
+        if "samplers" in mat:
+            try:
+                samplers = json.loads(mat["samplers"])
+                sampler = _get_diffuse_sampler_entry(samplers)
+                
+                if not sampler:
+                    # Create new sampler entry
+                    sampler = {
+                        "textureName": "DiffuseTexture",
+                        "texturePath": tex_path if tex_path.lower().endswith(('.tex', '.dds', '.png')) else tex_path + '.tex',
+                        "addressU": 0,
+                        "addressV": 0,
+                        "addressW": 0
+                    }
+                    samplers.append(sampler)
+                else:
+                    # Update existing sampler
+                    sampler["texturePath"] = tex_path if tex_path.lower().endswith(('.tex', '.dds', '.png')) else tex_path + '.tex'
+                
+                mat["samplers"] = json.dumps(samplers)
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to update sampler: {str(e)}")
+                return {'CANCELLED'}
+        else:
+            self.report({'WARNING'}, "Material has no samplers data")
+        
+        # Update material node
+        if _update_material_diffuse_node(mat, tex_path, settings.assets_folder):
+            self.report({'INFO'}, "Diffuse texture updated successfully")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "Diffuse texture updated in data but failed to load image node")
+            return {'FINISHED'}
 
 
 class MAPGEO_OT_set_test_paths(bpy.types.Operator):
@@ -1579,6 +1821,192 @@ class MAPGEO_OT_show_not_used(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MAPGEO_OT_add_point_light(bpy.types.Operator):
+    """Add a Blender Point Light linked to selected mesh (Custom feature - not used in official maps)"""
+    bl_idname = "mapgeo.add_point_light"
+    bl_label = "Add Point Light"
+    bl_description = "Add a point light to selected mesh (Custom/Modded feature only)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    light_color: bpy.props.FloatVectorProperty(
+        name="Color",
+        subtype='COLOR',
+        default=(1.0, 0.95, 0.8),
+        min=0.0,
+        max=1.0,
+        description="Light color"
+    )
+    
+    light_intensity: bpy.props.FloatProperty(
+        name="Intensity",
+        default=500.0,
+        min=0.0,
+        description="Light intensity (power in Watts for Blender)"
+    )
+    
+    light_radius: bpy.props.FloatProperty(
+        name="Radius",
+        default=5.0,
+        min=0.0,
+        description="Light influence radius"
+    )
+    
+    offset_z: bpy.props.FloatProperty(
+        name="Z Offset",
+        default=2.0,
+        description="Z offset from mesh origin"
+    )
+    
+    @classmethod
+    def poll(cls, context):
+        return context.selected_objects and any(obj.type == 'MESH' for obj in context.selected_objects)
+    
+    def execute(self, context):
+        created_lights = 0
+        
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            
+            # Create light data
+            light_data = bpy.data.lights.new(name=f"{obj.name}_PointLight", type='POINT')
+            light_data.energy = self.light_intensity
+            light_data.color = self.light_color
+            light_data.shadow_soft_size = self.light_radius
+            
+            # Create light object
+            light_obj = bpy.data.objects.new(name=f"{obj.name}_PointLight", object_data=light_data)
+            light_obj.location = obj.location.copy()
+            light_obj.location.z += self.offset_z
+            
+            # Link to same collection as mesh
+            for collection in obj.users_collection:
+                collection.objects.link(light_obj)
+            
+            # Parent to mesh
+            light_obj.parent = obj
+            
+            # Store light properties on mesh
+            obj["point_light_enabled"] = True
+            obj["point_light_color"] = list(self.light_color)
+            obj["point_light_intensity"] = self.light_intensity
+            obj["point_light_radius"] = self.light_radius
+            obj["point_light_offset_z"] = self.offset_z
+            
+            created_lights += 1
+        
+        if created_lights > 0:
+            self.report({'INFO'}, f"Created {created_lights} point light(s)")
+        else:
+            self.report({'WARNING'}, "No mesh objects selected")
+        
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class MAPGEO_OT_remove_point_light_from_selected(bpy.types.Operator):
+    """Remove point lights from selected meshes"""
+    bl_idname = "mapgeo.remove_point_light_from_selected"
+    bl_label = "Remove Point Lights"
+    bl_description = "Remove point lights from selected meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return context.selected_objects and any(
+            obj.type == 'MESH' and obj.get("point_light_enabled", False) 
+            for obj in context.selected_objects
+        )
+    
+    def execute(self, context):
+        removed_lights = 0
+        removed_objects = 0
+        
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            
+            if not obj.get("point_light_enabled", False):
+                continue
+            
+            # Find and remove child light objects
+            for child in obj.children[:]:  # Copy list to avoid modification during iteration
+                if child.type == 'LIGHT':
+                    bpy.data.objects.remove(child, do_unlink=True)
+                    removed_objects += 1
+            
+            # Remove properties
+            for key in ["point_light_enabled", "point_light_color", "point_light_intensity", 
+                       "point_light_radius", "point_light_offset_z"]:
+                if key in obj:
+                    del obj[key]
+            
+            removed_lights += 1
+        
+        if removed_lights > 0:
+            self.report({'INFO'}, f"Removed point light data from {removed_lights} mesh(es), deleted {removed_objects} light object(s)")
+        else:
+            self.report({'WARNING'}, "No meshes with point lights selected")
+        
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_export_point_lights(bpy.types.Operator):
+    """Export point lights to JSON file (for custom/modded maps)"""
+    bl_idname = "mapgeo.export_point_lights"
+    bl_label = "Export Point Lights to JSON"
+    bl_description = "Export point light data to companion JSON file"
+    bl_options = {'REGISTER'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    
+    def execute(self, context):
+        import json
+        
+        lights_data = []
+        
+        for obj in context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            
+            if not obj.get("point_light_enabled", False):
+                continue
+            
+            light_data = {
+                "mesh_name": obj.name,
+                "type": "point",
+                "position": list(obj.location),
+                "color": obj.get("point_light_color", [1.0, 1.0, 1.0]),
+                "intensity": obj.get("point_light_intensity", 500.0),
+                "radius": obj.get("point_light_radius", 5.0),
+                "offset_z": obj.get("point_light_offset_z", 0.0)
+            }
+            lights_data.append(light_data)
+        
+        if not lights_data:
+            self.report({'WARNING'}, "No point lights to export")
+            return {'CANCELLED'}
+        
+        # Write JSON
+        output = {
+            "version": 1,
+            "note": "Custom point light data - not used in official League maps",
+            "lights": lights_data
+        }
+        
+        with open(self.filepath, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        self.report({'INFO'}, f"Exported {len(lights_data)} point light(s) to {self.filepath}")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 # Register classes
 classes = (
     VIEW3D_PT_mapgeo_panel,
@@ -1594,11 +2022,15 @@ classes = (
     MAPGEO_OT_assign_bush,
     MAPGEO_OT_assign_baron_hash,
     MAPGEO_OT_assign_render_region_hash,
+    MAPGEO_OT_set_diffuse_texture,
     MAPGEO_OT_set_test_paths,
     MAPGEO_OT_show_all,
     MAPGEO_OT_show_not_used,
     MAPGEO_OT_toggle_bucket_grid_selectable,
     MAPGEO_OT_create_bucket_grid,
+    MAPGEO_OT_add_point_light,
+    MAPGEO_OT_remove_point_light_from_selected,
+    MAPGEO_OT_export_point_lights,
 )
 
 

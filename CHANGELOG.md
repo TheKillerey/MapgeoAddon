@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+## [0.2.0] - 2026-02-15
+
+### ✨ Features Added
+
+- **Shader template system** - Create materials from real game templates
+  - 91 shader templates extracted from 9,509 materials
+  - Per-shader samplers, parameters, switches, macros, blend settings
+  - New template picker with most-used-first sorting
+
+- **Dropdowns for Add operators** - No more free-text for samplers/params/switches/macros/techniques
+  - Uses curated enums for shader compatibility and naming consistency
+
+#### Point Light System (Custom Feature)
+- **Add Point Light Operator** - Add Blender Point Lights linked to meshes
+  - Creates actual Blender light objects in viewport
+  - Stores custom properties: color, intensity, radius, Z offset
+  - Parented to mesh for easy manipulation
+  - Dialog for configuring light parameters
+  
+- **Point Light Management UI** - New panel section in Layer Management
+  - "Add Point Light to Selected" button
+  - "Remove from Selected" button
+  - "Export Lights to JSON" operator
+  - Warning labels: "NOT used in official maps!"
+  - Shows count of meshes with point lights
+  
+- **Import Point Light Support** - Auto-creates Blender lights on import
+  - Reads point_light custom properties from meshes
+  - Creates and parents light objects automatically
+  
+- **Export Point Lights to JSON** - Save light data to companion file
+  - JSON format with light definitions
+  - Mesh name, position, color, intensity, radius
+  - For custom/modded map workflows
+  
+- **Stationary Light Research** - Comprehensive field analysis
+  - Scanned 195 .mapgeo files (~150,000+ meshes)
+  - Result: Field exists but is UNUSED in all official maps
+  - Documentation: `STATIONARY_LIGHT_RESEARCH.md`
+
+### 🛠 Fixes
+
+- **GrassTintMap UV offsets** - Corrected ADD offsets from 0.5 to 1.0 for bush shading
+- **Baron hash assignment** - Decodes materials file on assign and refreshes visibility
+- **Visibility culling** - Exported bounding sphere/box computed in world space
+
+### ✨ UI Improvements
+
+- **Layer Operations buttons** - Switch style buttons now show assigned state
+- **Material switch toggles** - Switch controls display button state with label text
+
+### ⚠️ Important Notes
+
+**Point lights are a CUSTOM feature**:
+- The `stationary_light` field exists in .mapgeo format but is completely unused
+- This feature is for custom/modded maps only
+- NOT compatible with official League client
+- Requires modded game client or custom rendering pipeline
+
+---
+
 ## [0.1.1] - 2026-02-14
 
 ### 🛠 Fixes
