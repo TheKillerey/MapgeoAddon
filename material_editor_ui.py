@@ -271,23 +271,34 @@ def _sync_sampler_texture(mat, sampler_index, texture_path):
 
         # Resolve the on-disk file ------------------------------------------
         assets_folder = None
+        custom_assets_folder = None
+        prioritize_custom = False
         if hasattr(bpy.context.scene, 'mapgeo_settings'):
             assets_folder = bpy.context.scene.mapgeo_settings.assets_folder
+            custom_assets_folder = bpy.context.scene.mapgeo_settings.custom_assets_folder
+            prioritize_custom = bpy.context.scene.mapgeo_settings.prioritize_custom_assets
 
         resolved_path = None
-        if assets_folder and resolve_texture_path:
-            resolved_path = resolve_texture_path(tex_path, assets_folder)
+        if (assets_folder or custom_assets_folder) and resolve_texture_path:
+            resolved_path = resolve_texture_path(tex_path, assets_folder, custom_assets_folder, prioritize_custom)
             if not resolved_path and tex_path.lower().startswith('assets/'):
-                resolved_path = resolve_texture_path(tex_path[7:], assets_folder)
+                resolved_path = resolve_texture_path(tex_path[7:], assets_folder, custom_assets_folder, prioritize_custom)
             if not resolved_path:
-                test = os.path.join(
-                    assets_folder,
-                    tex_path.replace('ASSETS/', '').replace('/', os.sep),
-                )
-                base = test.rsplit('.', 1)[0] if '.' in test else test
-                for ext in ('.tex', '.dds', '.png'):
-                    if os.path.exists(base + ext):
-                        resolved_path = base + ext
+                # Manual fallback check - try both folders
+                for folder in [assets_folder, custom_assets_folder]:
+                    if not folder:
+                        continue
+                    test = os.path.join(
+                        folder,
+                        tex_path.replace('ASSETS/', '').replace('/', os.sep),
+                    )
+                    base = test.rsplit('.', 1)[0] if '.' in test else test
+                    for ext in ('.tex', '.dds', '.png'):
+                        if os.path.exists(base + ext):
+                            resolved_path = base + ext
+                            break
+                    if resolved_path:
+                        break
                         break
         elif os.path.exists(tex_path):
             resolved_path = tex_path

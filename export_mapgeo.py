@@ -135,27 +135,39 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             # Also exclude objects in bucket grid collections
             objects = [obj for obj in objects if not any(col.get("is_bucket_grid_collection") for col in obj.users_collection)]
             
-            # If we have a known import source, only export meshes from that collection
-            if settings.last_import_path:
-                def collect_collection_meshes(collection, output):
-                    for col_obj in collection.objects:
-                        if col_obj.type == 'MESH':
-                            output.add(col_obj)
-                    for child in collection.children:
-                        collect_collection_meshes(child, output)
-                
-                source_collections = [
-                    col for col in bpy.data.collections
-                    if col.get("source_mapgeo_path") == settings.last_import_path
-                ]
-                
-                if source_collections:
-                    collected_meshes = set()
-                    for source_col in source_collections:
-                        collect_collection_meshes(source_col, collected_meshes)
-                    objects = [obj for obj in objects if obj in collected_meshes]
+            # Find meshes from root collection by name
+            root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
+            
+            def collect_collection_meshes(collection, output):
+                for col_obj in collection.objects:
+                    if col_obj.type == 'MESH':
+                        output.add(col_obj)
+                for child in collection.children:
+                    collect_collection_meshes(child, output)
+            
+            # Find root collection by name
+            root_collection = bpy.data.collections.get(root_name)
+            if root_collection:
+                collected_meshes = set()
+                collect_collection_meshes(root_collection, collected_meshes)
+                objects = [obj for obj in objects if obj in collected_meshes]
+                print(f"Exporting from root collection '{root_name}': {len(objects)} mesh objects")
+            else:
+                # Fallback: try source_mapgeo_path
+                if settings.last_import_path:
+                    source_collections = [
+                        col for col in bpy.data.collections
+                        if col.get("source_mapgeo_path") == settings.last_import_path
+                    ]
+                    if source_collections:
+                        collected_meshes = set()
+                        for source_col in source_collections:
+                            collect_collection_meshes(source_col, collected_meshes)
+                        objects = [obj for obj in objects if obj in collected_meshes]
+                    else:
+                        print(f"Warning: No root collection '{root_name}' found; exporting all meshes")
                 else:
-                    print("Warning: No source collection found for last_import_path; exporting all meshes")
+                    print(f"Warning: No root collection '{root_name}' found; exporting all meshes")
             
             if not objects:
                 self.report({'WARNING'}, "No mesh objects to export (excluding bucket grids)")
@@ -305,6 +317,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         # Check if mesh has TEXCOORD5 attribute (bush animation anchor data)
         has_texcoord5 = "TEXCOORD5" in mesh.attributes
         
+        # Check if mesh has LightmapUV layer (TEXCOORD7)
+        has_lightmap_uv = "LightmapUV" in mesh.uv_layers
+        
         # Check for vertex color attribute
         color_attr = None
         if self.export_vertex_colors:
@@ -358,6 +373,15 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             ))
             offset += 12
         
+        # TEXCOORD7 (lightmap UV - XY_FLOAT32)
+        if has_lightmap_uv:
+            elements.append(mapgeo_parser.VertexElement(
+                mapgeo_parser.VertexElementName.TEXCOORD7,
+                mapgeo_parser.VertexElementFormat.XY_FLOAT32,
+                offset
+            ))
+            offset += 8
+        
         # Create description
         description = mapgeo_parser.VertexBufferDescription(
             usage=0,  # Static
@@ -373,8 +397,14 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         # Get UV layer
         uv_layer = mesh.uv_layers.active if mesh.uv_layers else None
         
+        # Get LightmapUV layer (TEXCOORD7)
+        lightmap_uv_layer = mesh.uv_layers.get("LightmapUV") if has_lightmap_uv else None
+        
         # Get TEXCOORD5 attribute
         tc5_attr = mesh.attributes.get("TEXCOORD5") if has_texcoord5 else None
+        
+        # Get raw_normals attribute (render region meshes store non-unit normals)
+        raw_normals_attr = mesh.attributes.get("raw_normals")
         
         # Build a map from vertex index to loop indices for UVs and colors
         vert_to_loops = {}
@@ -402,9 +432,17 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             # Normal in LOCAL space (same coordinate swap as position)
             if self.export_normals:
-                local_normal = vert.normal
-                struct.pack_into('<fff', vertex_data, offset + current_offset,
-                               local_normal.x, local_normal.z, local_normal.y)
+                if raw_normals_attr and vert_idx < len(raw_normals_attr.data):
+                    # Use preserved raw normals (render region meshes have non-unit normals)
+                    rn = raw_normals_attr.data[vert_idx].vector
+                    # raw_normals are stored in Blender coords (X, Z_mapgeo, Y_mapgeo)
+                    # Swap back: Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
+                    struct.pack_into('<fff', vertex_data, offset + current_offset,
+                                   rn.x, rn.z, rn.y)
+                else:
+                    local_normal = vert.normal
+                    struct.pack_into('<fff', vertex_data, offset + current_offset,
+                                   local_normal.x, local_normal.z, local_normal.y)
                 current_offset += 12
             
             # Vertex Color in BGRA format (League native)
@@ -442,6 +480,19 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 struct.pack_into('<fff', vertex_data, offset + current_offset,
                                vec[0], vec[2], vec[1])
                 current_offset += 12
+            
+            # TEXCOORD7 - lightmap UV
+            if lightmap_uv_layer:
+                # Get first loop for this vertex
+                if vert_idx in vert_to_loops and len(vert_to_loops[vert_idx]) > 0:
+                    loop_idx = vert_to_loops[vert_idx][0]
+                    uv = lightmap_uv_layer.data[loop_idx].uv
+                    # Flip V coordinate
+                    struct.pack_into('<ff', vertex_data, offset + current_offset,
+                                   uv[0], 1.0 - uv[1])
+                else:
+                    struct.pack_into('<ff', vertex_data, offset + current_offset, 0.0, 0.0)
+                current_offset += 8
         
         return mapgeo_parser.VertexBuffer(
             description=description,
@@ -480,10 +531,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         # Get quality and visibility from custom properties (set during import)
         # Try both old property names (mapgeo_*) and new names (*) for compatibility
         raw_quality = obj.get("quality", obj.get("mapgeo_quality", int(self.default_quality)))
-        # Quality is a BITMASK (0-31), not enum. Clamp to valid range to prevent crashes
-        mesh_entry.quality = max(0, min(31, int(raw_quality)))
-        if raw_quality != mesh_entry.quality:
-            print(f"WARNING: Object {obj.name} had invalid quality {raw_quality}, clamped to {mesh_entry.quality}")
+        # Quality is a uint8 bitmask. 31 = standard 5 quality levels, 255 = all bits (render regions).
+        mesh_entry.quality = max(0, min(255, int(raw_quality)))
         mesh_entry.visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility", 
                                                                     mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
         mesh_entry.layer_transition_behavior = obj.get("layer_transition_behavior", 0)
@@ -504,31 +553,28 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             except (ValueError, TypeError):
                 mesh_entry.visibility_controller_path_hash = 0
         
-        # Calculate bounding volumes in WORLD space
-        # The game engine uses bounding sphere/box for frustum culling in world space.
-        # Vertex data is stored in local space, but bounds must reflect actual world position.
+        # Calculate bounding volumes in LOCAL space
+        # The game engine combines these bounds with the per-mesh transform matrix.
+        # Vertex data is stored in local space, and bounds must also be in local space.
         if mesh.vertices:
-            # Transform each vertex to world space, then convert to League coords
-            # Blender world -> League: (X, Z, Y)
-            world_positions = []
+            # Convert local vertex positions to League coords: Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
+            local_positions = []
             for v in mesh.vertices:
-                world_pos = obj.matrix_world @ v.co
-                # Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
-                world_positions.append((world_pos.x, world_pos.z, world_pos.y))
+                local_positions.append((v.co.x, v.co.z, v.co.y))
             
-            min_x = min(p[0] for p in world_positions)
-            min_y = min(p[1] for p in world_positions)
-            min_z = min(p[2] for p in world_positions)
-            max_x = max(p[0] for p in world_positions)
-            max_y = max(p[1] for p in world_positions)
-            max_z = max(p[2] for p in world_positions)
+            min_x = min(p[0] for p in local_positions)
+            min_y = min(p[1] for p in local_positions)
+            min_z = min(p[2] for p in local_positions)
+            max_x = max(p[0] for p in local_positions)
+            max_y = max(p[1] for p in local_positions)
+            max_z = max(p[2] for p in local_positions)
             
             mesh_entry.bounding_box = mapgeo_parser.BoundingBox(
                 min=(min_x, min_y, min_z),
                 max=(max_x, max_y, max_z)
             )
             
-            # Bounding sphere from world-space positions
+            # Bounding sphere from local-space positions
             center_x = (min_x + max_x) / 2
             center_y = (min_y + max_y) / 2
             center_z = (min_z + max_z) / 2
@@ -536,7 +582,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             radius = max(
                 (Vector(p) - center).length 
-                for p in world_positions
+                for p in local_positions
             )
             
             mesh_entry.bounding_sphere = mapgeo_parser.BoundingSphere(
@@ -641,61 +687,89 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         return mesh_entry
     
     def collect_imported_bucket_grids(self, context, mapgeo: mapgeo_parser.MapgeoFile):
-        """Collect bucket grids from imported data (stored in module cache)"""
+        """Collect bucket grids from scene data (stored on BucketGrid collections)"""
         
-        # Retrieve bucket grids from module cache (populated during import)
-        bucket_grids_data = list(import_mapgeo._imported_bucket_grids_cache.values())
+        # Find all bucket grid collections in the scene
+        bucket_grid_collections = []
+        scene_col_names = {c.name for c in self._get_all_collections(context)}
+        for col in bpy.data.collections:
+            if col.get("is_bucket_grid_collection") and col.get("bucket_data_json"):
+                # Verify collection is actually linked to the scene (not orphaned)
+                if col.name in scene_col_names:
+                    bucket_grid_collections.append(col)
         
-        if not bucket_grids_data:
-            print("No imported bucket grids found in cache")
+        if not bucket_grid_collections:
+            print("No bucket grid collections found in scene")
             return
         
-        print(f"Found {len(bucket_grids_data)} imported bucket grid(s) in cache")
-        
-        # Reconstruct BucketGrid objects from cached data
-        for grid_data in bucket_grids_data:
+        total_grids = 0
+        for col in bucket_grid_collections:
             try:
-                grid = mapgeo_parser.BucketGrid()
-                grid.path_hash = grid_data.get("path_hash", 0)
-                grid.min_x = grid_data.get("min_x", 0.0)
-                grid.min_z = grid_data.get("min_z", 0.0)
-                grid.max_x = grid_data.get("max_x", 0.0)
-                grid.max_z = grid_data.get("max_z", 0.0)
-                grid.bucket_size_x = grid_data.get("bucket_size_x", 512.0)
-                grid.bucket_size_z = grid_data.get("bucket_size_z", 512.0)
-                grid.buckets_per_side = int(grid_data.get("buckets_per_side", 1))
-                grid.is_disabled = grid_data.get("is_disabled", False)
-                grid.flags = int(grid_data.get("flags", 0))
-                grid.unknown_v18_float = grid_data.get("unknown_v18_float", 0.0)
-                grid.max_stickout_x = grid_data.get("max_stickout_x", 0.0)
-                grid.max_stickout_z = grid_data.get("max_stickout_z", 0.0)
-                
-                # Restore vertices and indices
-                grid.vertices = [tuple(v) for v in grid_data.get("vertices", [])]
-                grid.indices = grid_data.get("indices", [])
-                grid.face_visibility_flags = grid_data.get("face_visibility_flags", [])
-                
-                # Restore buckets
-                for row_data in grid_data.get("buckets", []):
-                    row = []
-                    for bucket_data in row_data:
-                        bucket = mapgeo_parser.GeometryBucket(
-                            max_stickout_x=float(bucket_data.get("max_stickout_x", 0.0)),
-                            max_stickout_z=float(bucket_data.get("max_stickout_z", 0.0)),
-                            start_index=int(bucket_data.get("start_index", 0)),
-                            base_vertex=int(bucket_data.get("base_vertex", 0)),
-                            inside_face_count=int(bucket_data.get("inside_face_count", 0)),
-                            sticking_out_face_count=int(bucket_data.get("sticking_out_face_count", 0))
-                        )
-                        row.append(bucket)
-                    grid.buckets.append(row)
-                
-                mapgeo.bucket_grids.append(grid)
-                print(f"  Exported imported bucket grid (hash: {hex(grid.path_hash)})")
-            except Exception as e:
-                print(f"  ERROR reconstructing bucket grid: {str(e)}")
-                import traceback
-                traceback.print_exc()
+                bucket_data_json = col.get("bucket_data_json", "[]")
+                bucket_grids_data = json.loads(bucket_data_json)
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"  ERROR parsing bucket_data_json from collection '{col.name}': {e}")
+                continue
+            
+            print(f"Found {len(bucket_grids_data)} bucket grid(s) in collection '{col.name}'")
+            
+            # Reconstruct BucketGrid objects from stored JSON data
+            for grid_data in bucket_grids_data:
+                try:
+                    grid = mapgeo_parser.BucketGrid()
+                    grid.path_hash = grid_data.get("path_hash", 0)
+                    grid.min_x = grid_data.get("min_x", 0.0)
+                    grid.min_z = grid_data.get("min_z", 0.0)
+                    grid.max_x = grid_data.get("max_x", 0.0)
+                    grid.max_z = grid_data.get("max_z", 0.0)
+                    grid.bucket_size_x = grid_data.get("bucket_size_x", 512.0)
+                    grid.bucket_size_z = grid_data.get("bucket_size_z", 512.0)
+                    grid.buckets_per_side = int(grid_data.get("buckets_per_side", 1))
+                    grid.is_disabled = grid_data.get("is_disabled", False)
+                    grid.flags = int(grid_data.get("flags", 0))
+                    grid.unknown_v18_float = grid_data.get("unknown_v18_float", 0.0)
+                    grid.max_stickout_x = grid_data.get("max_stickout_x", 0.0)
+                    grid.max_stickout_z = grid_data.get("max_stickout_z", 0.0)
+                    
+                    # Restore vertices and indices
+                    grid.vertices = [tuple(v) for v in grid_data.get("vertices", [])]
+                    grid.indices = grid_data.get("indices", [])
+                    grid.face_visibility_flags = grid_data.get("face_visibility_flags", [])
+                    
+                    # Restore buckets
+                    for row_data in grid_data.get("buckets", []):
+                        row = []
+                        for bucket_data in row_data:
+                            bucket = mapgeo_parser.GeometryBucket(
+                                max_stickout_x=float(bucket_data.get("max_stickout_x", 0.0)),
+                                max_stickout_z=float(bucket_data.get("max_stickout_z", 0.0)),
+                                start_index=int(bucket_data.get("start_index", 0)),
+                                base_vertex=int(bucket_data.get("base_vertex", 0)),
+                                inside_face_count=int(bucket_data.get("inside_face_count", 0)),
+                                sticking_out_face_count=int(bucket_data.get("sticking_out_face_count", 0))
+                            )
+                            row.append(bucket)
+                        grid.buckets.append(row)
+                    
+                    mapgeo.bucket_grids.append(grid)
+                    total_grids += 1
+                    print(f"  Exported bucket grid (hash: {hex(grid.path_hash)})")
+                except Exception as e:
+                    print(f"  ERROR reconstructing bucket grid: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+        
+        print(f"Total bucket grids exported from scene: {total_grids}")
+    
+    def _get_all_collections(self, context):
+        """Get all collections linked to the scene (recursively)"""
+        result = []
+        def recurse(col):
+            result.append(col)
+            for child in col.children:
+                recurse(child)
+        recurse(context.scene.collection)
+        return result
     
     def collect_custom_bucket_grids(self, context, mapgeo: mapgeo_parser.MapgeoFile):
         """Collect bucket grids from custom-created data (EXPERIMENTAL)"""

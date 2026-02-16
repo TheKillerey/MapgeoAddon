@@ -16,8 +16,10 @@ class MaterialLoader:
     """Loads and creates Blender materials from League materials JSON or Python format"""
     
     def __init__(self, assets_folder: str = "", levels_folder: str = "",
-                 map_py_path: str = "", dragon_layer: str = "LAYER_1"):
+                 map_py_path: str = "", dragon_layer: str = "LAYER_1", custom_assets_folder: str = "", prioritize_custom: bool = False):
         self.assets_folder = assets_folder
+        self.custom_assets_folder = custom_assets_folder
+        self.prioritize_custom = prioritize_custom
         self.levels_folder = levels_folder
         self.map_py_path = map_py_path
         self.dragon_layer = dragon_layer  # e.g. 'LAYER_1' (base), 'LAYER_2' (Inferno), etc.
@@ -963,7 +965,9 @@ class MaterialLoader:
             assets_folder=assets_folder,
             levels_folder=levels_folder,
             map_py_path=map_py_path,
-            dragon_layer=dragon_layer
+            dragon_layer=dragon_layer,
+            custom_assets_folder=getattr(settings, 'custom_assets_folder', ''),
+            prioritize_custom=getattr(settings, 'prioritize_custom_assets', False)
         )
         loader._materials_path = materials_path
         
@@ -1933,10 +1937,10 @@ class MaterialLoader:
         Returns:
             ShaderNodeTexImage node or None
         """
-        if not self.assets_folder:
+        if not self.assets_folder and not self.custom_assets_folder:
             return None
         
-        full_tex_path = resolve_texture_path(texture_path, self.assets_folder)
+        full_tex_path = resolve_texture_path(texture_path, self.assets_folder, self.custom_assets_folder, self.prioritize_custom)
         if not full_tex_path:
             return None
         
@@ -1998,11 +2002,11 @@ class MaterialLoader:
         Returns:
             ShaderNodeTexImage node or None
         """
-        if not self.assets_folder:
+        if not self.assets_folder and not self.custom_assets_folder:
             return None
         
         # Resolve texture path (tries .tex -> .dds -> .png)
-        full_tex_path = resolve_texture_path(texture_path, self.assets_folder)
+        full_tex_path = resolve_texture_path(texture_path, self.assets_folder, self.custom_assets_folder, self.prioritize_custom)
         if not full_tex_path:
             print(f"  Warning: Could not find texture: {texture_path}")
             return None

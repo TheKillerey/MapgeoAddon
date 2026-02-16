@@ -33,7 +33,7 @@ def _get_diffuse_sampler_entry(samplers):
     return None
 
 
-def _update_material_diffuse_node(mat, texture_path, assets_folder):
+def _update_material_diffuse_node(mat, texture_path, assets_folder, custom_assets_folder="", prioritize_custom=False):
     if not mat or not mat.use_nodes or not mat.node_tree:
         return False
 
@@ -59,7 +59,7 @@ def _update_material_diffuse_node(mat, texture_path, assets_folder):
     if diffuse_node is None:
         return False
 
-    resolved_path = resolve_texture_path(texture_path, assets_folder) if assets_folder else None
+    resolved_path = resolve_texture_path(texture_path, assets_folder, custom_assets_folder, prioritize_custom) if (assets_folder or custom_assets_folder) else None
     if not resolved_path:
         return False
 
@@ -426,7 +426,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.0"
+        addon_version = "0.2.1"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -470,9 +470,27 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         layout = self.layout
         settings = context.scene.mapgeo_settings
         
+        # Edit Mode Toggle (prominent placement)
+        box = layout.box()
+        box.label(text="Visibility System", icon='RESTRICT_VIEW_OFF')
+        
+        col = box.column(align=True)
+        col.scale_y = 1.3
+        col.prop(settings, "edit_mode", text="Edit Mode (Show All)", toggle=True, icon='EDITMODE_HLT' if settings.edit_mode else 'OBJECT_DATAMODE')
+        
+        if settings.edit_mode:
+            info_box = col.box()
+            info_box.alert = True
+            info_box.label(text="⚠ Layer system disabled", icon='INFO')
+            info_box.label(text="All objects visible for editing")
+        
         # Environment visibility filters (League engine style)
+        layout.separator()
         box = layout.box()
         box.label(text="Environment State", icon='WORLD')
+        
+        # Disable controls if edit mode is active
+        box.enabled = not settings.edit_mode
         
         col = box.column(align=True)
         col.label(text="Dragon Variation:", icon='OUTLINER_DATA_MESH')
@@ -665,7 +683,22 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         box.label(text="Materials & Textures", icon='MATERIAL')
         
         col = box.column(align=True)
-        col.prop(settings, "assets_folder", text="Assets Folder")
+        col.label(text="Assets Folders:", icon='FILE_FOLDER')
+        col.prop(settings, "assets_folder", text="Original (Riot)")
+        col.prop(settings, "custom_assets_folder", text="Custom")
+        
+        # Priority toggle
+        if settings.assets_folder and settings.custom_assets_folder:
+            priority_row = col.row()
+            priority_row.prop(settings, "prioritize_custom_assets", text="Custom First", toggle=True, icon='SORT_ASC' if settings.prioritize_custom_assets else 'SORT_DESC')
+            priority_info = col.box()
+            priority_info.scale_y = 0.7
+            if settings.prioritize_custom_assets:
+                priority_info.label(text="Order: Custom → Original", icon='INFO')
+            else:
+                priority_info.label(text="Order: Original → Custom", icon='INFO')
+        
+        col.separator()
         col.prop(settings, "levels_folder", text="Levels Folder")
         col.prop(settings, "materials_json_path", text="Materials (.json/.py)")
         col.prop(settings, "map_py_path", text="Map File (.py/.json)")
@@ -680,7 +713,7 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         test_col = test_box.column(align=True)
         test_col.operator("mapgeo.set_test_paths", text="Set Test Paths (Map11)", icon='FILEBROWSER')
         
-        if settings.assets_folder and settings.materials_json_path:
+        if (settings.assets_folder or settings.custom_assets_folder) and settings.materials_json_path:
             box.label(text="✓ Materials enabled", icon='CHECKMARK')
             if settings.map_py_path:
                 box.label(text="✓ Map file set (grass tint)", icon='CHECKMARK')
@@ -907,6 +940,145 @@ class VIEW3D_PT_mapgeo_properties_panel(Panel):
             col.prop(settings, "material_diffuse_tex_path", text="Diffuse .tex")
             col.operator("mapgeo.set_diffuse_texture", text="Apply Diffuse", icon='CHECKMARK')
 
+
+class VIEW3D_PT_mapgeo_utilities_panel(Panel):
+    """Utilities Panel for mesh and material management"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "Utilities"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        # Import from other mapgeo files
+        box = layout.box()
+        box.label(text="Import from Mapgeo", icon='IMPORT')
+        
+        col = box.column(align=True)
+        col.operator("mapgeo.import_bushes_from_mapgeo", text="Import Bushes", icon='OUTLINER_OB_FORCE_FIELD')
+        col.operator("mapgeo.import_render_regions_from_mapgeo", text="Import Render Regions", icon='MESH_GRID')
+        col.operator("mapgeo.import_bucket_grid_from_mapgeo", text="Import Bucket Grid", icon='GRID')
+        
+        # Import external meshes
+        layout.separator()
+        box = layout.box()
+        box.label(text="Import External Meshes", icon='MESH_DATA')
+        
+        col = box.column(align=True)
+        col.operator("mapgeo.import_external_mesh", text="Import Mesh (glTF/FBX/OBJ)", icon='IMPORT')
+        box.label(text="No materials - manual setup required", icon='INFO')
+        
+        # Cleanup utilities
+        layout.separator()
+        box = layout.box()
+        box.label(text="Cleanup", icon='BRUSH_DATA')
+        
+        col = box.column(align=True)
+        col.operator("mapgeo.cleanup_unused_materials", text="Remove Unused Materials", icon='TRASH')
+
+
+class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
+    """LightGrid Panel for light baking"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "LightGrid"
+    bl_idname = "VIEW3D_PT_mapgeo_lightgrid_panel"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        # Display current lightgrid info
+        if "lightgrid_width" in scene:
+            box = layout.box()
+            box.label(text="Loaded LightGrid", icon='OUTLINER_DATA_LIGHTPROBE')
+            
+            width = scene.get("lightgrid_width", 0)
+            height = scene.get("lightgrid_height", 0)
+            cell_count = scene.get("lightgrid_cell_count", 0)
+            light_scale = scene.get("lightgrid_light_scale", 1.0)
+            is_baked = scene.get("lightgrid_baked", False)
+            
+            row = box.row()
+            row.label(text=f"Dimensions: {width}x{height}")
+            row = box.row()
+            row.label(text=f"Cells: {cell_count}")
+            row = box.row()
+            row.label(text=f"Light Scale: {light_scale:.3f}")
+            row = box.row()
+            if is_baked:
+                row.label(text="Status: Baked ✓", icon='CHECKMARK')
+            else:
+                row.label(text="Status: Not Baked", icon='ERROR')
+            
+            # Lightgrid operations
+            box.separator()
+            col = box.column(align=True)
+            col.operator("mapgeo.bake_lightgrid", text="Bake LightGrid", icon='RENDER_STILL')
+            
+            col.separator()
+            export_row = col.row()
+            export_row.enabled = is_baked
+            export_row.operator("mapgeo.export_lightgrid", text="Export LightGrid", icon='EXPORT')
+            
+            col.separator()
+            col.operator("mapgeo.visualize_lightgrid", text="Visualize Grid", icon='GRID')
+            col.operator("mapgeo.clear_lightgrid", text="Clear Data", icon='TRASH')
+        else:
+            box = layout.box()
+            box.label(text="No LightGrid", icon='INFO')
+        
+        # Create / Import
+        layout.separator()
+        col = layout.column(align=True)
+        col.operator("mapgeo.create_lightgrid", text="Create New LightGrid", icon='ADD')
+        col.operator("mapgeo.import_lightgrid", text="Import LightGrid (.dat)", icon='IMPORT')
+        
+        # Mesh Lightmap Properties
+        layout.separator()
+        box = layout.box()
+        box.label(text="Mesh Lightmap Settings", icon='TEXTURE')
+        
+        if context.selected_objects:
+            mesh_count = len([obj for obj in context.selected_objects if obj.type == 'MESH'])
+            box.label(text=f"{mesh_count} mesh(es) selected")
+            
+            # Shadow casting for baking
+            col = box.column(align=True) 
+            col.label(text="Shadow Casting:")
+            row = col.row(align=True)
+            row.operator("mapgeo.set_lightgrid_occluder", text="Occluder")
+            row.operator("mapgeo.set_lightgrid_ignore", text="Ignore")
+            
+            # Lightmap assignment
+            box.separator()
+            col = box.column(align=True)
+            col.label(text="Assign Lightmap:")
+            col.operator("mapgeo.assign_lightmap_texture", text="Set Lightmap Texture", icon='IMAGE_DATA')
+            
+            # Show current lightmap if assigned
+            obj = context.active_object
+            if obj and obj.type == 'MESH' and "lightmap_texture" in obj:
+                col.label(text=f"Texture: {obj['lightmap_texture']}", icon='CHECKMARK')
+                col.label(text=f"Scale: ({obj.get('lightmap_scale', [1,1])[0]:.3f}, {obj.get('lightmap_scale', [1,1])[1]:.3f})")
+                col.label(text=f"Bias: ({obj.get('lightmap_bias', [0,0])[0]:.3f}, {obj.get('lightmap_bias', [0,0])[1]:.3f})")
+        else:
+            box.label(text="Select meshes to configure")
+        
+        # Info
+        layout.separator()
+        box = layout.box()
+        box.label(text="Light Baking Workflow", icon='LIGHT')
+        box.label(text="1. Create or import a LightGrid")
+        box.label(text="2. Set mesh shadow properties")
+        box.label(text="3. Add lights to your scene")
+        box.label(text="4. Bake LightGrid")
+        box.label(text="5. Export to .dat file")
 
 
 class MAPGEO_OT_initialize_custom_mesh(bpy.types.Operator):
@@ -1287,7 +1459,7 @@ class MAPGEO_OT_set_diffuse_texture(bpy.types.Operator):
             self.report({'WARNING'}, "Material has no samplers data")
         
         # Update material node
-        if _update_material_diffuse_node(mat, tex_path, settings.assets_folder):
+        if _update_material_diffuse_node(mat, tex_path, settings.assets_folder, settings.custom_assets_folder, settings.prioritize_custom_assets):
             self.report({'INFO'}, "Diffuse texture updated successfully")
             return {'FINISHED'}
         else:
@@ -2007,6 +2179,1104 @@ class MAPGEO_OT_export_point_lights(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class MAPGEO_OT_import_bushes_from_mapgeo(bpy.types.Operator):
+    """Import bush meshes from another mapgeo file with full material/UV/lightmap pipeline"""
+    bl_idname = "mapgeo.import_bushes_from_mapgeo"
+    bl_label = "Import Bushes from Mapgeo"
+    bl_description = "Import all meshes from another .mapgeo file (full materials, UVs, lightmaps). Auto-flags bushes via TEXCOORD5"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.mapgeo", options={'HIDDEN'})
+    
+    def execute(self, context):
+        from . import import_mapgeo
+        from . import mapgeo_parser
+        
+        def bush_filter(idx, md, mapgeo_file):
+            """Only import meshes that have TEXCOORD5 in their vertex declaration (bush animation data)."""
+            if not md.vertex_buffer_ids:
+                return False
+            # Check all vertex buffers for TEXCOORD5
+            for vb_offset, vb_id in enumerate(md.vertex_buffer_ids):
+                desc_id = md.vertex_declaration_id + vb_offset
+                if desc_id >= len(mapgeo_file.vertex_buffer_descriptions):
+                    continue
+                desc = mapgeo_file.vertex_buffer_descriptions[desc_id]
+                for elem in desc.elements:
+                    if elem.name == mapgeo_parser.VertexElementName.TEXCOORD5:
+                        return True
+            return False
+        
+        try:
+            # Import only bush meshes (those with TEXCOORD5 animation data)
+            count, error = import_mapgeo.import_filtered_meshes(
+                context, self.filepath,
+                mesh_filter_fn=bush_filter,
+                collection_suffix="_Bushes"
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to import: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+        
+        if error:
+            self.report({'ERROR'}, error)
+            return {'CANCELLED'}
+        
+        if count == 0:
+            self.report({'WARNING'}, "No bush meshes found (no TEXCOORD5 data in any mesh)")
+            return {'CANCELLED'}
+        
+        self.report({'INFO'}, f"Imported {count} bush meshes from {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_import_render_regions_from_mapgeo(bpy.types.Operator):
+    """Import render region meshes from another mapgeo file with full pipeline"""
+    bl_idname = "mapgeo.import_render_regions_from_mapgeo"
+    bl_label = "Import Render Regions from Mapgeo"
+    bl_description = "Import meshes with render region hash (unknown_version18_int != 0) with full materials/UVs/lightmaps"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.mapgeo", options={'HIDDEN'})
+    
+    def execute(self, context):
+        from . import import_mapgeo
+        
+        try:
+            # Filter: only meshes with render region hash != 0
+            count, error = import_mapgeo.import_filtered_meshes(
+                context, self.filepath,
+                mesh_filter_fn=lambda idx, md, mgeo: (hasattr(md, 'unknown_version18_int') and md.unknown_version18_int != 0),
+                collection_suffix="_RenderRegions"
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to import: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+        
+        if error:
+            self.report({'ERROR'}, error)
+            return {'CANCELLED'}
+        
+        if count == 0:
+            self.report({'WARNING'}, "No render region meshes found (no unknown_version18_int != 0)")
+            return {'CANCELLED'}
+        
+        self.report({'INFO'}, f"Imported {count} render region meshes from {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
+    """Import bucket grid from another mapgeo file"""
+    bl_idname = "mapgeo.import_bucket_grid_from_mapgeo"
+    bl_label = "Import Bucket Grid from Mapgeo"
+    bl_description = "Import bucket grid visualization (wireframe geometry) from another .mapgeo file"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.mapgeo", options={'HIDDEN'})
+    
+    def execute(self, context):
+        from . import mapgeo_parser
+        import json
+        
+        # Parse source mapgeo file
+        try:
+            parser = mapgeo_parser.MapgeoParser()
+            mapgeo_data = parser.read(self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to parse mapgeo file: {e}")
+            return {'CANCELLED'}
+        
+        if not mapgeo_data.bucket_grids:
+            self.report({'WARNING'}, "No bucket grids found in mapgeo file")
+            return {'CANCELLED'}
+        
+        # Find or create root collection, then nest bucket grid inside it
+        settings = context.scene.mapgeo_settings
+        root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
+        
+        root_collection = bpy.data.collections.get(root_name)
+        if root_collection is None:
+            root_collection = bpy.data.collections.new(root_name)
+            context.scene.collection.children.link(root_collection)
+        
+        collection_name = f"{root_name}_BucketGrid"
+        if collection_name in bpy.data.collections:
+            collection = bpy.data.collections[collection_name]
+        else:
+            collection = bpy.data.collections.new(collection_name)
+            root_collection.children.link(collection)
+        
+        collection["is_bucket_grid_collection"] = True
+        collection["is_custom_bucket_grid"] = True
+        collection["bucket_grid_count"] = len(mapgeo_data.bucket_grids)
+        
+        # Import bucket grids with full geometry
+        total_verts = 0
+        total_faces = 0
+        
+        for grid_idx, grid in enumerate(mapgeo_data.bucket_grids):
+            # Build grid name
+            grid_name = f"BucketGrid_{grid_idx:03d}"
+            if grid.path_hash:
+                grid_name = f"BucketGrid_{grid.path_hash:08X}"
+            
+            # Skip disabled grids
+            if grid.is_disabled:
+                print(f"  Bucket grid {grid_idx}: disabled, skipping")
+                continue
+            
+            # Check if grid has actual geometry
+            if grid.vertices and grid.indices:
+                # Create mesh from bucket grid geometry (like main importer)
+                mesh = bpy.data.meshes.new(grid_name)
+                
+                # Scale vertices and swap Y/Z (mapgeo Y-up -> Blender Z-up)
+                verts = [(v[0], v[2], v[1]) for v in grid.vertices]
+                
+                # Build face list from indices with base_vertex offsets per bucket
+                faces = []
+                if grid.buckets:
+                    for bucket_row in grid.buckets:
+                        for bucket in bucket_row:
+                            face_count = bucket.inside_face_count + bucket.sticking_out_face_count
+                            if face_count == 0:
+                                continue
+                            start_idx = bucket.start_index
+                            for i in range(face_count):
+                                idx_pos = start_idx + (i * 3)
+                                if idx_pos + 2 < len(grid.indices):
+                                    v0 = grid.indices[idx_pos] + bucket.base_vertex
+                                    v1 = grid.indices[idx_pos + 1] + bucket.base_vertex
+                                    v2 = grid.indices[idx_pos + 2] + bucket.base_vertex
+                                    # Reverse winding for coordinate system handedness
+                                    faces.append((v0, v2, v1))
+                
+                mesh.from_pydata(verts, [], faces)
+                mesh.update()
+                total_verts += len(verts)
+                total_faces += len(faces)
+            else:
+                # Fallback: create bounding box plane
+                mesh = bpy.data.meshes.new(grid_name)
+                min_x, min_z = grid.min_x, grid.min_z
+                max_x, max_z = grid.max_x, grid.max_z
+                verts = [
+                    (min_x, min_z, 0),
+                    (max_x, min_z, 0),
+                    (max_x, max_z, 0),
+                    (min_x, max_z, 0),
+                ]
+                faces = [(0, 1, 2, 3)]
+                mesh.from_pydata(verts, [], faces)
+                mesh.update()
+            
+            # Create object
+            obj = bpy.data.objects.new(grid_name, mesh)
+            collection.objects.link(obj)
+            
+            # Create wireframe material (crimson red, mostly transparent)
+            mat_name = f"{grid_name}_Material"
+            if mat_name in bpy.data.materials:
+                bpy.data.materials.remove(bpy.data.materials[mat_name])
+            mat = bpy.data.materials.new(name=mat_name)
+            mat.use_nodes = True
+            mat.blend_method = 'BLEND'
+            nodes = mat.node_tree.nodes
+            nodes.clear()
+            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+            bsdf.location = (0, 0)
+            bsdf.inputs['Base Color'].default_value = (0.935, 0.055, 0.0, 1.0)
+            bsdf.inputs['Alpha'].default_value = 0.04
+            output = nodes.new(type='ShaderNodeOutputMaterial')
+            output.location = (300, 0)
+            mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+            mesh.materials.append(mat)
+            
+            # Display settings
+            obj.display_type = 'WIRE'
+            obj.show_wire = True
+            obj.show_all_edges = True
+            obj.color = (0.86, 0.08, 0.24, 0.8)
+            obj.hide_select = True
+            
+            # Store metadata
+            obj["is_bucket_grid"] = True
+            obj["bucket_grid_index"] = grid_idx
+            obj["path_hash"] = f"{grid.path_hash:08X}" if grid.path_hash else "00000000"
+            obj["bounds_min_x"] = grid.min_x
+            obj["bounds_min_z"] = grid.min_z
+            obj["bounds_max_x"] = grid.max_x
+            obj["bounds_max_z"] = grid.max_z
+            obj["bucket_size_x"] = grid.bucket_size_x
+            obj["bucket_size_z"] = grid.bucket_size_z
+            obj["stickout_x"] = grid.max_stickout_x
+            obj["stickout_z"] = grid.max_stickout_z
+            obj["buckets_per_side"] = grid.buckets_per_side
+            obj["is_disabled"] = grid.is_disabled
+            obj["flags"] = grid.flags
+            if grid.unknown_v18_float is not None:
+                obj["unknown_v18_float"] = grid.unknown_v18_float
+            
+            # Store face visibility flags
+            if grid.face_visibility_flags:
+                vis_hex = bytes(grid.face_visibility_flags).hex()
+                obj["face_visibility_flags_hex"] = vis_hex
+            
+            bucket_count = sum(
+                len(row) for row in grid.buckets
+            ) if grid.buckets else 0
+            obj["bucket_count"] = bucket_count
+            
+            # Create bounding box wireframe
+            bbox_name = f"{grid_name}_Bounds"
+            bbox_mesh = bpy.data.meshes.new(bbox_name)
+            min_x, min_z = grid.min_x, grid.min_z
+            max_x, max_z = grid.max_x, grid.max_z
+            z_low, z_high = -0.1, 0.1
+            bbox_verts = [
+                (min_x, min_z, z_low), (max_x, min_z, z_low),
+                (max_x, max_z, z_low), (min_x, max_z, z_low),
+                (min_x, min_z, z_high), (max_x, min_z, z_high),
+                (max_x, max_z, z_high), (min_x, max_z, z_high),
+            ]
+            bbox_edges = [
+                (0,1),(1,2),(2,3),(3,0),
+                (4,5),(5,6),(6,7),(7,4),
+                (0,4),(1,5),(2,6),(3,7),
+            ]
+            bbox_mesh.from_pydata(bbox_verts, bbox_edges, [])
+            bbox_mesh.update()
+            bbox_obj = bpy.data.objects.new(bbox_name, bbox_mesh)
+            collection.objects.link(bbox_obj)
+            bbox_obj.display_type = 'WIRE'
+            bbox_obj.hide_select = True
+            bbox_obj["is_bucket_grid_bounds"] = True
+            bbox_obj["bucket_grid_index"] = grid_idx
+        
+        # Store full bucket data JSON on collection for export (includes vertices/indices)
+        bucket_data_list = []
+        for grid_idx, grid in enumerate(mapgeo_data.bucket_grids):
+            grid_data = {
+                "index": grid_idx,
+                "path_hash": grid.path_hash if grid.path_hash else 0,
+                "min_x": grid.min_x,
+                "min_z": grid.min_z,
+                "max_x": grid.max_x,
+                "max_z": grid.max_z,
+                "bucket_size_x": grid.bucket_size_x,
+                "bucket_size_z": grid.bucket_size_z,
+                "buckets_per_side": grid.buckets_per_side,
+                "is_disabled": grid.is_disabled,
+                "flags": grid.flags,
+                "unknown_v18_float": grid.unknown_v18_float,
+                "max_stickout_x": grid.max_stickout_x,
+                "max_stickout_z": grid.max_stickout_z,
+                "vertices": [(v[0], v[1], v[2]) for v in grid.vertices] if grid.vertices else [],
+                "indices": grid.indices if grid.indices else [],
+                "face_visibility_flags": grid.face_visibility_flags if grid.face_visibility_flags else [],
+            }
+            if grid.buckets:
+                cells = []
+                for row in grid.buckets:
+                    row_cells = []
+                    for b in row:
+                        row_cells.append({
+                            "max_stickout_x": b.max_stickout_x,
+                            "max_stickout_z": b.max_stickout_z,
+                            "start_index": b.start_index,
+                            "base_vertex": b.base_vertex,
+                            "inside_face_count": b.inside_face_count,
+                            "sticking_out_face_count": b.sticking_out_face_count,
+                        })
+                    cells.append(row_cells)
+                grid_data["buckets"] = cells
+            bucket_data_list.append(grid_data)
+        
+        collection["bucket_data_json"] = json.dumps(bucket_data_list)
+        
+        # Hide collection in viewport by default
+        view_layer = context.view_layer
+        def find_layer_collection(layer_col, name):
+            if layer_col.name == name:
+                return layer_col
+            for child in layer_col.children:
+                result = find_layer_collection(child, name)
+                if result:
+                    return result
+            return None
+        
+        layer_col = find_layer_collection(view_layer.layer_collection, collection_name)
+        if layer_col:
+            layer_col.hide_viewport = True
+        
+        self.report({'INFO'}, f"Imported {len(mapgeo_data.bucket_grids)} bucket grids ({total_verts} verts, {total_faces} faces)")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_cleanup_unused_materials(bpy.types.Operator):
+    """Remove all materials that are not used by any object in the scene"""
+    bl_idname = "mapgeo.cleanup_unused_materials"
+    bl_label = "Cleanup Unused Materials"
+    bl_description = "Remove all materials with 0 users from the scene"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        removed_count = 0
+        
+        # Iterate through all materials
+        for mat in list(bpy.data.materials):
+            # Check if material has any users (objects using it)
+            if mat.users == 0:
+                bpy.data.materials.remove(mat)
+                removed_count += 1
+        
+        if removed_count > 0:
+            self.report({'INFO'}, f"Removed {removed_count} unused materials")
+        else:
+            self.report({'INFO'}, "No unused materials found")
+        
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
+    """Import external mesh file (gltf/fbx/obj) without material setup"""
+    bl_idname = "mapgeo.import_external_mesh"
+    bl_label = "Import External Mesh"
+    bl_description = "Import mesh from gltf/fbx/obj file without material setup"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.gltf;*.glb;*.fbx;*.obj", options={'HIDDEN'})
+    
+    def execute(self, context):
+        import_path = self.filepath
+        file_ext = os.path.splitext(import_path)[1].lower()
+        
+        # Find or create main mesh collection
+        mesh_collection = None
+        for col in bpy.data.collections:
+            if "_Meshes" in col.name or "Meshes" in col.name:
+                mesh_collection = col
+                break
+        
+        if not mesh_collection:
+            mesh_collection = bpy.data.collections.new("Imported_Meshes")
+            context.scene.collection.children.link(mesh_collection)
+        
+        # Store current objects to identify new ones
+        existing_objects = set(bpy.data.objects)
+        
+        # Import based on file type
+        try:
+            if file_ext in ['.gltf', '.glb']:
+                bpy.ops.import_scene.gltf(filepath=import_path)
+            elif file_ext == '.fbx':
+                bpy.ops.import_scene.fbx(filepath=import_path)
+            elif file_ext == '.obj':
+                bpy.ops.wm.obj_import(filepath=import_path)
+            else:
+                self.report({'ERROR'}, f"Unsupported file format: {file_ext}")
+                return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Import failed: {e}")
+            return {'CANCELLED'}
+        
+        # Find newly imported objects
+        new_objects = set(bpy.data.objects) - existing_objects
+        imported_count = 0
+        
+        for obj in new_objects:
+            if obj.type == 'MESH':
+                # Remove materials (no material setup)
+                obj.data.materials.clear()
+                
+                # Move to mesh collection
+                for col in obj.users_collection:
+                    col.objects.unlink(obj)
+                mesh_collection.objects.link(obj)
+                
+                # Initialize mapgeo properties
+                obj["visibility_layer"] = 255  # All layers
+                obj["quality"] = 31  # All quality levels
+                obj["layer_transition_behavior"] = 0
+                obj["render_flags"] = 0
+                obj["disable_backface_culling"] = 0
+                
+                imported_count += 1
+        
+        self.report({'INFO'}, f"Imported {imported_count} mesh(es) from {os.path.basename(import_path)}")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+# ─── LightGrid Import/Export ───
+
+class MAPGEO_OT_create_lightgrid(bpy.types.Operator):
+    """Create a new LightGrid for light baking"""
+    bl_idname = "mapgeo.create_lightgrid"
+    bl_label = "Create New LightGrid"
+    bl_description = "Create a new lightgrid with custom dimensions"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    width: bpy.props.IntProperty(
+        name="Width",
+        description="Grid width in cells",
+        default=256,
+        min=1,
+        max=512
+    )
+    
+    height: bpy.props.IntProperty(
+        name="Height",
+        description="Grid height in cells",
+        default=256,
+        min=1,
+        max=512
+    )
+    
+    bounds_x: bpy.props.FloatProperty(
+        name="Bounds X",
+        description="Physical width of the grid in world units",
+        default=12877.52,
+        min=1.0
+    )
+    
+    bounds_y: bpy.props.FloatProperty(
+        name="Bounds Y",
+        description="Physical height of the grid in world units",
+        default=12877.52,
+        min=1.0
+    )
+    
+    light_scale: bpy.props.FloatProperty(
+        name="Light Scale",
+        description="Overall light intensity multiplier",
+        default=0.850,
+        min=0.0,
+        max=10.0
+    )
+    
+    fullbright_intensity: bpy.props.FloatProperty(
+        name="Fullbright Intensity",
+        description="Ambient light intensity",
+        default=1.0,
+        min=0.0,
+        max=1.0
+    )
+    
+    def execute(self, context):
+        from . import lightgrid_parser
+        
+        scene = context.scene
+        
+        # Store grid parameters
+        scene["lightgrid_width"] = self.width
+        scene["lightgrid_height"] = self.height
+        scene["lightgrid_bounds"] = [self.bounds_x, self.bounds_y]
+        scene["lightgrid_light_scale"] = self.light_scale
+        scene["lightgrid_fullbright_intensity"] = self.fullbright_intensity
+        scene["lightgrid_cell_count"] = self.width * self.height
+        
+        # Initialize empty cell data (will be filled by baking)
+        cell_count = self.width * self.height
+        empty_cells = []
+        for i in range(min(100, cell_count)):  # Store preview of first 100
+            empty_cells.append({
+                "c1": (128, 128, 128, 255),
+                "c2": (128, 128, 128, 255),
+                "c3": (128, 128, 128, 255),
+                "c4": (128, 128, 128, 255),
+                "c5": (128, 128, 128, 255),
+                "c6": (128, 128, 128, 255),
+            })
+        scene["lightgrid_cells_preview"] = json.dumps(empty_cells)
+        scene["lightgrid_baked"] = False
+        
+        self.report({'INFO'}, f"✓ Created LightGrid: {self.width}x{self.height} "
+                              f"({cell_count} cells). Use 'Bake LightGrid' to generate lighting.")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class MAPGEO_OT_bake_lightgrid(bpy.types.Operator):
+    """Bake scene lighting into the lightgrid"""
+    bl_idname = "mapgeo.bake_lightgrid"
+    bl_label = "Bake LightGrid"
+    bl_description = "Sample scene lights at each grid cell to generate lightmap data"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    sample_height: bpy.props.FloatProperty(
+        name="Sample Height",
+        description="Z height to sample lighting at",
+        default=1.0,
+        min=0.0
+    )
+    
+    def execute(self, context):
+        from . import lightgrid_parser
+        import mathutils
+        
+        scene = context.scene
+        
+        # Check if lightgrid exists
+        if "lightgrid_width" not in scene:
+            self.report({'ERROR'}, "No LightGrid exists. Create one first.")
+            return {'CANCELLED'}
+        
+        width = scene.get("lightgrid_width", 0)
+        height = scene.get("lightgrid_height", 0)
+        bounds = scene.get("lightgrid_bounds", (0.0, 0.0))
+        light_scale = scene.get("lightgrid_light_scale", 1.0)
+        fullbright = scene.get("lightgrid_fullbright_intensity", 1.0)
+        
+        cell_width = bounds[0] / width
+        cell_height = bounds[1] / height
+        
+        # Create lightgrid and populate cells
+        lightgrid = lightgrid_parser.LightGrid(
+            width=width,
+            height=height,
+            bounds=tuple(bounds),
+            light_scale=light_scale,
+            fullbright_intensity=fullbright
+        )
+        
+        # Bake lighting for each cell
+        cell_count = width * height
+        baked_count = 0
+        
+        # Get all lights in scene
+        lights = [obj for obj in scene.objects if obj.type == 'LIGHT']
+        
+        # Get all occluder meshes
+        occluders = [obj for obj in scene.objects 
+                     if obj.type == 'MESH' and obj.get("lightgrid_occluder", False)]
+        
+        if not lights:
+            self.report({'WARNING'}, "No lights in scene. Creating neutral lightgrid.")
+        
+        self.report({'INFO'}, f"Baking with {len(lights)} lights and {len(occluders)} occluders...")
+        
+        # Sample each grid cell
+        for y in range(height):
+            for x in range(width):
+                # Calculate world position of cell center
+                world_x = x * cell_width + cell_width / 2
+                world_y = y * cell_height + cell_height / 2
+                world_pos = mathutils.Vector((world_x, world_y, self.sample_height))
+                
+                # Sample lighting from 6 directions (directional hemisphere)
+                # These match League's light sampling directions
+                directions = [
+                    mathutils.Vector((0, 0, 1)),    # Up
+                    mathutils.Vector((0, 0, -1)),   # Down
+                    mathutils.Vector((1, 0, 0)),    # Right
+                    mathutils.Vector((-1, 0, 0)),   # Left
+                    mathutils.Vector((0, 1, 0)),    # Forward
+                    mathutils.Vector((0, -1, 0)),   # Back
+                ]
+                
+                colors = []
+                for direction in directions:
+                    # Sample light contribution in this direction
+                    color = self._sample_lighting(scene, world_pos, direction, lights, occluders, fullbright)
+                    colors.append(color)
+                
+                # Create cell
+                cell = lightgrid_parser.LightGridCell(
+                    c1=colors[0],
+                    c2=colors[1],
+                    c3=colors[2],
+                    c4=colors[3],
+                    c5=colors[4],
+                    c6=colors[5]
+                )
+                lightgrid.cells.append(cell)
+                baked_count += 1
+        
+        # Store baked data in scene
+        scene["lightgrid_cell_count"] = baked_count
+        scene["lightgrid_baked"] = True
+        
+        # Store full cell data as compressed JSON
+        cell_data_full = []
+        for cell in lightgrid.cells:
+            cell_data_full.append({
+                "c1": cell.c1.to_tuple(),
+                "c2": cell.c2.to_tuple(),
+                "c3": cell.c3.to_tuple(),
+                "c4": cell.c4.to_tuple(),
+                "c5": cell.c5.to_tuple(),
+                "c6": cell.c6.to_tuple(),
+            })
+        scene["lightgrid_cells_baked"] = json.dumps(cell_data_full)
+        
+        self.report({'INFO'}, f"✓ Baked {baked_count} cells from {len(lights)} lights")
+        return {'FINISHED'}
+    
+    def _sample_lighting(self, scene, position, direction, lights, occluders, ambient):
+        """Sample lighting at a position in a given direction with shadow casting"""
+        from . import lightgrid_parser
+        import mathutils
+        
+        # Start with ambient/fullbright
+        r, g, b = ambient * 128, ambient * 128, ambient * 128
+        
+        # Add contribution from each light
+        for light_obj in lights:
+            light_pos = light_obj.matrix_world.translation
+            light_data = light_obj.data
+            
+            # Vector from position to light
+            to_light = light_pos - position
+            distance = to_light.length
+            
+            if distance < 0.001:
+                continue
+            
+            to_light_normalized = to_light.normalized()
+            
+            # Calculate light contribution based on direction
+            dot = max(0.0, direction.dot(to_light_normalized))
+            
+            if dot > 0:
+                # Check for shadows by raycasting to light
+                is_shadowed = False
+                
+                if occluders:
+                    # Cast ray from sample point towards light
+                    # Use depsgraph for ray casting
+                    depsgraph = bpy.context.evaluated_depsgraph_get()
+                    
+                    for occluder in occluders:
+                        # Get evaluated object
+                        eval_obj = occluder.evaluated_get(depsgraph)
+                        
+                        # Transform ray to object space
+                        matrix_inv = eval_obj.matrix_world.inverted()
+                        ray_origin_local = matrix_inv @ position
+                        ray_direction_local = matrix_inv.to_3x3() @ to_light_normalized
+                        
+                        # Ray cast
+                        success, location, normal, index = eval_obj.ray_cast(
+                            ray_origin_local,
+                            ray_direction_local,
+                            distance=distance
+                        )
+                        
+                        if success:
+                            is_shadowed = True
+                            break
+                
+                # Only add light contribution if not shadowed
+                if not is_shadowed:
+                    # Get light color and energy
+                    light_color = light_data.color
+                    energy = light_data.energy
+                    
+                    # Simple distance attenuation
+                    attenuation = 1.0
+                    if light_data.type in {'POINT', 'SPOT'}:
+                        attenuation = 1.0 / (1.0 + distance * 0.01)
+                    
+                    # Add light contribution
+                    contribution = dot * energy * attenuation * 50  # Scale factor
+                    r += light_color.r * contribution
+                    g += light_color.g * contribution
+                    b += light_color.b * contribution
+        
+        # Clamp to 0-255
+        r = max(0, min(255, int(r)))
+        g = max(0, min(255, int(g)))
+        b = max(0, min(255, int(b)))
+        
+        return lightgrid_parser.Color(r, g, b, 255)
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class MAPGEO_OT_import_lightgrid(bpy.types.Operator):
+    """Import LightGrid (.dat) for light baking preview"""
+    bl_idname = "mapgeo.import_lightgrid"
+    bl_label = "Import LightGrid"
+    bl_description = "Import lightgrid.dat file for light baking visualization"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.dat", options={'HIDDEN'})
+    
+    def execute(self, context):
+        from . import lightgrid_parser
+        
+        try:
+            lightgrid = lightgrid_parser.LightGrid()
+            lightgrid.read(self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to import lightgrid: {e}")
+            return {'CANCELLED'}
+        
+        # Store in scene for later use
+        scene = context.scene
+        scene["lightgrid_width"] = lightgrid.width
+        scene["lightgrid_height"] = lightgrid.height
+        scene["lightgrid_bounds"] = list(lightgrid.bounds)
+        scene["lightgrid_light_scale"] = lightgrid.light_scale
+        scene["lightgrid_fullbright_intensity"] = lightgrid.fullbright_intensity
+        scene["lightgrid_cell_count"] = len(lightgrid.cells)
+        scene["lightgrid_filepath"] = self.filepath
+        scene["lightgrid_baked"] = True  # Mark as having data
+        
+        # Store ALL cell data as JSON for export
+        cell_data_full = []
+        for cell in lightgrid.cells:
+            cell_data_full.append({
+                "c1": cell.c1.to_tuple(),
+                "c2": cell.c2.to_tuple(),
+                "c3": cell.c3.to_tuple(),
+                "c4": cell.c4.to_tuple(),
+                "c5": cell.c5.to_tuple(),
+                "c6": cell.c6.to_tuple(),
+            })
+        scene["lightgrid_cells_baked"] = json.dumps(cell_data_full)
+        
+        # Store preview (first 100 cells for UI display)
+        scene["lightgrid_cells_preview"] = json.dumps(cell_data_full[:100])
+        
+        self.report({'INFO'}, f"✓ Imported LightGrid: {lightgrid.width}x{lightgrid.height} "
+                              f"({len(lightgrid.cells)} cells)")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_export_lightgrid(bpy.types.Operator):
+    """Export current LightGrid as .dat file"""
+    bl_idname = "mapgeo.export_lightgrid"
+    bl_label = "Export LightGrid"
+    bl_description = "Export lightgrid.dat file"
+    bl_options = {'REGISTER'}
+    
+    filepath: bpy.props.StringProperty(
+        subtype='FILE_PATH',
+        default="lightgrid.dat"
+    )
+    filter_glob: bpy.props.StringProperty(default="*.dat", options={'HIDDEN'})
+    
+    def execute(self, context):
+        from . import lightgrid_parser
+        
+        scene = context.scene
+        
+        # Check if lightgrid data exists
+        if "lightgrid_width" not in scene:
+            self.report({'ERROR'}, "No LightGrid data loaded. Create or import a lightgrid first.")
+            return {'CANCELLED'}
+        
+        # Check if baked data exists
+        if not scene.get("lightgrid_baked", False):
+            self.report({'ERROR'}, "LightGrid has no baked data. Use 'Bake LightGrid' first.")
+            return {'CANCELLED'}
+        
+        try:
+            # Create lightgrid from scene data
+            lightgrid = lightgrid_parser.LightGrid(
+                width=scene.get("lightgrid_width", 0),
+                height=scene.get("lightgrid_height", 0),
+                bounds=tuple(scene.get("lightgrid_bounds", (0.0, 0.0))),
+                light_scale=scene.get("lightgrid_light_scale", 1.0),
+                fullbright_intensity=scene.get("lightgrid_fullbright_intensity", 1.0)
+            )
+            
+            # Reconstruct cells from baked data
+            cells_json = scene.get("lightgrid_cells_baked", "[]")
+            cells_data = json.loads(cells_json)
+            
+            for cell_data in cells_data:
+                cell = lightgrid_parser.LightGridCell(
+                    c1=lightgrid_parser.Color(*cell_data["c1"]),
+                    c2=lightgrid_parser.Color(*cell_data["c2"]),
+                    c3=lightgrid_parser.Color(*cell_data["c3"]),
+                    c4=lightgrid_parser.Color(*cell_data["c4"]),
+                    c5=lightgrid_parser.Color(*cell_data["c5"]),
+                    c6=lightgrid_parser.Color(*cell_data["c6"])
+                )
+                lightgrid.cells.append(cell)
+            
+            lightgrid.write(self.filepath)
+            self.report({'INFO'}, f"✓ Exported LightGrid to {os.path.basename(self.filepath)} "
+                                  f"({len(lightgrid.cells)} cells)")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export lightgrid: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_clear_lightgrid(bpy.types.Operator):
+    """Clear lightgrid data from scene"""
+    bl_idname = "mapgeo.clear_lightgrid"
+    bl_label = "Clear LightGrid"
+    bl_description = "Remove all stored LightGrid data"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene = context.scene
+        lightgrid_keys = [k for k in scene.keys() if k.startswith("lightgrid_")]
+        for key in lightgrid_keys:
+            del scene[key]
+        
+        self.report({'INFO'}, f"Cleared {len(lightgrid_keys)} LightGrid properties")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_visualize_lightgrid(bpy.types.Operator):
+    """Create a visual grid mesh to show lightgrid coverage"""
+    bl_idname = "mapgeo.visualize_lightgrid"
+    bl_label = "Visualize LightGrid"
+    bl_description = "Create a grid mesh showing the lightgrid cell layout"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene = context.scene
+        
+        # Check if lightgrid data exists
+        if "lightgrid_width" not in scene:
+            self.report({'ERROR'}, "No LightGrid data loaded. Import a lightgrid first.")
+            return {'CANCELLED'}
+        
+        width = scene.get("lightgrid_width", 0)
+        height = scene.get("lightgrid_height", 0)
+        bounds = scene.get("lightgrid_bounds", (0.0, 0.0))
+        
+        if width == 0 or height == 0:
+            self.report({'ERROR'}, "Invalid lightgrid dimensions")
+            return {'CANCELLED'}
+        
+        # Calculate cell size
+        cell_width = bounds[0] / width
+        cell_height = bounds[1] / height
+        
+        # Create grid mesh
+        mesh = bpy.data.meshes.new("LightGrid_Mesh")
+        obj = bpy.data.objects.new("LightGrid_Visualization", mesh)
+        
+        # Link to scene
+        context.collection.objects.link(obj)
+        
+        # Generate vertices and edges for grid
+        vertices = []
+        edges = []
+        
+        # Create horizontal lines
+        for y in range(height + 1):
+            y_pos = y * cell_height
+            for x in range(width + 1):
+                x_pos = x * cell_width
+                vertices.append((x_pos, y_pos, 0.0))
+        
+        # Create edges
+        vertex_index = 0
+        # Horizontal edges
+        for y in range(height + 1):
+            for x in range(width):
+                edges.append((vertex_index + x, vertex_index + x + 1))
+            vertex_index += width + 1
+        
+        # Vertical edges
+        for x in range(width + 1):
+            for y in range(height):
+                edges.append((y * (width + 1) + x, (y + 1) * (width + 1) + x))
+        
+        # Create mesh
+        mesh.from_pydata(vertices, edges, [])
+        mesh.update()
+        
+        # Set display properties
+        obj.display_type = 'WIRE'
+        obj.show_in_front = True
+        obj.hide_render = True
+        
+        # Color the object
+        obj.color = (0.3, 0.7, 1.0, 0.5)  # Light blue
+        
+        # Position at origin
+        obj.location = (0, 0, 0.5)
+        
+        # Select the new object
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        
+        self.report({'INFO'}, f"Created LightGrid visualization: {width}x{height} cells")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_set_lightgrid_occluder(bpy.types.Operator):
+    """Mark selected meshes as light occluders (cast shadows in lightgrid)"""
+    bl_idname = "mapgeo.set_lightgrid_occluder"
+    bl_label = "Set as Light Occluder"
+    bl_description = "These meshes will cast shadows when baking lightgrid"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH':
+                obj["lightgrid_occluder"] = True
+                count += 1
+        
+        self.report({'INFO'}, f"Marked {count} mesh(es) as light occluders")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_set_lightgrid_ignore(bpy.types.Operator):
+    """Mark selected meshes to be ignored by lightgrid baking"""
+    bl_idname = "mapgeo.set_lightgrid_ignore"
+    bl_label = "Ignore for Lightgrid"
+    bl_description = "These meshes will not cast shadows in lightgrid"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH':
+                obj["lightgrid_occluder"] = False
+                count += 1
+        
+        self.report({'INFO'}, f"Set {count} mesh(es) to be ignored by lightgrid")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_assign_lightmap_texture(bpy.types.Operator):
+    """Assign lightmap texture and UV parameters to selected meshes"""
+    bl_idname = "mapgeo.assign_lightmap_texture"
+    bl_label = "Assign Lightmap Texture"
+    bl_description = "Set the baked lightmap texture path and UV atlas parameters"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    texture_path: bpy.props.StringProperty(
+        name="Texture Path",
+        description="Path to lightmap texture (e.g. Maps/Lightmaps/Baked_Map12_0.dds)",
+        default="Maps/Lightmaps/Lightmap.dds"
+    )
+    
+    scale_u: bpy.props.FloatProperty(
+        name="Scale U",
+        description="UV scale for lightmap atlas (U coordinate)",
+        default=1.0,
+        min=0.0
+    )
+    
+    scale_v: bpy.props.FloatProperty(
+        name="Scale V",
+        description="UV scale for lightmap atlas (V coordinate)",
+        default=1.0,
+        min=0.0
+    )
+    
+    bias_u: bpy.props.FloatProperty(
+        name="Bias U",
+        description="UV offset for lightmap atlas (U coordinate)",
+        default=0.0
+    )
+    
+    bias_v: bpy.props.FloatProperty(
+        name="Bias V",  
+        description="UV offset for lightmap atlas (V coordinate)",
+        default=0.0
+    )
+    
+    channel: bpy.props.EnumProperty(
+        name="Light Channel",
+        description="Which light channel to assign",
+        items=[
+            ('BAKED', "Baked Light", "Static pre-baked lighting"),
+            ('STATIONARY', "Stationary Light", "Dynamic stationary lighting"),
+            ('PAINT', "Baked Paint", "Painted texture overlay")
+        ],
+        default='BAKED'
+    )
+    
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH':
+                if self.channel == 'BAKED':
+                    obj["lightmap_texture"] = self.texture_path
+                    obj["lightmap_scale"] = [self.scale_u, self.scale_v]
+                    obj["lightmap_bias"] = [self.bias_u, self.bias_v]
+                elif self.channel == 'STATIONARY':
+                    obj["stationary_light_texture"] = self.texture_path
+                    obj["stationary_light_scale"] = [self.scale_u, self.scale_v]
+                    obj["stationary_light_bias"] = [self.bias_u, self.bias_v]
+                elif self.channel == 'PAINT':
+                    obj["baked_paint_texture"] = self.texture_path
+                    obj["baked_paint_scale"] = [self.scale_u, self.scale_v]
+                    obj["baked_paint_bias"] = [self.bias_u, self.bias_v]
+                count += 1
+        
+        channel_name = {"BAKED": "baked light", "STATIONARY": "stationary light", "PAINT": "baked paint"}[self.channel]
+        self.report({'INFO'}, f"Assigned {channel_name} texture to {count} mesh(es)")
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        # Pre-fill with active object's values if available
+        obj = context.active_object
+        if obj and obj.type == 'MESH':
+            if "lightmap_texture" in obj:
+                self.texture_path = obj["lightmap_texture"]
+                self.scale_u, self.scale_v = obj.get("lightmap_scale", [1.0, 1.0])
+                self.bias_u, self.bias_v = obj.get("lightmap_bias", [0.0, 0.0])
+        
+        return context.window_manager.invoke_props_dialog(self)
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "channel")
+        layout.separator()
+        layout.prop(self, "texture_path")
+        layout.separator()
+        layout.label(text="UV Atlas Parameters:")
+        row = layout.row(align=True)
+        row.prop(self, "scale_u")
+        row.prop(self, "scale_v")
+        row = layout.row(align=True)
+        row.prop(self, "bias_u")
+        row.prop(self, "bias_v")
+
+
 # Register classes
 classes = (
     VIEW3D_PT_mapgeo_panel,
@@ -2014,6 +3284,7 @@ classes = (
     VIEW3D_PT_mapgeo_import_panel,
     VIEW3D_PT_mapgeo_export_panel,
     VIEW3D_PT_mapgeo_properties_panel,
+    VIEW3D_PT_mapgeo_utilities_panel,
     MAPGEO_OT_setup_mesh,
     MAPGEO_OT_initialize_custom_mesh,
     MAPGEO_OT_assign_layer,
@@ -2031,6 +3302,21 @@ classes = (
     MAPGEO_OT_add_point_light,
     MAPGEO_OT_remove_point_light_from_selected,
     MAPGEO_OT_export_point_lights,
+    MAPGEO_OT_import_bushes_from_mapgeo,
+    MAPGEO_OT_import_render_regions_from_mapgeo,
+    MAPGEO_OT_import_bucket_grid_from_mapgeo,
+    MAPGEO_OT_cleanup_unused_materials,
+    MAPGEO_OT_import_external_mesh,
+    MAPGEO_OT_create_lightgrid,
+    MAPGEO_OT_bake_lightgrid,
+    MAPGEO_OT_import_lightgrid,
+    MAPGEO_OT_export_lightgrid,
+    MAPGEO_OT_clear_lightgrid,
+    MAPGEO_OT_visualize_lightgrid,
+    MAPGEO_OT_set_lightgrid_occluder,
+    MAPGEO_OT_set_lightgrid_ignore,
+    MAPGEO_OT_assign_lightmap_texture,
+    VIEW3D_PT_mapgeo_lightgrid_panel,
 )
 
 

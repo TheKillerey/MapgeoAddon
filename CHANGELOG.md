@@ -7,7 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [Released]
+
+## [0.2.1] - 2026-02-16
+
+### ✨ Features Added
+
+#### LightGrid System (Complete Implementation)
+- **LightGrid Parser** - Binary format support for lightgrid.dat files
+  - Version 3 format with 32-byte header
+  - BGRA color conversion for 6 directional samples per cell
+  - Grid dimensions, bounds, light scale, fullbright intensity
+  
+- **LightGrid UI Operators** - Full workflow in Material Editor panel
+  - Create LightGrid: Define grid dimensions and parameters
+  - Import/Export LightGrid: Read/write .dat files
+  - Bake LightGrid: Sample scene lighting with shadow raycasting
+  - Visualize Grid: Wireframe overlay at grid origin
+  - Clear LightGrid: Remove grid data
+  
+- **Mesh Lightmap Settings Panel** - Control per-mesh lightmap behavior
+  - Shadow casting flags (Occluder vs Ignore)
+  - Lightmap texture assignment with scale/bias/channel selection
+  - Display current lightmap configuration
+  - Supports BAKED/STATIONARY/PAINT channels
+
+#### Lightmap Export System (Fixed)
+- **TEXCOORD7 Export** - Fixed missing lightmap UV channel export
+  - Detects "LightmapUV" layer in Blender meshes
+  - Writes TEXCOORD7 to vertex buffer (XY_FLOAT32 format)
+  - Applies V-flip for correct texture orientation
+  
+- **Baked Light Channel Export** - Writes lightmap metadata to mapgeo
+  - Texture path from object custom properties
+  - Scale/bias UV transform parameters
+  - Matches official Map12 structure (148/330 meshes validated)
+  
+- **LightGrid Export** - Saves baked lighting data
+  - 256×256 grid with 65,536 cells
+  - 6 directional color samples per cell (24 bytes BGRA)
+  - Full roundtrip: import → edit → export → reimport
+
+### 🐛 Bug Fixes
+- Fixed lightmap UVs not exporting (TEXCOORD7 was completely missing)
+- Fixed lightmap texture path handling (Base vs custom folder names)
+- Validated against official ARAM base.mapgeo structure
+
+### 📚 Documentation
+- Added Material System guide (materials.py format, sampler/param definitions)
+- Added LightGrid format documentation
+- Updated README with lightmap workflow
+- Documented official map lightmap usage (330/342 meshes in Map12)
+
+### 🔧 Technical Details
+- Lightmap implementation matches Riot's official format exactly
+- Materials don't need lightmap parameters (engine reads from mapgeo)
+- Supports both explicit UVs (TEXCOORD7) and procedural worldspace UVs
+- Shadow raycasting in bake operator for realistic lighting
+
+---
 
 ## [0.2.0] - 2026-02-15
 

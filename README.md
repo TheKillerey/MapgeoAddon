@@ -2,7 +2,7 @@
 
 [![Blender](https://img.shields.io/badge/Blender-5.0+-orange.svg)](https://www.blender.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.1.1-blue)
+![Version](https://img.shields.io/badge/version-0.2.1-blue)
 ![Status](https://img.shields.io/badge/status-stable-green)
 
 **Edit League of Legends maps in Blender!** Open Summoner's Rift, ARAM, or any League map as a 3D model, make changes, and save them back.
@@ -299,6 +299,72 @@ Very High -> `16`
 Some meshes have the value `255` - This just means that you have full quality and your mesh is not affected by the quality settings.
 Currently using `32` -> `254` will be the same as `31` but the usage for that is currently unknown.
 
+### Material System
+The addon supports League's complete material system with shader templates, samplers, and parameters.
+
+**Materials.py Format:**
+- **Samplers** (textures): `DiffuseTexture`, `NormalTexture`, `EmissiveTexture`, etc.
+- **Parameters** (values): `TintColor`, `AlphaTestValue`, shader constants, etc.
+- **Shader Macros**: Feature flags like `NO_BAKED_LIGHTING`, `DISABLE_DEPTH_FOG`
+- **Blend Modes**: Alpha blending, additive, etc.
+- **91 Shader Templates**: Extracted from 9,509 official materials
+
+**Material Editor Panel:**
+- Add/Edit/Remove samplers with texture path
+- Add/Edit/Remove parameters with vec4 values
+- Add/Edit/Remove shader macros (feature flags)
+- Add/Edit/Remove techniques and passes
+- Template picker with most-used-first sorting
+- Export to `.materials.py` format for game use
+
+**How Materials Work:**
+1. Mesh references material by path (e.g., `"Maps/KitPieces/SRS/Base/Materials/Default/Ground_A_MAT"`)
+2. Material defines shader and all texture/parameter bindings
+3. Engine reads material from `.materials.py` or `.materials.bin` file
+4. No material parameters needed in `.mapgeo` file (except lightmaps)
+
+See `MATERIALS_GUIDE.md` for complete documentation.
+
+### Lightmap & LightGrid System
+League uses baked lighting for static illumination and dynamic light grids for characters.
+
+**Lightmap Features (TEXCOORD7):**
+- Import/export lightmap UVs from "LightmapUV" layer
+- Automatic scale/bias transform from `baked_light` channel
+- Texture atlas support (multiple meshes share one lightmap)
+- Two modes:
+  - **Explicit UVs**: Mesh has TEXCOORD7 channel with custom UVs
+  - **Procedural UVs**: Engine calculates from world position + scale/bias
+
+**LightGrid Features:**
+- Import/export `.lightgrid.dat` files (Version 3 format)
+- Create custom grids: 256×256 cells, configurable bounds
+- Bake lighting: Sample scene lights with shadow raycasting
+- 6 directional samples per cell (up/down/left/right/forward/back)
+- Visualize grid: Wireframe overlay in viewport
+- Used for dynamic objects that need real-time indirect lighting
+
+**Mesh Lightmap Settings:**
+- Assign lightmap texture with scale/bias/channel
+- Shadow casting flags (Occluder vs Ignore for baking)
+- Display current lightmap configuration
+- Supports BAKED/STATIONARY/PAINT channels
+
+**Official Usage:**
+- ARAM Map12: 330/342 meshes use lightmaps (148 with explicit UVs)
+- Summoner's Rift: Similar extensive lightmap atlasing
+- Materials don't define lightmap parameters (engine reads from `.mapgeo`)
+
+**Workflow:**
+1. Create "LightmapUV" layer in Blender
+2. Unwrap mesh or use existing UVs
+3. Use "Set Lightmap Texture" operator (scale=1, bias=0 for full texture)
+4. Export: addon writes TEXCOORD7 + baked_light channel
+5. Create lightmap texture (external tool or bake in Blender)
+6. Place texture in `assets/maps/lightmaps/maps/mapgeometry/mapXX/folder/`
+
+See `MATERIALS_GUIDE.md` and inline tooltips for more details.
+
 ---
 
 ## 📖 How to Use
@@ -539,7 +605,22 @@ Using this tool is at your own risk. Modifying game files may violate Terms of S
 
 ## 📝 Version History
 
-### v0.1.0 (February 13, 2026) - Current
+See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
+
+### v0.2.1 (February 16, 2026) - Current
+- ✨ **LightGrid System** - Full import/export/bake/visualize workflow
+- ✨ **Lightmap Export Fixed** - TEXCOORD7 channel now exports correctly
+- ✨ **Mesh Lightmap Settings** - Shadow casting, texture assignment, scale/bias
+- 🐛 **Fixed lightmap UVs not writing** - Critical export bug resolved
+- 📖 **Material System Documentation** - Complete guide added
+
+### v0.2.0 (February 15, 2026)
+- ✨ **Shader Template System** - 91 templates from 9,509 materials
+- ✨ **Material Editor Redesign** - Dropdown enums for all fields
+- ✨ **Point Light System** - Custom feature for dynamic lights
+- 📖 **Stationary Light Research** - Field analysis across 195 mapgeo files
+
+### v0.1.0 (February 13, 2026)
 - ✨ **Full import and export support** - Complete round-trip editing
 - ✨ **All League features working** - Dragons, baron, bushes, lightmaps
 - ✨ **Stable release** - Production ready
@@ -562,14 +643,16 @@ Using this tool is at your own risk. Modifying game files may violate Terms of S
 
 Potential features for future versions:
 - [ ] Automated Bucketgrid creation
-- [ ] Material template library
-- [ ] Lightmap Baking
+- [x] Material template library (v0.2.0)
+- [x] LightGrid system (v0.2.1)
+- [ ] Full Lightmap texture baking from Blender lights
 - [ ] Full particle support
 - [ ] Full project workflow
 - [ ] Direct reading of TEX files in blender without converting them
 - [ ] Map Object Support
 - [ ] Dynamic Light Support
 - [ ] Vertex Animations
+- [ ] Materials.bin export (currently manual editing required)
 
 Suggestions welcome - open an issue!
 

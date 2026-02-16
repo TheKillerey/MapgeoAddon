@@ -230,14 +230,17 @@ class TexConverter:
         return dds_header + pixels
 
 
-def resolve_texture_path(texture_path: str, assets_folder: str) -> Optional[str]:
+def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_folder: str = "", prioritize_custom: bool = False) -> Optional[str]:
     """
     Resolve a texture path from the materials file.
     Tries multiple extensions in order: .tex -> .dds -> .png
+    Checks folders based on priority setting.
     
     Args:
         texture_path: Path from materials file (e.g., "ASSETS/Maps/.../texture.tex")
-        assets_folder: Base assets folder path selected by user
+        assets_folder: Original Riot assets folder path
+        custom_assets_folder: Custom assets folder path
+        prioritize_custom: If True, check custom folder first, then original. If False, check original first.
     
     Returns:
         Full resolved path to texture file, or None if not found
@@ -251,20 +254,36 @@ def resolve_texture_path(texture_path: str, assets_folder: str) -> Optional[str]
     # Convert to OS-specific path separators
     texture_path = texture_path.replace('/', os.sep).replace('\\', os.sep)
     
-    # Join with assets folder
-    full_path = os.path.join(assets_folder, texture_path)
+    # Determine folder order based on priority
+    folders = []
+    if prioritize_custom:
+        # Custom first, then original
+        if custom_assets_folder:
+            folders.append(custom_assets_folder)
+        if assets_folder:
+            folders.append(assets_folder)
+    else:
+        # Original first, then custom (default)
+        if assets_folder:
+            folders.append(assets_folder)
+        if custom_assets_folder:
+            folders.append(custom_assets_folder)
     
-    # Try exact path first
-    if os.path.exists(full_path):
-        return full_path
-    
-    # Try alternative extensions in order: .tex -> .dds -> .png
-    base_path = os.path.splitext(full_path)[0]
-    extensions = ['.tex', '.dds', '.png']
-    
-    for ext in extensions:
-        test_path = base_path + ext
-        if os.path.exists(test_path):
-            return test_path
+    # Try each folder in order
+    for folder in folders:
+        full_path = os.path.join(folder, texture_path)
+        
+        # Try exact path first
+        if os.path.exists(full_path):
+            return full_path
+        
+        # Try alternative extensions in order: .tex -> .dds -> .png
+        base_path = os.path.splitext(full_path)[0]
+        extensions = ['.tex', '.dds', '.png']
+        
+        for ext in extensions:
+            test_path = base_path + ext
+            if os.path.exists(test_path):
+                return test_path
     
     return None

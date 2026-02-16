@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo",
     "description": "Import, edit and export League of Legends .mapgeo files (Riot's map format)",
@@ -40,6 +40,10 @@ from . import (
 # Callback function for environment visibility
 def update_environment_visibility(self, context):
     """Update object visibility based on selected dragon and baron layer filters (League engine logic)"""
+    # Skip visibility filtering if Edit Mode is enabled
+    if self.edit_mode:
+        return
+    
     dragon_filter = self.dragon_layer_filter
     baron_filter = self.baron_layer_filter
     
@@ -306,6 +310,13 @@ class MapgeoSettings(PropertyGroup):
     layers: CollectionProperty(type=MapgeoLayerItem)
     active_layer_index: IntProperty(default=0)
     
+    # Root collection name (fixed structure for reliable export)
+    root_collection_name: StringProperty(
+        name="Root Collection Name",
+        description="Root collection name for imported mapgeo data. All imports use this as the base name",
+        default="rey_map"
+    )
+    
     # File paths
     last_import_path: StringProperty(
         name="Last Import Path",
@@ -323,10 +334,23 @@ class MapgeoSettings(PropertyGroup):
     
     # Assets and Materials
     assets_folder: StringProperty(
-        name="Assets Folder",
-        description="Path to the ASSETS folder containing textures",
+        name="Original Assets Folder",
+        description="Path to the original Riot ASSETS folder containing textures (checked first)",
         default="",
         subtype='DIR_PATH'
+    )
+    
+    custom_assets_folder: StringProperty(
+        name="Custom Assets Folder",
+        description="Path to custom ASSETS folder containing textures (fallback if not found in original)",
+        default="",
+        subtype='DIR_PATH'
+    )
+    
+    prioritize_custom_assets: BoolProperty(
+        name="Prioritize Custom Assets",
+        description="Check custom assets folder first, then original (useful for custom maps with texture overrides)",
+        default=False
     )
     
     levels_folder: StringProperty(
@@ -355,6 +379,14 @@ class MapgeoSettings(PropertyGroup):
         description="Path to the map*.py or map*.json file containing MapSkin definitions for grass tint textures",
         default="",
         subtype='FILE_PATH'
+    )
+    
+    # Edit Mode - disable layer visibility system
+    edit_mode: BoolProperty(
+        name="Edit Mode",
+        description="Disable layer visibility system and show all objects regardless of dragon/baron layers. Enable when editing to prevent objects from disappearing",
+        default=False,
+        update=update_environment_visibility
     )
     
     # Visibility filters (League engine style)
@@ -427,11 +459,27 @@ classes = (
     ui_panel.MAPGEO_OT_add_point_light,
     ui_panel.MAPGEO_OT_remove_point_light_from_selected,
     ui_panel.MAPGEO_OT_export_point_lights,
+    ui_panel.MAPGEO_OT_import_bushes_from_mapgeo,
+    ui_panel.MAPGEO_OT_import_render_regions_from_mapgeo,
+    ui_panel.MAPGEO_OT_import_bucket_grid_from_mapgeo,
+    ui_panel.MAPGEO_OT_cleanup_unused_materials,
+    ui_panel.MAPGEO_OT_import_external_mesh,
+    ui_panel.MAPGEO_OT_create_lightgrid,
+    ui_panel.MAPGEO_OT_bake_lightgrid,
+    ui_panel.MAPGEO_OT_import_lightgrid,
+    ui_panel.MAPGEO_OT_export_lightgrid,
+    ui_panel.MAPGEO_OT_clear_lightgrid,
+    ui_panel.MAPGEO_OT_visualize_lightgrid,
+    ui_panel.MAPGEO_OT_set_lightgrid_occluder,
+    ui_panel.MAPGEO_OT_set_lightgrid_ignore,
+    ui_panel.MAPGEO_OT_assign_lightmap_texture,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
     ui_panel.VIEW3D_PT_mapgeo_export_panel,
     ui_panel.VIEW3D_PT_mapgeo_properties_panel,
+    ui_panel.VIEW3D_PT_mapgeo_utilities_panel,
+    ui_panel.VIEW3D_PT_mapgeo_lightgrid_panel,
 )
 
 def menu_func_import(self, context):

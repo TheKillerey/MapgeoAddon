@@ -17,7 +17,8 @@ from . import utils
 from . import material_loader as mat_loader
 from . import baron_hash_parser
 
-# Module-level cache for imported bucket grids (persists in Blender session)
+# DEPRECATED: Module-level cache no longer used. Bucket grid data is stored 
+# on the BucketGrid collection's "bucket_data_json" custom property instead.
 _imported_bucket_grids_cache = {}
 
 # Module-level cache for imported sampler defs (persists in Blender session)
@@ -137,8 +138,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
     def import_mapgeo(self, context, mapgeo: mapgeo_parser.MapgeoFile):
         """Import mapgeo data into Blender"""
         
-        # Create a collection for this mapgeo
-        collection_name = os.path.splitext(os.path.basename(self.filepath))[0]
+        # Use fixed root collection name from settings (not filename)
+        settings = context.scene.mapgeo_settings
+        collection_name = settings.root_collection_name if settings.root_collection_name else "rey_map"
         collection = bpy.data.collections.new(collection_name)
         context.scene.collection.children.link(collection)
         
@@ -179,6 +181,12 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             collection.children.link(baron_col)
             baron_collections[state_bit] = baron_col
         
+        # Create Bush and RenderRegion collections
+        bushes_collection = bpy.data.collections.new(f"{collection_name}_Bushes")
+        collection.children.link(bushes_collection)
+        render_regions_collection = bpy.data.collections.new(f"{collection_name}_RenderRegions")
+        collection.children.link(render_regions_collection)
+        
         print(f"Importing {len(mapgeo.meshes)} meshes from {collection_name}")
         print(f"  Vertex buffers: {len(mapgeo.vertex_buffers)}")
         print(f"  Index buffers: {len(mapgeo.index_buffers)}")
@@ -197,15 +205,23 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         settings = context.scene.mapgeo_settings
         
         if settings.materials_json_path and os.path.exists(settings.materials_json_path):
-            if settings.assets_folder and os.path.exists(settings.assets_folder):
+            has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
+            has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
+            
+            if has_original_assets or has_custom_assets:
                 print(f"  Loading materials from: {os.path.basename(settings.materials_json_path)}")
-                print(f"  Assets folder: {settings.assets_folder}")
+                if has_original_assets:
+                    print(f"  Original assets folder: {settings.assets_folder}")
+                if has_custom_assets:
+                    print(f"  Custom assets folder (fallback): {settings.custom_assets_folder}")
                 
                 material_loader = mat_loader.MaterialLoader(
                     assets_folder=settings.assets_folder,
                     levels_folder=settings.levels_folder if hasattr(settings, 'levels_folder') else "",
                     map_py_path=settings.map_py_path if hasattr(settings, 'map_py_path') else "",
                     dragon_layer=settings.dragon_layer_filter if hasattr(settings, 'dragon_layer_filter') else "LAYER_1",
+                    custom_assets_folder=settings.custom_assets_folder if hasattr(settings, 'custom_assets_folder') else "",
+                    prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
                 )
                 materials_db = material_loader.load_materials(settings.materials_json_path)
                 
@@ -374,6 +390,15 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                                 else:
                                     color_attr.data[loop_idx].color = col[:4]
                 
+                # Raw normals preservation for render region meshes
+                # Render region meshes use non-unit "normals" that contain game-specific data.
+                # Blender auto-normalizes normals to unit length, destroying this data.
+                # Store pre-swap raw normals so the exporter can write them back.
+                if normals and mesh_data.unknown_version18_int != 0:
+                    raw_attr = bl_mesh.attributes.new(name="raw_normals", type='FLOAT_VECTOR', domain='POINT')
+                    for vi in range(min(len(normals), len(bl_mesh.vertices))):
+                        raw_attr.data[vi].vector = normals[vi]
+
                 # TEXCOORD5 - bush animation anchor positions (3D per-vertex data)
                 # Store as a vertex-domain float vector attribute for round-trip export
                 if texcoord5_data and len(texcoord5_data) > 0:
@@ -488,6 +513,15 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     except Exception as e:
                         print(f"    Warning: Could not link mesh to baron collections: {e}")
                 
+                # Link to Bushes collection if mesh has TEXCOORD5 (bush animation data)
+                if texcoord5_data and len(texcoord5_data) > 0:
+                    obj["is_bush"] = True
+                    bushes_collection.objects.link(obj)
+                
+                # Link to RenderRegions collection if mesh has render region hash
+                if mesh_data.unknown_version18_int:
+                    render_regions_collection.objects.link(obj)
+                
                 # Apply transform
                 matrix = self.convert_transform_matrix(mesh_data.transform_matrix)
                 obj.matrix_world = matrix
@@ -499,14 +533,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Visibility and quality
                 obj["visibility_layer"] = int(mesh_data.visibility)
-                # Quality is a BITMASK (0-31), not enum. Each bit enables a quality level:
-                # Bit 0 (1)=Very Low, Bit 1 (2)=Low, Bit 2 (4)=Medium, Bit 3 (8)=High, Bit 4 (16)=Very High
-                # Value 31 (0b11111) = visible at ALL quality levels (most common)
-                quality_value = int(mesh_data.quality)
-                if quality_value < 0 or quality_value > 31:
-                    print(f"WARNING: Mesh {mesh_data.name} has invalid quality {quality_value}, setting to 31 (all levels)")
-                    quality_value = 31  # Default to all quality levels
-                obj["quality"] = quality_value
+                # Quality is a uint8 bitmask. Common values: 31 (all 5 levels), 255 (all bits).
+                # Render region meshes often use 255. Do NOT clamp to 31.
+                obj["quality"] = max(0, min(255, int(mesh_data.quality)))
                 
                 # Render flags, layer transition behavior, backface culling
                 obj["layer_transition_behavior"] = mesh_data.layer_transition_behavior
@@ -668,6 +697,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         
         total_verts = 0
         total_faces = 0
+        all_grid_jsons = []  # Collect full grid data for collection property
         
         for grid_idx, grid in enumerate(mapgeo.bucket_grids):
             if grid.is_disabled:
@@ -781,9 +811,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 vis_hex = bytes(grid.face_visibility_flags).hex()
                 obj["face_visibility_flags_hex"] = vis_hex
             
-            # Store serialized bucket grid data in module cache for export
-            global _imported_bucket_grids_cache
-            
+            # Build full grid data for collection-level storage (used by export)
             grid_json = {
                 "index": grid_idx,
                 "path_hash": grid.path_hash,
@@ -817,8 +845,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 ],
                 "face_visibility_flags": grid.face_visibility_flags,
             }
-            _imported_bucket_grids_cache[grid_idx] = grid_json
-            print(f"  Cached bucket grid {grid_idx}")
+            all_grid_jsons.append(grid_json)
+            print(f"  Stored bucket grid {grid_idx} data for export")
             
             # --- Create bounding box wireframe ---
             bbox_name = f"{grid_name}_Bounds"
@@ -887,38 +915,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             bbox_obj["is_bucket_grid_bounds"] = True
             bbox_obj["bucket_grid_index"] = grid_idx
         
-        # Store per-grid bucket data as JSON on the collection for export
-        bucket_data_list = []
-        for grid_idx, grid in enumerate(mapgeo.bucket_grids):
-            grid_data = {
-                "index": grid_idx,
-                "path_hash": grid.path_hash if grid.path_hash else 0,
-                "unknown_v18_float": grid.unknown_v18_float,
-                "bounds": [grid.min_x, grid.min_z, grid.max_x, grid.max_z],
-                "stickout": [grid.max_stickout_x, grid.max_stickout_z],
-                "bucket_size": [grid.bucket_size_x, grid.bucket_size_z],
-                "buckets_per_side": grid.buckets_per_side,
-                "is_disabled": grid.is_disabled,
-                "flags": grid.flags,
-            }
-            if grid.buckets:
-                cells = []
-                for row in grid.buckets:
-                    row_cells = []
-                    for b in row:
-                        row_cells.append({
-                            "max_stickout_x": b.max_stickout_x,
-                            "max_stickout_z": b.max_stickout_z,
-                            "start_index": b.start_index,
-                            "base_vertex": b.base_vertex,
-                            "inside_face_count": b.inside_face_count,
-                            "sticking_out_face_count": b.sticking_out_face_count,
-                        })
-                    cells.append(row_cells)
-                grid_data["buckets"] = cells
-            bucket_data_list.append(grid_data)
-        
-        bg_collection["bucket_data_json"] = json.dumps(bucket_data_list)
+        # Store full grid data as JSON on the collection for export
+        # This is the source of truth - no stale module cache needed
+        bg_collection["bucket_data_json"] = json.dumps(all_grid_jsons)
         
         # Hide the bucket grid collection by default in the viewport
         view_layer = context.view_layer
@@ -1427,6 +1426,592 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
 
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_SCENE_OT_mapgeo.bl_idname, text="League of Legends Mapgeo (.mapgeo)")
+
+
+# ─── Standalone import utility (used by utility operators in ui_panel.py) ───
+# Replicates the full main importer pipeline with a filter function.
+
+def read_vertex_element(data: bytes, elem):
+    """Read a single vertex element from raw buffer data. Returns tuple or None."""
+    try:
+        offset = elem.offset
+        fmt = elem.format
+        
+        if fmt == 0:    return struct.unpack_from('<f', data, offset)
+        elif fmt == 1:  return struct.unpack_from('<ff', data, offset)
+        elif fmt == 2:  return struct.unpack_from('<fff', data, offset)
+        elif fmt == 3:  return struct.unpack_from('<ffff', data, offset)
+        elif fmt == 4:
+            v = struct.unpack_from('<BBBB', data, offset)
+            return (v[2]/255.0, v[1]/255.0, v[0]/255.0, v[3]/255.0)
+        elif fmt == 5:
+            v = struct.unpack_from('<BBBB', data, offset)
+            return (v[2]/255.0, v[1]/255.0, v[0]/255.0, v[3]/255.0)
+        elif fmt == 6:
+            v = struct.unpack_from('<BBBB', data, offset)
+            return tuple(x / 255.0 for x in v)
+        elif fmt == 7:  return struct.unpack_from('<ee', data, offset)
+        elif fmt == 8:  return struct.unpack_from('<eee', data, offset)
+        elif fmt == 9:  return struct.unpack_from('<eeee', data, offset)
+        elif fmt == 10:
+            v = struct.unpack_from('<BB', data, offset)
+            return tuple(x / 255.0 for x in v)
+        elif fmt == 11:
+            v = struct.unpack_from('<BBB', data, offset)
+            return tuple(x / 255.0 for x in v)
+        elif fmt == 12:
+            v = struct.unpack_from('<BBBB', data, offset)
+            return tuple(x / 255.0 for x in v)
+    except:
+        pass
+    return None
+
+
+def _parse_vertex_buffer_standalone(vertex_buffer, vb_description, mesh_data):
+    """Parse a single vertex buffer into components. Returns (vertices, normals, uvs[8], colors, texcoord5_data)."""
+    vertices = []
+    normals = []
+    uvs = [[] for _ in range(8)]
+    colors = []
+    texcoord5_data = []
+    
+    vertex_size = vb_description.get_vertex_size()
+    if vertex_size == 0:
+        return vertices, normals, uvs, colors, texcoord5_data
+    
+    vertex_count = mesh_data.vertex_count
+    if vertex_count * vertex_size > len(vertex_buffer.data):
+        vertex_count = len(vertex_buffer.data) // vertex_size
+    
+    # Discover elements
+    position_elem = None
+    normal_elem = None
+    color_elem = None
+    uv_elems = {}
+    texcoord5_elem = None
+    
+    for elem in vb_description.elements:
+        if elem.name == mapgeo_parser.VertexElementName.POSITION:
+            position_elem = elem
+        elif elem.name == mapgeo_parser.VertexElementName.NORMAL:
+            normal_elem = elem
+        elif elem.name == mapgeo_parser.VertexElementName.PRIMARY_COLOR:
+            color_elem = elem
+        elif mapgeo_parser.VertexElementName.TEXCOORD0 <= elem.name <= mapgeo_parser.VertexElementName.TEXCOORD7:
+            uv_idx = elem.name - mapgeo_parser.VertexElementName.TEXCOORD0
+            if uv_idx == 5:
+                texcoord5_elem = elem  # TEXCOORD5 is NOT a UV, it's bush animation data
+            else:
+                uv_elems[uv_idx] = elem
+    
+    for i in range(vertex_count):
+        offset = i * vertex_size
+        vdata = vertex_buffer.data[offset:offset + vertex_size]
+        
+        if position_elem:
+            pos = read_vertex_element(vdata, position_elem)
+            if pos and len(pos) >= 3:
+                vertices.append((pos[0], pos[2], pos[1]))
+            else:
+                vertices.append((0, 0, 0))
+        
+        if normal_elem:
+            n = read_vertex_element(vdata, normal_elem)
+            if n and len(n) >= 3:
+                normals.append((n[0], n[2], n[1]))
+        
+        for uv_idx, uv_elem in uv_elems.items():
+            uv = read_vertex_element(vdata, uv_elem)
+            if uv and len(uv) >= 2:
+                uvs[uv_idx].append((uv[0], 1.0 - uv[1]))
+            else:
+                uvs[uv_idx].append((0.0, 0.0))
+        
+        if texcoord5_elem:
+            tc5 = read_vertex_element(vdata, texcoord5_elem)
+            if tc5 and len(tc5) >= 3:
+                texcoord5_data.append((tc5[0], tc5[2], tc5[1]))
+            else:
+                texcoord5_data.append((0.0, 0.0, 0.0))
+        
+        if color_elem:
+            color = read_vertex_element(vdata, color_elem)
+            if color:
+                colors.append(color)
+    
+    return vertices, normals, uvs, colors, texcoord5_data
+
+
+def _parse_index_buffer_standalone(index_buffer, mesh_data):
+    """Parse index buffer into faces with per-face primitive index. Returns (faces, face_materials)."""
+    faces = []
+    face_materials = []
+    
+    for prim_idx, prim in enumerate(mesh_data.primitives):
+        for i in range(0, prim.index_count, 3):
+            idx_offset = (prim.start_index + i) * 2
+            if idx_offset + 6 > len(index_buffer.data):
+                break
+            i0, i1, i2 = struct.unpack_from('<HHH', index_buffer.data, idx_offset)
+            faces.append((i0, i1, i2))
+            face_materials.append(prim_idx)
+    
+    return faces, face_materials
+
+
+def _create_simple_material(name):
+    """Create a basic Principled BSDF material."""
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=name)
+        mat.use_nodes = True
+        if mat.node_tree:
+            nodes = mat.node_tree.nodes
+            nodes.clear()
+            bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+            bsdf.location = (0, 0)
+            output = nodes.new('ShaderNodeOutputMaterial')
+            output.location = (300, 0)
+            mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+    return mat
+
+
+def get_blender_transform(matrix_list):
+    """Convert 16-float mapgeo transform to Blender Matrix with Y/Z swap."""
+    mat_league = Matrix([
+        [matrix_list[0], matrix_list[4], matrix_list[8], matrix_list[12]],
+        [matrix_list[1], matrix_list[5], matrix_list[9], matrix_list[13]],
+        [matrix_list[2], matrix_list[6], matrix_list[10], matrix_list[14]],
+        [matrix_list[3], matrix_list[7], matrix_list[11], matrix_list[15]]
+    ])
+    conversion = Matrix([
+        [1, 0, 0, 0],
+        [0, 0, 1, 0],
+        [0, 1, 0, 0],
+        [0, 0, 0, 1]
+    ])
+    return conversion @ mat_league @ conversion.inverted()
+
+
+def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=""):
+    """
+    Import meshes from a mapgeo file with full pipeline (materials, UVs, normals,
+    vertex colors, lightmaps, baron hashes, custom properties, layer collections).
+    
+    This replicates the main IMPORT_SCENE_OT_mapgeo.import_mapgeo pipeline exactly,
+    but only imports meshes for which mesh_filter_fn returns True.
+    
+    Args:
+        context: Blender context
+        filepath: Path to .mapgeo file
+        mesh_filter_fn: callable(mesh_idx, mesh_data, mapgeo) -> bool. Return True to import.
+                        Receives the full mapgeo object for access to vertex_buffer_descriptions etc.
+        collection_suffix: Suffix for the collection name (e.g. "_Bushes", "_RenderRegions")
+    
+    Returns:
+        (imported_count, error_message) - count of imported meshes, or error string
+    """
+    import hashlib
+    
+    # Parse mapgeo file
+    parser = mapgeo_parser.MapgeoParser()
+    mapgeo = parser.read(filepath)
+    
+    if not mapgeo.meshes:
+        return 0, "No meshes found in mapgeo file"
+    
+    # ─── Find or create root collection and sub-collections ───
+    settings = context.scene.mapgeo_settings
+    root_name = settings.root_collection_name if settings.root_collection_name else "rey_map"
+    
+    # Find existing root collection, or create it
+    root_collection = bpy.data.collections.get(root_name)
+    if root_collection is None:
+        root_collection = bpy.data.collections.new(root_name)
+        context.scene.collection.children.link(root_collection)
+    
+    # Find or create _Meshes sub-collection (all mesh objects go here)
+    meshes_col_name = f"{root_name}_Meshes"
+    meshes_collection = bpy.data.collections.get(meshes_col_name)
+    if meshes_collection is None:
+        meshes_collection = bpy.data.collections.new(meshes_col_name)
+        root_collection.children.link(meshes_collection)
+    
+    # Find or create the specific target sub-collection (e.g. _Bushes, _RenderRegions)
+    target_collection = None
+    if collection_suffix:
+        target_col_name = f"{root_name}{collection_suffix}"
+        target_collection = bpy.data.collections.get(target_col_name)
+        if target_collection is None:
+            target_collection = bpy.data.collections.new(target_col_name)
+            root_collection.children.link(target_collection)
+    
+    # Find or create layer collections
+    layer_names = {
+        mapgeo_parser.EnvironmentVisibility.LAYER_1: "Base",
+        mapgeo_parser.EnvironmentVisibility.LAYER_2: "Inferno",
+        mapgeo_parser.EnvironmentVisibility.LAYER_3: "Mountain",
+        mapgeo_parser.EnvironmentVisibility.LAYER_4: "Ocean",
+        mapgeo_parser.EnvironmentVisibility.LAYER_5: "Cloud",
+        mapgeo_parser.EnvironmentVisibility.LAYER_6: "Hextech",
+        mapgeo_parser.EnvironmentVisibility.LAYER_7: "Chemtech",
+        mapgeo_parser.EnvironmentVisibility.LAYER_8: "Void",
+    }
+    layer_collections = {}
+    for layer_flag, layer_name in layer_names.items():
+        col_name = f"{root_name}_{layer_name}"
+        layer_col = bpy.data.collections.get(col_name)
+        if layer_col is None:
+            layer_col = bpy.data.collections.new(col_name)
+            root_collection.children.link(layer_col)
+        layer_collections[layer_flag] = layer_col
+    
+    # Find or create baron state collections
+    baron_state_names = {1: "BaronBase", 2: "BaronCup", 4: "BaronTunnel", 8: "BaronUpgraded"}
+    baron_collections = {}
+    for state_bit, state_name in baron_state_names.items():
+        col_name = f"{root_name}_{state_name}"
+        baron_col = bpy.data.collections.get(col_name)
+        if baron_col is None:
+            baron_col = bpy.data.collections.new(col_name)
+            root_collection.children.link(baron_col)
+        baron_collections[state_bit] = baron_col
+    
+    # ─── Load materials database ───
+    materials = {}
+    materials_db = {}
+    material_loader_inst = None
+    baron_parser_inst = None
+    lightmap_color_scale = 1.0
+    settings = context.scene.mapgeo_settings
+    
+    if settings.materials_json_path and os.path.exists(settings.materials_json_path):
+        has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
+        has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
+        
+        if has_original_assets or has_custom_assets:
+            material_loader_inst = mat_loader.MaterialLoader(
+                assets_folder=settings.assets_folder,
+                levels_folder=settings.levels_folder if hasattr(settings, 'levels_folder') else "",
+                map_py_path=settings.map_py_path if hasattr(settings, 'map_py_path') else "",
+                dragon_layer=settings.dragon_layer_filter if hasattr(settings, 'dragon_layer_filter') else "LAYER_1",
+                custom_assets_folder=settings.custom_assets_folder if hasattr(settings, 'custom_assets_folder') else "",
+                prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
+            )
+            materials_db = material_loader_inst.load_materials(settings.materials_json_path)
+            
+            map_settings = material_loader_inst.load_map_settings(settings.materials_json_path)
+            lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
+            
+            baron_parser_inst = baron_hash_parser.MaterialsBinParser(settings.materials_json_path)
+    
+    # ─── Import matching meshes ───
+    imported_count = 0
+    
+    for mesh_idx, mesh_data in enumerate(mapgeo.meshes):
+        # Apply user filter (pass mapgeo for access to vertex descriptions etc.)
+        if not mesh_filter_fn(mesh_idx, mesh_data, mapgeo):
+            continue
+        
+        try:
+            mesh_name = f"{root_name}_mesh_{mesh_idx:03d}"
+            
+            # Validate buffer IDs
+            if not mesh_data.vertex_buffer_ids:
+                continue
+            vb_id = mesh_data.vertex_buffer_ids[0]
+            if vb_id >= len(mapgeo.vertex_buffers):
+                continue
+            desc_id = mesh_data.vertex_declaration_id
+            if desc_id >= len(mapgeo.vertex_buffer_descriptions):
+                continue
+            if mesh_data.index_buffer_id >= len(mapgeo.index_buffers):
+                continue
+            
+            vertex_buffer = mapgeo.vertex_buffers[vb_id]
+            vb_description = mapgeo.vertex_buffer_descriptions[desc_id]
+            index_buffer = mapgeo.index_buffers[mesh_data.index_buffer_id]
+            
+            # Parse primary vertex buffer
+            vertices, normals, uvs, colors, texcoord5_data = _parse_vertex_buffer_standalone(
+                vertex_buffer, vb_description, mesh_data
+            )
+            
+            # Parse secondary vertex buffers
+            if len(mesh_data.vertex_buffer_ids) > 1:
+                for sec_vb_idx in range(1, len(mesh_data.vertex_buffer_ids)):
+                    sec_vb_id = mesh_data.vertex_buffer_ids[sec_vb_idx]
+                    sec_desc_id = mesh_data.vertex_declaration_id + sec_vb_idx
+                    if sec_vb_id >= len(mapgeo.vertex_buffers) or sec_desc_id >= len(mapgeo.vertex_buffer_descriptions):
+                        continue
+                    sec_vb = mapgeo.vertex_buffers[sec_vb_id]
+                    sec_desc = mapgeo.vertex_buffer_descriptions[sec_desc_id]
+                    _, sec_normals, sec_uvs, sec_colors, sec_tc5 = _parse_vertex_buffer_standalone(
+                        sec_vb, sec_desc, mesh_data
+                    )
+                    if sec_normals and not normals:
+                        normals = sec_normals
+                    for uv_idx, uv_data in enumerate(sec_uvs):
+                        if uv_data and not uvs[uv_idx]:
+                            uvs[uv_idx] = uv_data
+                    if sec_colors and not colors:
+                        colors = sec_colors
+                    if sec_tc5 and not texcoord5_data:
+                        texcoord5_data = sec_tc5
+            
+            # Parse index buffer
+            faces, face_materials = _parse_index_buffer_standalone(index_buffer, mesh_data)
+            
+            if not vertices or not faces:
+                continue
+            
+            # ── Create Blender mesh ──
+            bl_mesh = bpy.data.meshes.new(mesh_name)
+            bl_mesh.from_pydata(vertices, [], faces)
+            bl_mesh.update()
+            
+            # Normals
+            if normals and len(normals) == len(vertices):
+                bl_mesh.normals_split_custom_set_from_vertices(normals)
+            
+            # All UV channels
+            uv_channels_created = 0
+            has_lightmap_uv = False
+            for uv_idx, uv_data in enumerate(uvs):
+                if uv_data and len(uv_data) > 0:
+                    if uv_idx == 7:
+                        uv_layer = bl_mesh.uv_layers.new(name="LightmapUV")
+                        has_lightmap_uv = True
+                        lm_scale = (1.0, 1.0)
+                        lm_bias = (0.0, 0.0)
+                        if mesh_data.baked_light:
+                            lm_scale = mesh_data.baked_light.scale
+                            lm_bias = mesh_data.baked_light.bias
+                        for face in bl_mesh.polygons:
+                            for loop_idx in face.loop_indices:
+                                vert_idx = bl_mesh.loops[loop_idx].vertex_index
+                                if vert_idx < len(uv_data):
+                                    raw_u, raw_v = uv_data[vert_idx]
+                                    orig_v = 1.0 - raw_v
+                                    final_u = raw_u * lm_scale[0] + lm_bias[0]
+                                    final_v = orig_v * lm_scale[1] + lm_bias[1]
+                                    uv_layer.data[loop_idx].uv = (final_u, 1.0 - final_v)
+                    else:
+                        uv_layer = bl_mesh.uv_layers.new(name=f"UVMap{uv_idx}" if uv_idx > 0 else "UVMap")
+                        for face in bl_mesh.polygons:
+                            for loop_idx in face.loop_indices:
+                                vert_idx = bl_mesh.loops[loop_idx].vertex_index
+                                if vert_idx < len(uv_data):
+                                    uv_layer.data[loop_idx].uv = uv_data[vert_idx]
+                    uv_channels_created += 1
+            
+            # Vertex colors
+            if colors:
+                color_attr = bl_mesh.color_attributes.new(name="Color", type='BYTE_COLOR', domain='CORNER')
+                for face in bl_mesh.polygons:
+                    for loop_idx in face.loop_indices:
+                        vert_idx = bl_mesh.loops[loop_idx].vertex_index
+                        if vert_idx < len(colors):
+                            col = colors[vert_idx]
+                            if len(col) == 3:
+                                color_attr.data[loop_idx].color = (*col, 1.0)
+                            else:
+                                color_attr.data[loop_idx].color = col[:4]
+            
+            # Raw normals preservation for render region meshes
+            if normals and mesh_data.unknown_version18_int != 0:
+                raw_attr = bl_mesh.attributes.new(name="raw_normals", type='FLOAT_VECTOR', domain='POINT')
+                for vi in range(min(len(normals), len(bl_mesh.vertices))):
+                    raw_attr.data[vi].vector = normals[vi]
+
+            # TEXCOORD5 (bush animation)
+            if texcoord5_data and len(texcoord5_data) > 0:
+                tc5_attr = bl_mesh.attributes.new(name="TEXCOORD5", type='FLOAT_VECTOR', domain='POINT')
+                for vert_idx in range(min(len(texcoord5_data), len(bl_mesh.vertices))):
+                    tc5_attr.data[vert_idx].vector = texcoord5_data[vert_idx]
+            
+            # ── Materials ──
+            material_mapping = {}
+            mesh_lightmap_texture = None
+            if has_lightmap_uv and mesh_data.baked_light and mesh_data.baked_light.texture:
+                mesh_lightmap_texture = mesh_data.baked_light.texture
+            
+            mesh_texture_overrides = {}
+            if mesh_data.texture_overrides:
+                for override in mesh_data.texture_overrides:
+                    for sampler_def in mapgeo.sampler_defs:
+                        if sampler_def.index == override.index:
+                            mesh_texture_overrides[sampler_def.name] = override.texture
+                            break
+            
+            baked_paint_scale = mesh_data.baked_paint_scale
+            baked_paint_bias = mesh_data.baked_paint_bias
+            
+            for prim_idx, prim in enumerate(mesh_data.primitives):
+                mat_name = prim.material if prim.material else "Default"
+                
+                mat_cache_key = mat_name
+                if mesh_lightmap_texture:
+                    lm_hash = hashlib.md5(mesh_lightmap_texture.encode()).hexdigest()[:6]
+                    mat_cache_key = f"{mat_name}__lm__{lm_hash}"
+                if mesh_texture_overrides:
+                    override_hash = hashlib.md5(str(sorted(mesh_texture_overrides.items())).encode()).hexdigest()[:6]
+                    mat_cache_key = f"{mat_cache_key}__to__{override_hash}"
+                if baked_paint_scale != (1.0, 1.0) or baked_paint_bias != (0.0, 0.0):
+                    bp_hash = hashlib.md5(f"{baked_paint_scale}{baked_paint_bias}".encode()).hexdigest()[:6]
+                    mat_cache_key = f"{mat_cache_key}__bp__{bp_hash}"
+                
+                if mat_cache_key not in materials:
+                    if material_loader_inst and materials_db:
+                        mat = material_loader_inst.get_or_create_material(
+                            mat_name, materials_db,
+                            lightmap_texture=mesh_lightmap_texture,
+                            lightmap_color_scale=lightmap_color_scale,
+                            texture_overrides=mesh_texture_overrides,
+                            baked_paint_scale=baked_paint_scale,
+                            baked_paint_bias=baked_paint_bias
+                        )
+                        materials[mat_cache_key] = mat
+                    else:
+                        materials[mat_cache_key] = _create_simple_material(mat_name)
+                
+                mat_slot_idx = -1
+                for idx, mat_slot in enumerate(bl_mesh.materials):
+                    if mat_slot == materials[mat_cache_key]:
+                        mat_slot_idx = idx
+                        break
+                if mat_slot_idx == -1:
+                    bl_mesh.materials.append(materials[mat_cache_key])
+                    mat_slot_idx = len(bl_mesh.materials) - 1
+                material_mapping[prim_idx] = mat_slot_idx
+            
+            if material_mapping:
+                for face_idx, face in enumerate(bl_mesh.polygons):
+                    if face_idx < len(face_materials):
+                        prim_idx = face_materials[face_idx]
+                        if prim_idx in material_mapping:
+                            face.material_index = material_mapping[prim_idx]
+            
+            # ── Create object & link to collections ──
+            obj = bpy.data.objects.new(mesh_name, bl_mesh)
+            meshes_collection.objects.link(obj)
+            
+            # Link to target sub-collection (Bushes, RenderRegions, etc.)
+            if target_collection is not None:
+                target_collection.objects.link(obj)
+            
+            if mesh_data.visibility:
+                for layer_flag, layer_col in layer_collections.items():
+                    if mesh_data.visibility & layer_flag:
+                        layer_col.objects.link(obj)
+            
+            # Transform
+            obj.matrix_world = get_blender_transform(mesh_data.transform_matrix)
+            
+            # ── Custom properties (full set, identical to main importer) ──
+            obj["visibility_layer"] = int(mesh_data.visibility)
+            obj["quality"] = max(0, min(255, int(mesh_data.quality)))
+            obj["layer_transition_behavior"] = mesh_data.layer_transition_behavior
+            obj["render_flags"] = mesh_data.render_flags
+            obj["disable_backface_culling"] = int(mesh_data.disable_backface_culling)
+            
+            # Lightmap data
+            if mesh_data.baked_light:
+                if mesh_data.baked_light.texture:
+                    obj["lightmap_texture"] = mesh_data.baked_light.texture
+                obj["lightmap_scale"] = list(mesh_data.baked_light.scale)
+                obj["lightmap_bias"] = list(mesh_data.baked_light.bias)
+            if mesh_data.stationary_light:
+                if mesh_data.stationary_light.texture:
+                    obj["stationary_light_texture"] = mesh_data.stationary_light.texture
+                obj["stationary_light_scale"] = list(mesh_data.stationary_light.scale)
+                obj["stationary_light_bias"] = list(mesh_data.stationary_light.bias)
+            
+            # Baked paint
+            if mesh_data.baked_paint_scale != (1.0, 1.0) or mesh_data.baked_paint_bias != (0.0, 0.0):
+                obj["baked_paint_scale"] = list(mesh_data.baked_paint_scale)
+                obj["baked_paint_bias"] = list(mesh_data.baked_paint_bias)
+            
+            # Render region hash
+            if mesh_data.unknown_version18_int:
+                obj["render_region_hash"] = f"{mesh_data.unknown_version18_int:08X}"
+            
+            # Baron hash
+            if mesh_data.visibility_controller_path_hash:
+                baron_hash_str = f"{mesh_data.visibility_controller_path_hash:08X}"
+                obj["baron_hash"] = baron_hash_str
+                
+                if baron_parser_inst:
+                    try:
+                        controller = baron_parser_inst.decode_baron_hash(baron_hash_str)
+                        if controller.baron_layers:
+                            baron_layers_list = sorted(list(controller.baron_layers))
+                            obj["baron_layers_decoded"] = str(baron_layers_list)
+                        if controller.dragon_layers:
+                            dragon_layers_list = sorted(list(controller.dragon_layers))
+                            obj["baron_dragon_layers_decoded"] = str(dragon_layers_list)
+                        obj["baron_parent_mode"] = controller.parent_mode
+                    except Exception as e:
+                        print(f"    Warning: Could not decode baron hash {baron_hash_str}: {e}")
+            
+            # Link to baron collections after properties are set
+            if "baron_layers_decoded" in obj and obj["baron_layers_decoded"]:
+                try:
+                    import ast
+                    baron_layers = ast.literal_eval(obj["baron_layers_decoded"])
+                    for baron_state_bit in baron_layers:
+                        if baron_state_bit in baron_collections:
+                            baron_collections[baron_state_bit].objects.link(obj)
+                except Exception:
+                    pass
+            
+            # Bush flag (if TEXCOORD5 present)
+            if texcoord5_data and len(texcoord5_data) > 0:
+                obj["is_bush"] = True
+            
+            # Point lights
+            if obj.get("point_light_enabled", False):
+                try:
+                    light_color = obj.get("point_light_color", [1.0, 0.95, 0.8])
+                    light_intensity = obj.get("point_light_intensity", 500.0)
+                    light_radius = obj.get("point_light_radius", 5.0)
+                    offset_z = obj.get("point_light_offset_z", 0.0)
+                    light_data = bpy.data.lights.new(name=f"{mesh_name}_PointLight", type='POINT')
+                    light_data.energy = light_intensity
+                    light_data.color = light_color
+                    light_data.shadow_soft_size = light_radius
+                    light_obj = bpy.data.objects.new(name=f"{mesh_name}_PointLight", object_data=light_data)
+                    light_obj.location = obj.location.copy()
+                    light_obj.location.z += offset_z
+                    meshes_collection.objects.link(light_obj)
+                    light_obj.parent = obj
+                except Exception:
+                    pass
+            
+            imported_count += 1
+            if imported_count <= 5 or imported_count % 100 == 0:
+                uv_info = f", {uv_channels_created} UV" if uv_channels_created > 0 else ""
+                print(f"  ✓ Mesh {mesh_idx}: {len(vertices)} verts, {len(faces)} faces{uv_info}")
+        
+        except Exception as e:
+            print(f"  ✗ Error importing mesh {mesh_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    suffix_label = collection_suffix.strip('_') if collection_suffix else 'filtered'
+    print(f"\n✓ Filtered import ({suffix_label}): {imported_count} meshes into '{root_name}'")
+    
+    # Update visibility
+    try:
+        import sys
+        addon_module = sys.modules.get(__package__)
+        if addon_module and hasattr(addon_module, 'update_environment_visibility'):
+            addon_module.update_environment_visibility(settings, context)
+    except Exception:
+        pass
+    
+    return imported_count, None
 
 
 def register():

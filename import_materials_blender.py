@@ -1,0 +1,370 @@
+"""
+Blender Material Importer for League of Legends
+Imports materials from .materials.py files into Blender
+"""
+
+import bpy
+from pathlib import Path
+from typing import Dict, List, Optional
+import json
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from materials_parser import MaterialsParser, Material
+except ImportError:
+    # Fallback if materials_parser not available
+    Material = None
+    MaterialsParser = None
+
+def import_materials_from_file(filepath: str, create_textures: bool = True) -> Dict[str, bpy.types.Material]:
+    """
+    Import materials from League .materials.py file
+    
+    Args:
+        filepath: Path to .materials.py file
+        create_textures: Whether to create texture nodes (will search for textures)
+    
+    Returns:
+        Dict mapping material names to Blender materials
+    """
+    
+    if MaterialsParser is None:
+        raise RuntimeError("materials_parser module not available")
+    
+    # Parse the materials file
+    parser = MaterialsParser(filepath)
+    league_materials = parser.parse()
+    
+    print(f"Importing {len(league_materials)} materials from {Path(filepath).name}")
+    
+    blender_materials = {}
+    
+    for mat_name, league_mat in league_materials.items():
+        try:
+            blender_mat = _create_blender_material(mat_name, league_mat, create_textures)
+            blender_materials[mat_name] = blender_mat
+        except Exception as e:
+            print(f"Warning: Failed to import material {mat_name}: {e}")
+    
+    return blender_materials
+
+def _create_blender_material(name: str, league_material: Material, create_textures: bool = True) -> bpy.types.Material:
+    """
+    Create a Blender material from League material definition
+    Stores all League properties as custom properties
+    """
+    
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    
+    # Clear default nodes
+    mat.node_tree.nodes.clear()
+    
+    # Store League material data as custom properties
+    _store_custom_properties(mat, league_material, create_textures)
+    
+    # Create basic node structure for visualization
+    _create_material_nodes(mat, league_material, create_textures)
+    
+    return mat
+
+def _store_custom_properties(mat: bpy.types.Material, league_material: Material, create_textures: bool):
+    """Store League material data as Blender custom properties"""
+    
+    # Basic properties
+    mat["league_material_name"] = league_material.name
+    mat["league_material_type"] = league_material.type
+    mat["league_version"] = 3
+    mat["imported"] = True
+    
+    # Store samplers
+    samplers_data = []
+    for sampler in league_material.samplerValues:
+        sampler_dict = {
+            "textureName": sampler.textureName,
+            "texturePath": sampler.texturePath,
+            "addressU": sampler.addressU,
+            "addressV": sampler.addressV,
+            "addressW": sampler.addressW,
+        }
+        samplers_data.append(sampler_dict)
+    mat["samplers"] = json.dumps(samplers_data)
+    
+    # Store parameters
+    params_data = []
+    for param in league_material.paramValues:
+        param_dict = {
+            "name": param.name,
+            "value": list(param.value) if param.value is not None else None
+        }
+        params_data.append(param_dict)
+    mat["parameters"] = json.dumps(params_data)
+    
+    # Store switches
+    switches_data = []
+    for switch in league_material.switches:
+        switch_dict = {
+            "name": switch.name,
+            "on": switch.on
+        }
+        switches_data.append(switch_dict)
+    mat["switches"] = json.dumps(switches_data)
+    
+    # Store shader macros
+    if league_material.shaderMacros:
+        mat["shader_macros"] = json.dumps(league_material.shaderMacros)
+    
+    # Store techniques
+    techniques_data = []
+    for technique in league_material.techniques:
+        tech_dict = {
+            "name": technique.name,
+            "passes": []
+        }
+        for pass_obj in technique.passes:
+            pass_dict = {
+                "shader": pass_obj.shader,
+                "blendEnable": pass_obj.blendEnable,
+                "srcColorBlendFactor": pass_obj.srcColorBlendFactor,
+                "srcAlphaBlendFactor": pass_obj.srcAlphaBlendFactor,
+                "dstColorBlendFactor": pass_obj.dstColorBlendFactor,
+                "dstAlphaBlendFactor": pass_obj.dstAlphaBlendFactor,
+            }
+            tech_dict["passes"].append(pass_dict)
+        techniques_data.append(tech_dict)
+    mat["techniques"] = json.dumps(techniques_data)
+    
+    # Store child techniques
+    child_tech_data = []
+    for child_tech in league_material.childTechniques:
+        child_dict = {
+            "name": child_tech.name,
+            "parentName": child_tech.parentName,
+            "shaderMacros": child_tech.shaderMacros
+        }
+        child_tech_data.append(child_dict)
+    mat["child_techniques"] = json.dumps(child_tech_data)
+
+def _create_material_nodes(mat: bpy.types.Material, league_material: Material, create_textures: bool):
+    """Create Blender shader nodes for visualization"""
+    
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    
+    # Create output node
+    output_node = nodes.new(type='ShaderNodeOutputMaterial')
+    output_node.location = (300, 0)
+    
+    # Create principled shader
+    principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+    principled.location = (0, 0)
+    
+    # Link to output
+    links.new(principled.outputs['BSDF'], output_node.inputs['Surface'])
+    
+    # Load primary diffuse texture if available
+    if create_textures and league_material.samplerValues:
+        try:
+            # Look for main diffuse/color texture
+            diffuse_sampler = None
+            for sampler in league_material.samplerValues:
+                if any(x in sampler.textureName.lower() for x in ['diffuse', 'color', 'base', 'main']):
+                    diffuse_sampler = sampler
+                    break
+            
+            if not diffuse_sampler and league_material.samplerValues:
+                diffuse_sampler = league_material.samplerValues[0]
+            
+            if diffuse_sampler:
+                # Create texture node
+                tex_node = nodes.new(type='ShaderNodeTexImage')
+                tex_node.location = (-300, 0)
+                
+                # Try to load texture
+                _load_texture_into_node(tex_node, diffuse_sampler.texturePath)
+                
+                # Connect to principled
+                links.new(tex_node.outputs['Color'], principled.inputs['Base Color'])
+        except Exception as e:
+            print(f"Warning: Failed to set up texture nodes: {e}")
+
+def _load_texture_into_node(tex_node: bpy.types.ShaderNodeTexImage, texture_path: str) -> bool:
+    """
+    Attempt to load a texture file into a node
+    Searches in multiple common paths
+    """
+    
+    texture_path = texture_path.replace('\\', '/')
+    
+    # Possible base search paths
+    search_bases = [
+        Path(r"C:\Riot Games\League of Legends\Game\DATA\FINAL"),
+        Path(r"C:\Users\theki\AppData\Local\Programs\Python\Python310"),  # For local development
+    ]
+    
+    # Try direct path first
+    if Path(texture_path).exists():
+        try:
+            img = bpy.data.images.load(str(Path(texture_path)))
+            tex_node.image = img
+            return True
+        except:
+            pass
+    
+    # Try searching in League folders
+    for base_path in search_bases:
+        for possible_path in [
+            base_path / texture_path,
+            base_path / f"ASSETS/{texture_path.split('ASSETS/')[-1] if 'ASSETS/' in texture_path else texture_path}",
+        ]:
+            if possible_path.with_suffix('.tex').exists():
+                # Found .tex file, can't load directly but note it
+                print(f"Found texture: {possible_path.with_suffix('.tex')}")
+                return False
+    
+    return False
+
+def assign_material_to_object(obj: bpy.types.Object, material: bpy.types.Material, slot_index: int = 0):
+    """Assign a material to an object"""
+    
+    if not obj.data.materials:
+        obj.data.materials.append(material)
+    elif slot_index < len(obj.data.materials):
+        obj.data.materials[slot_index] = material
+    else:
+        obj.data.materials.append(material)
+
+def create_material_collection() -> bpy.types.Collection:
+    """Create a collection to organize imported materials"""
+    
+    # Remove existing if present
+    if "League Materials" in bpy.data.collections:
+        old_coll = bpy.data.collections["League Materials"]
+        bpy.data.batch_remove([old_coll])
+    
+    # Create new collection
+    coll = bpy.data.collections.new("League Materials")
+    bpy.context.scene.collection.children.link(coll)
+    
+    return coll
+
+def list_material_properties(material: bpy.types.Material) -> Dict[str, any]:
+    """List all League properties stored in a Blender material"""
+    
+    props = {}
+    
+    for key in ['league_material_name', 'league_material_type', 'samplers', 
+                'parameters', 'switches', 'shader_macros', 'techniques', 'child_techniques']:
+        if key in material:
+            value = material[key]
+            # Try to parse JSON if string
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except:
+                    pass
+            props[key] = value
+    
+    return props
+
+def export_material_to_json(material: bpy.types.Material, output_path: str):
+    """Export a Blender material's League data to JSON"""
+    
+    data = {
+        'name': material.name,
+        'properties': {}
+    }
+    
+    for key in material.keys():
+        if key.startswith(('league_', 'imported', 'samplers', 'parameters', 'switches', 'shader', 'techniques', 'child')):
+            value = material[key]
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except:
+                    pass
+            data['properties'][key] = value
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# ============================================================================
+# Blender Addon Operators
+# ============================================================================
+
+class MAPGEO_OT_import_materials(bpy.types.Operator):
+    """Import materials from League .materials.py file"""
+    bl_idname = "mapgeo.import_materials"
+    bl_label = "Import League Materials"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: bpy.props.StringProperty(
+        name="File Path",
+        description="Path to .materials.py file",
+        subtype='FILE_PATH'
+    )
+    
+    create_textures: bpy.props.BoolProperty(
+        name="Load Textures",
+        description="Attempt to load texture files",
+        default=True
+    )
+    
+    def execute(self, context):
+        try:
+            materials = import_materials_from_file(self.filepath, self.create_textures)
+            self.report({'INFO'}, f"Imported {len(materials)} materials")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to import materials: {str(e)}")
+            return {'CANCELLED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+class MAPGEO_OT_export_material_json(bpy.types.Operator):
+    """Export active material's League data to JSON"""
+    bl_idname = "mapgeo.export_material_json"
+    bl_label = "Export Material to JSON"
+    bl_options = {'REGISTER'}
+    
+    filepath: bpy.props.StringProperty(
+        name="File Path",
+        description="Output JSON file path",
+        subtype='FILE_PATH'
+    )
+    
+    def execute(self, context):
+        try:
+            mat = context.object.active_material
+            if not mat:
+                self.report({'ERROR'}, "No active material")
+                return {'CANCELLED'}
+            
+            export_material_to_json(mat, self.filepath)
+            self.report({'INFO'}, f"Exported to {self.filepath}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {str(e)}")
+            return {'CANCELLED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+def register():
+    """Register operators"""
+    bpy.utils.register_class(MAPGEO_OT_import_materials)
+    bpy.utils.register_class(MAPGEO_OT_export_material_json)
+
+def unregister():
+    """Unregister operators"""
+    bpy.utils.unregister_class(MAPGEO_OT_import_materials)
+    bpy.utils.unregister_class(MAPGEO_OT_export_material_json)
+
+if __name__ == "__main__":
+    register()
