@@ -85,6 +85,11 @@ test_lightgrid_registration.py
 baron_hash_parser.py
 create_custom_particle.py
 create_release.ps1
+update_addon.py
+
+# Development guides
+POINT_LIGHT_GUIDE.md
+QUICK_START.md
 
 # Release artifacts
 MapgeoAddon_v*.zip
