@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.2.4] - 2026-02-20
+
+### 🧹 Repository Cleanup
+- **Removed Developer Files** - Cleaned up repository to contain only Blender addon essentials
+  - Removed C# implementations (TroybinParser.cs, IniHashDictionary.cs, TroybinExamples.cs)
+  - Removed standalone documentation (TROYBIN_README.md, TROYBIN_CSHARP_README.md)
+  - Removed research materials and development notes
+  - Removed diagnostic and testing tools
+  - Removed development guides (POINT_LIGHT_GUIDE.md, QUICK_START.md)
+  - Removed developer utilities (baron_hash_parser.py, create_custom_particle.py, update_addon.py)
+  - Removed test particle files
+  - Updated .gitignore to prevent tracking of development artifacts
+
+### 📦 Repository Structure
+- **Addon-Only Focus** - Repository now contains only files needed for Blender addon installation
+  - Core addon modules (parsers, UI, importers, exporters)
+  - User documentation (README.md, CHANGELOG.md, LEAGUE_TOOLS_GUIDE.md, MATERIALS_GUIDE.md)
+  - Configuration files (.gitignore, LICENSE)
+  - Data files (shader templates, stationary light data)
+
 ## [0.2.3] - 2026-02-20
 
 ### ✨ Features Added - League Tools: Troybin Particle Editor
