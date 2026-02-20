@@ -719,6 +719,28 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         layout = self.layout
         settings = context.scene.mapgeo_settings
         
+        # Pillow Installation Status (check dynamically)
+        pillow_installed = False
+        try:
+            import PIL
+            pillow_installed = True
+        except ImportError:
+            pass
+        
+        pillow_box = layout.box()
+        pillow_row = pillow_box.row()
+        if pillow_installed:
+            pillow_row.label(text="Pillow: Installed", icon='CHECKMARK')
+        else:
+            pillow_row.label(text="Pillow: Not Installed", icon='ERROR')
+            install_row = pillow_box.row()
+            install_row.operator("mapgeo.install_pillow", text="Install Pillow for Textures", icon='IMPORT')
+            info_box = pillow_box.box()
+            info_box.scale_y = 0.7
+            info_box.label(text="Pillow is required for texture conversion", icon='INFO')
+        
+        layout.separator()
+        
         box = layout.box()
         box.label(text="Import Options", icon='PREFERENCES')
         

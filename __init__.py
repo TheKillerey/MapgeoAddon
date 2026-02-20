@@ -16,6 +16,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
+import sys
 import bpy
 from bpy.props import (
     StringProperty,
@@ -232,6 +233,44 @@ def update_bucket_grid_visibility(self, context):
     
     status = "shown" if show_grids else "hidden"
     print(f"Bucket grids {status} ({len(bg_layer_cols)} collections)")
+
+# Operators
+class MAPGEO_OT_install_pillow(bpy.types.Operator):
+    """Install Pillow library for texture conversion"""
+    bl_idname = "mapgeo.install_pillow"
+    bl_label = "Install Pillow"
+    bl_description = "Install Pillow (PIL) library for texture conversion (.tex to .png)"
+    bl_options = {'REGISTER'}
+    
+    def execute(self, context):
+        import subprocess
+        import site
+        
+        self.report({'INFO'}, "Installing Pillow... This may take a moment.")
+        
+        try:
+            # Install to user site-packages (no admin needed)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "Pillow"])
+            
+            # Add user site-packages to path immediately
+            import site
+            site.addsitedir(site.USER_SITE)
+            
+            # Test import
+            try:
+                import PIL
+                self.report({'INFO'}, "Pillow installed successfully! Restart Blender for full effect.")
+                return {'FINISHED'}
+            except ImportError:
+                self.report({'WARNING'}, "Pillow installed but requires Blender restart to take effect.")
+                return {'FINISHED'}
+                
+        except subprocess.CalledProcessError as e:
+            self.report({'ERROR'}, f"Installation failed: {e}")
+            return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Installation error: {e}")
+            return {'CANCELLED'}
 
 # Property Groups for storing mapgeo data
 class MapgeoLayerItem(PropertyGroup):
@@ -482,6 +521,7 @@ class MapgeoSettings(PropertyGroup):
 
 # Classes to register
 classes = (
+    MAPGEO_OT_install_pillow,
     MapgeoLayerItem,
     MapgeoSettings,
     import_mapgeo.IMPORT_SCENE_OT_mapgeo,
