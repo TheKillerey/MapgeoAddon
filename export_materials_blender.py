@@ -51,12 +51,72 @@ def export_blender_materials_to_league(output_filepath: str, materials_list: Opt
         except Exception as e:
             print(f"Warning: Failed to export material {blender_mat.name}: {e}")
     
-    # Export to file
+    # Retrieve preserved other_entries and entry_order
+    other_entries, entry_order = _retrieve_other_entries()
+    
+    # Export to file with preserved entries in original order
     if league_materials:
-        MaterialsExporter.export(league_materials, output_filepath)
-        print(f"Exported {len(league_materials)} materials to {output_filepath}")
+        MaterialsExporter.export(league_materials, output_filepath, other_entries, entry_order)
+        if other_entries:
+            print(f"Exported {len(league_materials)} materials + {len(other_entries)} other entries to {output_filepath}")
+        else:
+            print(f"Exported {len(league_materials)} materials to {output_filepath}")
+            print(f"Warning: No other entries found - VFX/MapPlaceableContainer data may be lost")
     
     return len(league_materials)
+
+
+def export_blender_materials_merge(source_filepath: str, output_filepath: str, 
+                                    materials_list: Optional[List[bpy.types.Material]] = None) -> int:
+    """
+    Export Blender materials merged with an existing .materials.py file.
+    
+    Reads the source file to get all non-material entries and entry order,
+    then replaces only the materials with Blender's versions while preserving
+    everything else (VFX, MapPlaceableContainer, etc.) from the source file.
+    
+    Args:
+        source_filepath: Path to existing .materials.py file to merge with
+        output_filepath: Path to write the merged output file
+        materials_list: List of Blender materials to export (None = all with league_material_name)
+    
+    Returns:
+        Number of materials exported
+    """
+    from materials_parser import MaterialsParser
+    
+    if MaterialsExporter is None:
+        raise RuntimeError("materials_parser module not available")
+    
+    # Parse the source file to get other_entries and entry_order
+    parser = MaterialsParser(source_filepath)
+    parser.parse()
+    other_entries = parser.other_entries
+    entry_order = parser.entry_order
+    
+    print(f"Source file: {len(parser.materials)} materials, {len(other_entries)} other entries")
+    
+    # Collect Blender materials
+    if materials_list is None:
+        materials_list = [m for m in bpy.data.materials if m.get("league_material_name")]
+    
+    # Convert Blender materials to League materials
+    league_materials = {}
+    for blender_mat in materials_list:
+        try:
+            league_mat = _convert_blender_to_league(blender_mat)
+            league_materials[league_mat.name] = league_mat
+        except Exception as e:
+            print(f"Warning: Failed to export material {blender_mat.name}: {e}")
+    
+    # Export: use source file's other_entries and entry_order, but with Blender's materials
+    if league_materials:
+        MaterialsExporter.export(league_materials, output_filepath, other_entries, entry_order)
+        print(f"Exported {len(league_materials)} materials + {len(other_entries)} other entries")
+        print(f"  (merged with: {source_filepath})")
+    
+    return len(league_materials)
+
 
 def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
     """Convert a Blender material to a League Material object"""
@@ -74,9 +134,9 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
                 sampler = MaterialSampler(
                     textureName=s.get("textureName", ""),
                     texturePath=s.get("texturePath", ""),
-                    addressU=s.get("addressU", 1),
-                    addressV=s.get("addressV", 1),
-                    addressW=s.get("addressW", 1)
+                    addressU=s.get("addressU"),
+                    addressV=s.get("addressV"),
+                    addressW=s.get("addressW")
                 )
                 league_mat.samplerValues.append(sampler)
         except json.JSONDecodeError:
@@ -104,6 +164,8 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
                     name=s.get("name", ""),
                     on=s.get("on", False)
                 )
+                if "group" in s:
+                    switch.group = s["group"]
                 league_mat.switches.append(switch)
         except json.JSONDecodeError:
             print(f"Warning: Failed to parse switches JSON for {blender_mat.name}")
@@ -125,10 +187,13 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
                     pass_obj = MaterialPass(
                         shader=p.get("shader", ""),
                         blendEnable=p.get("blendEnable", False),
+                        cullEnable=p.get("cullEnable"),
                         srcColorBlendFactor=p.get("srcColorBlendFactor", 1),
                         srcAlphaBlendFactor=p.get("srcAlphaBlendFactor", 1),
                         dstColorBlendFactor=p.get("dstColorBlendFactor", 0),
-                        dstAlphaBlendFactor=p.get("dstAlphaBlendFactor", 0)
+                        dstAlphaBlendFactor=p.get("dstAlphaBlendFactor", 0),
+                        writeMask=p.get("writeMask"),
+                        shaderMacros=p.get("shaderMacros", {})
                     )
                     technique.passes.append(pass_obj)
                 league_mat.techniques.append(technique)
@@ -149,7 +214,66 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
         except json.JSONDecodeError:
             print(f"Warning: Failed to parse child_techniques JSON for {blender_mat.name}")
     
+    # Restore dynamicMaterial
+    if "dynamic_material" in blender_mat:
+        league_mat.dynamicMaterial = blender_mat["dynamic_material"]
+    
     return league_mat
+
+def _retrieve_other_entries() -> tuple:
+    """Retrieve preserved non-material entries and entry order from Blender Text data block
+    
+    Returns:
+        Tuple of (other_entries dict, entry_order list) or (None, None) if not found
+    """
+    import pickle
+    import base64
+    
+    text_name = "league_other_entries"
+    
+    if text_name not in bpy.data.texts:
+        return None, None
+    
+    try:
+        text_block = bpy.data.texts[text_name]
+        lines = text_block.as_string().split('\n')
+        
+        # Find DATA line and extract base64 string
+        data_found = False
+        serialized = ""
+        for line in lines:
+            if line.strip() == "# DATA:":
+                data_found = True
+                continue
+            if data_found and not line.startswith("#"):
+                serialized = line.strip()
+                break
+        
+        if not serialized:
+            print("Warning: No data found in other_entries text block")
+            return None, None
+        
+        # Deserialize
+        store_data = pickle.loads(base64.b64decode(serialized))
+        
+        # Handle both old format (list) and new format (dict with entry_order)
+        if isinstance(store_data, dict) and 'other_entries' in store_data:
+            other_entries = store_data['other_entries']
+            entry_order = store_data.get('entry_order', None)
+            print(f"Retrieved {len(other_entries)} other entries + {len(entry_order) if entry_order else 0} order entries from Blender text block")
+            return other_entries, entry_order
+        else:
+            # Legacy format: store_data is the old list of tuples
+            print(f"Retrieved {len(store_data)} other entries (legacy format) from Blender text block")
+            # Convert old list format to new dict format
+            other_entries = {}
+            for name, etype, content in store_data:
+                other_entries[name] = (etype, content)
+            return other_entries, None
+        
+    except Exception as e:
+        print(f"Warning: Failed to retrieve other_entries: {e}")
+        return None, None
 
 def export_selected_materials_json(output_filepath: str) -> int:
     """Export selected object's materials to JSON for editing"""
@@ -278,15 +402,54 @@ class MAPGEO_OT_export_materials_json(bpy.types.Operator):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+
+class MAPGEO_OT_export_materials_merge(bpy.types.Operator):
+    """Export materials merged with an existing .materials.py file (preserves VFX, containers, etc.)"""
+    bl_idname = "mapgeo.export_materials_merge"
+    bl_label = "Export Materials (Merge)"
+    bl_options = {'REGISTER'}
+    
+    filepath: bpy.props.StringProperty(
+        name="File Path",
+        description="Select the source .materials.py file to merge with",
+        subtype='FILE_PATH',
+    )
+    
+    def execute(self, context):
+        import os
+        try:
+            source = self.filepath
+            if not os.path.isfile(source):
+                self.report({'ERROR'}, f"Source file not found: {source}")
+                return {'CANCELLED'}
+            
+            # Write output next to source with _export suffix
+            base, ext = os.path.splitext(source)
+            output = f"{base}_export{ext}"
+            
+            count = export_blender_materials_merge(source, output)
+            self.report({'INFO'}, f"Exported {count} materials merged with {os.path.basename(source)}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Merge export failed: {str(e)}")
+            return {'CANCELLED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 def register():
     """Register operators"""
     bpy.utils.register_class(MAPGEO_OT_export_materials_to_league)
     bpy.utils.register_class(MAPGEO_OT_export_materials_json)
+    bpy.utils.register_class(MAPGEO_OT_export_materials_merge)
 
 def unregister():
     """Unregister operators"""
     bpy.utils.unregister_class(MAPGEO_OT_export_materials_to_league)
     bpy.utils.unregister_class(MAPGEO_OT_export_materials_json)
+    bpy.utils.unregister_class(MAPGEO_OT_export_materials_merge)
 
 if __name__ == "__main__":
     register()

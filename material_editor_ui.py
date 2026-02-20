@@ -618,6 +618,36 @@ class MAPGEO_OT_export_materials_to_file(Operator):
         return {'RUNNING_MODAL'}
 
 
+class MAPGEO_OT_export_materials_merge_file(Operator):
+    """Export materials merged with an existing .materials.py file (preserves VFX, containers, etc.)"""
+    bl_idname = "mapgeo.export_materials_merge_file"
+    bl_label = "Export Materials (Merge)"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+
+    def execute(self, context):
+        import os
+        try:
+            from export_materials_blender import export_blender_materials_merge
+            source = self.filepath
+            if not os.path.isfile(source):
+                self.report({'ERROR'}, f"Source file not found: {source}")
+                return {'CANCELLED'}
+            base, ext = os.path.splitext(source)
+            output = f"{base}_export{ext}"
+            n = export_blender_materials_merge(source, output)
+            self.report({'INFO'}, f"Exported {n} materials merged with {os.path.basename(source)} -> {os.path.basename(output)}")
+            return {'FINISHED'}
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 class MAPGEO_OT_view_material_properties(Operator):
     """Print all League properties of the active material to the console"""
     bl_idname = "mapgeo.view_material_properties"
@@ -1229,17 +1259,42 @@ class MAPGEO_OT_edit_technique_pass(Operator):
         description="Select from 91 known League shaders",
     )
     custom_shader: StringProperty(name="Custom Shader Path", default="")
+    apply_template: BoolProperty(
+        name="Apply Shader Template",
+        description="Update samplers, parameters, switches, and macros from the shader template. Keeps existing DiffuseTexture path",
+        default=True,
+    )
     blend_enable: BoolProperty(name="Blend Enable", default=False)
     src_color: IntProperty(name="Src Color Factor", min=0, max=10, default=1)
     dst_color: IntProperty(name="Dst Color Factor", min=0, max=10, default=0)
     src_alpha: IntProperty(name="Src Alpha Factor", min=0, max=10, default=1)
     dst_alpha: IntProperty(name="Dst Alpha Factor", min=0, max=10, default=0)
 
+    # Track original shader to detect changes
+    _original_shader: str = ""
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "shader_select")
         if self.shader_select == "CUSTOM":
             layout.prop(self, "custom_shader")
+
+        # Show template option when shader changed and template exists
+        new_shader = self.custom_shader if self.shader_select == "CUSTOM" else self.shader_select
+        shader_changed = new_shader != self._original_shader
+        has_template = new_shader in _SHADER_TEMPLATES
+
+        if shader_changed and has_template:
+            box = layout.box()
+            box.prop(self, "apply_template", icon='FILE_REFRESH')
+            if self.apply_template:
+                tpl = _SHADER_TEMPLATES[new_shader]
+                samp = len(tpl.get("samplers", []))
+                parm = len(tpl.get("parameters", []))
+                sw = len(tpl.get("switches", []))
+                box.label(text=f"Template: {samp} samplers, {parm} params, {sw} switches", icon='INFO')
+                box.label(text="DiffuseTexture path will be preserved", icon='IMAGE_DATA')
+
         box = layout.box()
         box.label(text="Blend Settings:")
         box.prop(self, "blend_enable")
@@ -1261,6 +1316,10 @@ class MAPGEO_OT_edit_technique_pass(Operator):
         if not (0 <= self.pass_index < len(passes)):
             return {'CANCELLED'}
         shader = self.custom_shader if self.shader_select == "CUSTOM" else self.shader_select
+        shader_changed = shader != self._original_shader
+
+        # Update the pass
+        existing = passes[self.pass_index]
         passes[self.pass_index] = {
             "shader": shader,
             "blendEnable": self.blend_enable,
@@ -1269,9 +1328,104 @@ class MAPGEO_OT_edit_technique_pass(Operator):
             "srcAlphaBlendFactor": self.src_alpha,
             "dstAlphaBlendFactor": self.dst_alpha,
         }
+        # Carry forward fields not exposed in the UI
+        for key in ("cullEnable", "writeMask", "shaderMacros"):
+            if key in existing:
+                passes[self.pass_index][key] = existing[key]
         techniques[self.technique_index]["passes"] = passes
         mat["techniques"] = json.dumps(techniques)
+
+        # Apply shader template if shader changed and user opted in
+        if shader_changed and self.apply_template and shader in _SHADER_TEMPLATES:
+            self._apply_shader_template(mat, shader)
+
         _tag_redraw(context)
+        if shader_changed and self.apply_template and shader in _SHADER_TEMPLATES:
+            self.report({'INFO'}, f"Pass updated — shader template applied for {shader.rsplit('/', 1)[-1]}")
+        else:
+            self.report({'INFO'}, "Pass updated")
+        return {'FINISHED'}
+
+    def _apply_shader_template(self, mat, shader_path):
+        """Apply shader template data to material, preserving DiffuseTexture path"""
+        tpl = _SHADER_TEMPLATES[shader_path]
+
+        # --- Preserve existing DiffuseTexture path ---
+        diffuse_path = ""
+        try:
+            old_samplers = json.loads(mat.get("samplers", "[]"))
+            for s in old_samplers:
+                if s.get("textureName") == "DiffuseTexture" and s.get("texturePath"):
+                    diffuse_path = s["texturePath"]
+                    break
+        except Exception:
+            pass
+
+        # --- Samplers ---
+        samplers = []
+        for s in tpl.get("samplers", []):
+            sampler = {
+                "textureName": s["name"],
+                "texturePath": "",
+                "addressU": s.get("addressU"),
+                "addressV": s.get("addressV"),
+                "addressW": s.get("addressW"),
+            }
+            # Restore diffuse texture path
+            if s["name"] == "DiffuseTexture" and diffuse_path:
+                sampler["texturePath"] = diffuse_path
+            samplers.append(sampler)
+        mat["samplers"] = json.dumps(samplers)
+
+        # --- Parameters ---
+        params = []
+        for p in tpl.get("parameters", []):
+            params.append({
+                "name": p["name"],
+                "value": p.get("value", [0, 0, 0, 0]),
+            })
+        mat["parameters"] = json.dumps(params)
+
+        # --- Switches ---
+        switches = []
+        for s in tpl.get("switches", []):
+            switches.append({
+                "name": s["name"],
+                "on": s.get("on", False),
+            })
+        mat["switches"] = json.dumps(switches)
+
+        # --- Material-level shader macros ---
+        mat["shader_macros"] = json.dumps(tpl.get("macros", {}))
+
+        # --- Blend settings (update technique pass too) ---
+        blend = tpl.get("blend", {})
+        try:
+            techniques = json.loads(mat.get("techniques", "[]"))
+            if techniques and techniques[self.technique_index].get("passes"):
+                p = techniques[self.technique_index]["passes"][self.pass_index]
+                p["blendEnable"] = blend.get("blendEnable", False)
+                p["srcColorBlendFactor"] = blend.get("srcColorBlendFactor", 1)
+                p["dstColorBlendFactor"] = blend.get("dstColorBlendFactor", 0)
+                p["srcAlphaBlendFactor"] = blend.get("srcAlphaBlendFactor", 1)
+                p["dstAlphaBlendFactor"] = blend.get("dstAlphaBlendFactor", 0)
+                mat["techniques"] = json.dumps(techniques)
+        except Exception:
+            pass
+
+        # --- Child techniques ---
+        children = tpl.get("child_techniques", [])
+        if children:
+            child_list = []
+            for cn in children:
+                child_list.append({
+                    "name": cn,
+                    "parentName": "normal",
+                    "shaderMacros": {"ENV_TRANSITION": "1"} if cn == "env_transition" else {},
+                })
+            mat["child_techniques"] = json.dumps(child_list)
+        else:
+            mat["child_techniques"] = json.dumps([])
         self.report({'INFO'}, "Pass updated")
         return {'FINISHED'}
 
@@ -1281,6 +1435,7 @@ class MAPGEO_OT_edit_technique_pass(Operator):
             tech = json.loads(mat["techniques"])[self.technique_index]
             p = tech["passes"][self.pass_index]
             current_shader = p.get("shader", "")
+            self._original_shader = current_shader
             # Try to match to a known shader
             found = False
             for item in _SHADER_ITEMS:
@@ -1297,7 +1452,7 @@ class MAPGEO_OT_edit_technique_pass(Operator):
             self.src_alpha = p.get("srcAlphaBlendFactor", 1)
             self.dst_alpha = p.get("dstAlphaBlendFactor", 0)
         except Exception:
-            pass
+            self._original_shader = ""
         return context.window_manager.invoke_props_dialog(self, width=480)
 
 
@@ -1599,11 +1754,14 @@ class MATERIAL_PT_league_techniques(Panel):
 
 class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
     """League Material Editor - 3D Viewport sidebar"""
-    bl_label = "League Material Editor"
+    bl_label = "Materials Setup"
     bl_idname = "VIEW3D_PT_mapgeo_material_editor"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'League Mapgeo'
+    bl_category = 'LoL Mapgeo'
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 1
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -1612,7 +1770,8 @@ class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
         box = layout.box()
         box.label(text="Import / Export", icon='FILE_FOLDER')
         box.operator("mapgeo.import_materials_file", text="Import Materials", icon='IMPORT')
-        box.operator("mapgeo.export_materials_to_file", text="Export Materials", icon='EXPORT')
+        box.operator("mapgeo.export_materials_to_file", text="Export Materials Only", icon='EXPORT')
+        box.operator("mapgeo.export_materials_merge_file", text="Export with .materials.py", icon='FILE_BLEND')
 
         # Material assignment
         box = layout.box()
@@ -1708,6 +1867,7 @@ material_editor_classes = (
     MAPGEO_OT_create_material_from_template,
     MAPGEO_OT_duplicate_material,
     MAPGEO_OT_export_materials_to_file,
+    MAPGEO_OT_export_materials_merge_file,
     MAPGEO_OT_view_material_properties,
     # Sampler operators
     MAPGEO_OT_add_sampler,

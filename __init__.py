@@ -1,7 +1,7 @@
 """
 League of Legends Mapgeo Addon for Blender 5.0
 Author: TheKillerey
-Description: A comprehensive tool to import, edit, and export League of Legends .mapgeo files
+Description: A comprehensive tool to import, edit, and export League of Legends .mapgeo files and more
 """
 
 bl_info = {
@@ -10,9 +10,9 @@ bl_info = {
     "version": (0, 2, 4),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
-    "description": "Import, edit and export League of Legends .mapgeo files and .troybin particles (Riot's formats)",
+    "description": "Import, edit and export League of Legends .mapgeo files and more",
     "warning": "",
-    "doc_url": "https://github.com/LeagueToolkit/LeagueToolkit",
+    "doc_url": "https://github.com/TheKillerey/MapgeoAddon",
     "category": "Import-Export",
 }
 

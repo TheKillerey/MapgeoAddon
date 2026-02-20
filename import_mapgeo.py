@@ -1367,8 +1367,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 i0 = struct.unpack_from('<H', ib.data, idx_offset)[0]
                 i1 = struct.unpack_from('<H', ib.data, idx_offset + index_size)[0]
                 i2 = struct.unpack_from('<H', ib.data, idx_offset + index_size * 2)[0]
-                
-                faces.append((i0, i1, i2))
+
+                # Y/Z swap in parse_vertex_buffer changes handedness (reflection),
+                # so triangle winding must be reversed to keep front faces correct.
+                faces.append((i0, i2, i1))
                 face_materials.append(prim_idx)  # Track which primitive this face belongs to
         
         return faces, face_materials
@@ -1553,7 +1555,8 @@ def _parse_index_buffer_standalone(index_buffer, mesh_data):
             if idx_offset + 6 > len(index_buffer.data):
                 break
             i0, i1, i2 = struct.unpack_from('<HHH', index_buffer.data, idx_offset)
-            faces.append((i0, i1, i2))
+            # Match main importer winding correction after Y/Z swap.
+            faces.append((i0, i2, i1))
             face_materials.append(prim_idx)
     
     return faces, face_materials
