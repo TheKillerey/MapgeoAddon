@@ -47,6 +47,21 @@ temp/
 _*.py
 !__init__.py
 
+# Test troybin files (keep templates only)
+*_custom.troybin
+custom_magical_aura2.troybin
+chaos_inhibit_base_glow.troybin
+
+# Research and temporary files
+*_research_*.py
+*_tmp_*.py
+*.dump.txt
+sco_conversion_*.md
+CONVERSION_COMPLETE.md
+FILE_INVENTORY.md
+QUALITY_FIX_REPORT.md
+*_research_report.txt
+
 # Release artifacts
 MapgeoAddon_v*.zip
 

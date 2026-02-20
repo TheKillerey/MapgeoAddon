@@ -7,10 +7,10 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 1),
+    "version": (0, 2, 3),
     "blender": (5, 0, 0),
-    "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo",
-    "description": "Import, edit and export League of Legends .mapgeo files (Riot's map format)",
+    "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
+    "description": "Import, edit and export League of Legends .mapgeo files and .troybin particles (Riot's formats)",
     "warning": "",
     "doc_url": "https://github.com/LeagueToolkit/LeagueToolkit",
     "category": "Import-Export",
@@ -34,6 +34,7 @@ from . import (
     export_mapgeo,
     ui_panel,
     material_editor_ui,
+    troybin_ui,
     utils,
 )
 
@@ -380,6 +381,49 @@ class MapgeoSettings(PropertyGroup):
         default="",
         subtype='FILE_PATH'
     )
+
+    lightmap_export_folder: StringProperty(
+        name="Lightmap Export Folder",
+        description="Output folder for baked/exported lightmap textures",
+        default="",
+        subtype='DIR_PATH'
+    )
+
+    lightmap_game_path: StringProperty(
+        name="Lightmap Game Path",
+        description="Relative in-game path used in mapgeo mesh lightmap_texture",
+        default="Maps/Lightmaps"
+    )
+
+    lightmap_resolution: IntProperty(
+        name="Lightmap Resolution",
+        description="Resolution used per mesh lightmap texture",
+        default=512,
+        min=64,
+        max=4096
+    )
+
+    lightmap_bake_samples: IntProperty(
+        name="Lightmap Samples",
+        description="Cycles sample count for automatic lightmap baking",
+        default=64,
+        min=1,
+        max=4096
+    )
+
+    lightmap_bake_margin: IntProperty(
+        name="Bake Margin",
+        description="Bake margin in pixels",
+        default=8,
+        min=0,
+        max=128
+    )
+
+    lightmap_selected_only: BoolProperty(
+        name="Selected Meshes Only",
+        description="Apply lightmap setup/bake/export only to selected meshes",
+        default=True
+    )
     
     # Edit Mode - disable layer visibility system
     edit_mode: BoolProperty(
@@ -473,6 +517,11 @@ classes = (
     ui_panel.MAPGEO_OT_set_lightgrid_occluder,
     ui_panel.MAPGEO_OT_set_lightgrid_ignore,
     ui_panel.MAPGEO_OT_assign_lightmap_texture,
+    ui_panel.MAPGEO_OT_prepare_lightmap_setup,
+    ui_panel.MAPGEO_OT_create_lightmap_uvs,
+    ui_panel.MAPGEO_OT_remove_no_baked_light_macro,
+    ui_panel.MAPGEO_OT_bake_lightmaps,
+    ui_panel.MAPGEO_OT_export_lightmaps,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
@@ -504,6 +553,12 @@ def register():
     except Exception as e:
         print(f"[MaterialEditor] Registration failed: {e}")
     
+    # Register troybin UI
+    try:
+        troybin_ui.register()
+    except Exception as e:
+        print(f"[League Tools] Registration failed: {e}")
+    
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -512,11 +567,18 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister troybin UI
+    try:
+        troybin_ui.unregister()
+    except Exception as e:
+        print(f"[League Tools] Unregister failed: {e}")
+    
     # Unregister material editor UI
     try:
         material_editor_ui.unregister()
     except Exception as e:
         print(f"[MaterialEditor] Unregister failed: {e}")
+    
     # Remove menu entries
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)

@@ -43,6 +43,19 @@ Open `.mapgeo` files from League in Blender:
 - Everything is preserved: layers, visibility, quality settings
 - Works with all League features (dragon states, baron pit, etc.)
 
+### ✨ League Tools - Particle Editor (NEW!)
+Edit League of Legends `.troybin` particle files directly in Blender:
+- **Import/Export** - Load and save particle effects
+- **View Emitters** - See all particle emitters in the file
+- **Property Browser** - View all properties with automatic unhashing
+- **Create New** - Build custom particles from scratch
+- Supports all particle types: meshes, textures, colors, velocities, rotations
+- Human-readable property names (e-life, p-scale, e-rgba, etc.)
+
+Access via: **3D Viewport → Sidebar (N) → League Tools tab**
+
+See [LEAGUE_TOOLS_GUIDE.md](LEAGUE_TOOLS_GUIDE.md) for detailed documentation.
+
 ---
 
 ## 🌟 Key Features Explained

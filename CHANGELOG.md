@@ -9,6 +9,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.2.3] - 2026-02-20
+
+### ✨ Features Added - League Tools: Troybin Particle Editor
+
+#### Complete Particle File Support
+- **Troybin Parser** - Full read/write support for League of Legends .troybin particle files
+  - Inibin v2 format with 13 property types
+  - SDBM hash algorithm with automatic unhashing
+  - Comprehensive hash dictionary (50+ GPART_VARS, 25+ COLOR_VARS, etc.)
+  - Byte-identical output preservation
+  - Python and C# implementations
+
+#### New "League Tools" Panel
+- **Import/Export Troybin** - Load and save particle files
+  - Automatic property name resolution (100% unhashing for common properties)
+  - Multi-emitter support (up to 50 emitters per file)
+  - File statistics display (emitter count, property count, resolution rate)
+  
+- **Property Editor** - Full UI for editing particle properties
+  - All property types editable: Int, Float, Bool, Vec2/3/4, Color, String
+  - Visual color picker for RGBA properties with 0-255 conversion
+  - Property grouping by type for easy navigation
+  - "Show All Properties" toggle for large files
+  - "Show Hashes" option for debugging
+
+- **Emitter Management**
+  - Add new emitters with custom names and types (Simple/Complex/Single)
+  - Remove emitters and their associated properties
+  - Emitter list with property counts
+  - Support for multi-emitter particle systems
+
+- **Property Templates** - 14 common property templates:
+  - `e-life` - Emitter lifetime (-1 = infinite)
+  - `e-rate` - Emission rate (particles/sec)
+  - `e-rgba` - Emitter color (RGBA)
+  - `p-life` - Particle lifetime
+  - `p-scale` - Particle size (Vec3)
+  - `p-vel` - Velocity (Vec3)
+  - `p-rotvel` - Rotation speed (Vec3)
+  - `p-offset` - Spawn offset (Vec3)
+  - `p-type` - Render type (billboard/mesh/etc.)
+  - `p-mesh` - Mesh filename (.scb)
+  - `p-texture` - Texture filename (.dds)
+  - `p-meshtex` - Mesh texture
+  - `p-backfaceon` - Backface rendering
+  - `rendermode` - Render mode
+
+- **Add/Remove Properties** - Dynamic property management
+  - Add properties using templates with smart defaults
+  - Remove individual properties with X button
+  - Automatic hash calculation and duplicate detection
+  - Property count tracking per emitter
+
+- **Create New Particles** - Build particles from scratch
+  - Minimal valid structure creation
+  - Single-click property addition
+  - Multi-emitter workflow support
+
+### 📚 Documentation
+- **LEAGUE_TOOLS_GUIDE.md** - Complete user guide for particle editor
+  - Workflow examples for editing and creating particles
+  - Property reference with value ranges
+  - Hash resolution explanation
+  - Troubleshooting section
+
+- **TROYBIN_README.md** - Python parser documentation
+  - API reference for direct script usage
+  - Example code for reading/writing particles
+  - Hash system explanation
+
+- **TROYBIN_CSHARP_README.md** - C# implementation guide
+  - Complete C# class library documentation
+  - LeagueToolkit integration examples
+  - Type-safe property access
+
+### 🔧 Code Quality
+- **TroybinParser.cs** - Production-ready C# implementation
+  - Type-safe property access with GetProperty<T>/SetProperty<T>
+  - LINQ support for queries
+  - Comprehensive IniHashDictionary
+
+- **Sample Particles** - Test files included
+  - `test_simple_glow.troybin` - Simple 1-emitter particle
+  - `custom_magical_aura.troybin` - Complex 3-emitter particle
+  - `create_custom_particle.py` - Template script for creation
+
+### 🐛 Bug Fixes
+- Fixed unsigned 32-bit hash storage (converted to hex strings for Blender compatibility)
+- Fixed tuple/dictionary data structure handling in parser
+- Fixed color picker range (0.0-1.0 for Blender, auto-converts to 0-255 for export)
+- Fixed vector property initialization to prevent None values
+- Added comprehensive fallback handling for unknown property types
+
+### 🎮 User Experience
+- Seamless integration with existing Mapgeo tools
+- Accessible via View3D → Sidebar → "League Tools" tab
+- Live editing with changes saved on export
+- No Blender restart needed for property changes
+- Supports both new particle creation and existing file modification
+
+---
+
 ## [0.2.1] - 2026-02-16
 
 ### ✨ Features Added

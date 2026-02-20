@@ -6,6 +6,7 @@ Sidebar panels for layer management and import/export settings
 import bpy
 import json
 import os
+import re
 from bpy.types import Panel, UIList
 
 from .texture_utils import TexConverter, resolve_texture_path
@@ -79,6 +80,57 @@ def _update_material_diffuse_node(mat, texture_path, assets_folder, custom_asset
         return True
     except Exception:
         return False
+
+
+def _strip_no_baked_light_macros(material):
+    removed = 0
+    macro_keys = {"NO_BAKED_LIGHT", "NO_BAKED_LIGHTING"}
+
+    if "shader_macros" in material:
+        try:
+            macros = json.loads(material.get("shader_macros", "{}"))
+            to_remove = [key for key in macros if key.upper() in macro_keys]
+            for key in to_remove:
+                del macros[key]
+                removed += 1
+            material["shader_macros"] = json.dumps(macros)
+        except Exception:
+            pass
+
+    if "techniques" in material:
+        try:
+            techniques = json.loads(material.get("techniques", "[]"))
+            changed = False
+            for technique in techniques:
+                for pass_data in technique.get("passes", []):
+                    pass_macros = pass_data.get("shaderMacros", {})
+                    to_remove = [key for key in pass_macros if key.upper() in macro_keys]
+                    for key in to_remove:
+                        del pass_macros[key]
+                        removed += 1
+                        changed = True
+            if changed:
+                material["techniques"] = json.dumps(techniques)
+        except Exception:
+            pass
+
+    if "child_techniques" in material:
+        try:
+            child_techniques = json.loads(material.get("child_techniques", "[]"))
+            changed = False
+            for child in child_techniques:
+                child_macros = child.get("shaderMacros", {})
+                to_remove = [key for key in child_macros if key.upper() in macro_keys]
+                for key in to_remove:
+                    del child_macros[key]
+                    removed += 1
+                    changed = True
+            if changed:
+                material["child_techniques"] = json.dumps(child_techniques)
+        except Exception:
+            pass
+
+    return removed
 
 
 
@@ -426,7 +478,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.1"
+        addon_version = "0.2.3"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -464,6 +516,7 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
     bl_category = 'LoL Mapgeo'
     bl_label = "Layer Management"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 2
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -657,8 +710,9 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
-    bl_label = "Import Settings"
+    bl_label = "Setup Map"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 0
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -733,7 +787,7 @@ class VIEW3D_PT_mapgeo_export_panel(Panel):
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
     bl_label = "Export Settings"
-    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_parent_id = "VIEW3D_PT_mapgeo_import_panel"
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -768,7 +822,7 @@ class VIEW3D_PT_mapgeo_properties_panel(Panel):
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
     bl_label = "Mesh Properties"
-    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_parent_id = "VIEW3D_PT_mapgeo_import_panel"
     bl_options = {'DEFAULT_CLOSED'}
     
     @classmethod
@@ -948,6 +1002,7 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
     bl_category = 'LoL Mapgeo'
     bl_label = "Utilities"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 4
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -988,6 +1043,7 @@ class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
     bl_label = "LightGrid"
     bl_idname = "VIEW3D_PT_mapgeo_lightgrid_panel"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 3
     
     def draw(self, context):
         layout = self.layout
@@ -1069,6 +1125,29 @@ class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
                 col.label(text=f"Bias: ({obj.get('lightmap_bias', [0,0])[0]:.3f}, {obj.get('lightmap_bias', [0,0])[1]:.3f})")
         else:
             box.label(text="Select meshes to configure")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Lightmap Setup", icon='RENDER_STILL')
+        settings = context.scene.mapgeo_settings
+
+        col = box.column(align=True)
+        col.prop(settings, "lightmap_export_folder", text="Export Folder")
+        col.prop(settings, "lightmap_game_path", text="Game Path")
+
+        row = col.row(align=True)
+        row.prop(settings, "lightmap_resolution", text="Resolution")
+        row.prop(settings, "lightmap_bake_samples", text="Samples")
+
+        col.prop(settings, "lightmap_bake_margin", text="Bake Margin")
+        col.prop(settings, "lightmap_selected_only", text="Selected Meshes Only")
+
+        col.separator()
+        col.operator("mapgeo.prepare_lightmap_setup", text="1) Prepare Mesh Values", icon='PREFERENCES')
+        col.operator("mapgeo.create_lightmap_uvs", text="2) Create Lightmap UVs", icon='UV')
+        col.operator("mapgeo.remove_no_baked_light_macro", text="3) Remove NO_BAKED_LIGHT", icon='X')
+        col.operator("mapgeo.bake_lightmaps", text="4) Bake Lightmaps", icon='RENDER_STILL')
+        col.operator("mapgeo.export_lightmaps", text="5) Export Lightmaps", icon='EXPORT')
         
         # Info
         layout.separator()
@@ -1561,6 +1640,12 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         description="Height (Z coordinate) for the flat bounding box plane",
         default=0.0
     )
+
+    include_render_regions: bpy.props.BoolProperty(
+        name="Include Render Regions",
+        description="Include meshes with render_region_hash (unknown_version18_int) in bucket grid generation",
+        default=False
+    )
     
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
@@ -1569,6 +1654,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "bucket_size")
         layout.prop(self, "height")
+        layout.prop(self, "include_render_regions")
     
     def execute(self, context):
         import mathutils
@@ -1599,7 +1685,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             # Skip bushes and render region meshes (by custom properties)
             if obj.get("is_bush", False):
                 continue
-            if obj.get("render_region_hash"):
+            if not self.include_render_regions and obj.get("render_region_hash"):
                 continue
             
             # Skip objects with ignored keywords in name (fallback)
@@ -3277,6 +3363,299 @@ class MAPGEO_OT_assign_lightmap_texture(bpy.types.Operator):
         row.prop(self, "bias_v")
 
 
+class MAPGEO_OT_prepare_lightmap_setup(bpy.types.Operator):
+    """Create all required lightmap values on selected/all meshes"""
+    bl_idname = "mapgeo.prepare_lightmap_setup"
+    bl_label = "Prepare Lightmap Setup"
+    bl_description = "Initialize lightmap fields and export paths on meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        targets = [obj for obj in (context.selected_objects if settings.lightmap_selected_only else context.scene.objects) if obj.type == 'MESH']
+
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects to prepare")
+            return {'CANCELLED'}
+
+        rel_root = settings.lightmap_game_path.strip().strip("/").replace("\\", "/")
+        if not rel_root:
+            rel_root = "Maps/Lightmaps"
+
+        prepared = 0
+        for obj in targets:
+            safe_name = re.sub(r'[^A-Za-z0-9_\-]+', '_', obj.name)
+            obj["lightmap_texture"] = f"{rel_root}/{safe_name}_lightmap.dds"
+            obj["lightmap_scale"] = [1.0, 1.0]
+            obj["lightmap_bias"] = [0.0, 0.0]
+            obj["lightgrid_occluder"] = True
+            prepared += 1
+
+        self.report({'INFO'}, f"Prepared lightmap values for {prepared} mesh(es)")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_create_lightmap_uvs(bpy.types.Operator):
+    """Create lightmap UVs for selected/all meshes"""
+    bl_idname = "mapgeo.create_lightmap_uvs"
+    bl_label = "Create Lightmap UVs"
+    bl_description = "Create and unwrap LightmapUV for meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        targets = [obj for obj in (context.selected_objects if settings.lightmap_selected_only else context.scene.objects) if obj.type == 'MESH']
+
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects found")
+            return {'CANCELLED'}
+
+        initial_active = context.view_layer.objects.active
+        initial_selected = list(context.selected_objects)
+        initial_mode = context.mode
+
+        created = 0
+        unwrapped = 0
+
+        try:
+            for obj in targets:
+                mesh = obj.data
+                uv_layer = mesh.uv_layers.get("LightmapUV")
+                if uv_layer is None:
+                    uv_layer = mesh.uv_layers.new(name="LightmapUV")
+                    created += 1
+
+                mesh.uv_layers.active = uv_layer
+                uv_layer.active_render = True
+
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+
+                try:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.03)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    unwrapped += 1
+                except Exception:
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+        finally:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in initial_selected:
+                if obj and obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if initial_active and initial_active.name in bpy.data.objects:
+                context.view_layer.objects.active = initial_active
+            try:
+                if initial_mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode=initial_mode.replace('EDIT_MESH', 'EDIT'))
+            except Exception:
+                pass
+
+        self.report({'INFO'}, f"LightmapUV created: {created}, unwrapped: {unwrapped}")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_remove_no_baked_light_macro(bpy.types.Operator):
+    """Remove NO_BAKED_LIGHT / NO_BAKED_LIGHTING macros from materials on selected objects"""
+    bl_idname = "mapgeo.remove_no_baked_light_macro"
+    bl_label = "Remove NO_BAKED_LIGHT"
+    bl_description = "Remove NO_BAKED_LIGHT and NO_BAKED_LIGHTING from material macro data on selected objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objects = context.selected_objects
+        if not selected_objects:
+            self.report({'WARNING'}, "Select objects to remove macros from")
+            return {'CANCELLED'}
+        
+        materials_processed = set()
+        removed = 0
+        touched = 0
+        
+        for obj in selected_objects:
+            if obj.type != 'MESH':
+                continue
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None or mat.name in materials_processed:
+                    continue
+                materials_processed.add(mat.name)
+                mat_removed = _strip_no_baked_light_macros(mat)
+                if mat_removed > 0:
+                    touched += 1
+                    removed += mat_removed
+
+        self.report({'INFO'}, f"Updated {touched} materials, removed {removed} macro entries")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_bake_lightmaps(bpy.types.Operator):
+    """Automatically bake lightmaps for selected/all meshes with League-ready settings"""
+    bl_idname = "mapgeo.bake_lightmaps"
+    bl_label = "Bake Lightmaps"
+    bl_description = "Bake lightmaps for meshes and write texture paths"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        export_folder = bpy.path.abspath(settings.lightmap_export_folder)
+
+        if not export_folder:
+            self.report({'ERROR'}, "Set a Lightmap Export Folder first")
+            return {'CANCELLED'}
+
+        os.makedirs(export_folder, exist_ok=True)
+
+        targets = [obj for obj in (context.selected_objects if settings.lightmap_selected_only else context.scene.objects) if obj.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects to bake")
+            return {'CANCELLED'}
+
+        # Remove macros only from materials on target objects
+        materials_processed = set()
+        for obj in targets:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is not None and mat.name not in materials_processed:
+                    _strip_no_baked_light_macros(mat)
+                    materials_processed.add(mat.name)
+
+        scene = context.scene
+        prev_engine = scene.render.engine
+        prev_samples = scene.cycles.samples if hasattr(scene, 'cycles') else 64
+
+        scene.render.engine = 'CYCLES'
+        scene.cycles.samples = max(1, settings.lightmap_bake_samples)
+        scene.cycles.bake_type = 'DIFFUSE'
+        scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        scene.render.bake.use_pass_direct = True
+        scene.render.bake.use_pass_indirect = False
+        scene.render.bake.use_pass_color = False
+        scene.render.bake.margin = max(0, settings.lightmap_bake_margin)
+
+        initial_active = context.view_layer.objects.active
+        initial_selected = list(context.selected_objects)
+        rel_root = settings.lightmap_game_path.strip().strip("/").replace("\\", "/") or "Maps/Lightmaps"
+
+        baked = 0
+        try:
+            for obj in targets:
+                mesh = obj.data
+                uv_layer = mesh.uv_layers.get("LightmapUV")
+                if uv_layer is None:
+                    uv_layer = mesh.uv_layers.new(name="LightmapUV")
+                mesh.uv_layers.active = uv_layer
+                uv_layer.active_render = True
+
+                safe_name = re.sub(r'[^A-Za-z0-9_\-]+', '_', obj.name)
+                image_name = f"LM_{safe_name}"
+                image = bpy.data.images.get(image_name)
+                if image is None:
+                    image = bpy.data.images.new(image_name, width=settings.lightmap_resolution, height=settings.lightmap_resolution, alpha=False)
+                else:
+                    image.scale(settings.lightmap_resolution, settings.lightmap_resolution)
+
+                image.generated_color = (0.0, 0.0, 0.0, 1.0)
+
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if not mat or not mat.use_nodes or not mat.node_tree:
+                        continue
+                    nodes = mat.node_tree.nodes
+                    node = nodes.get("MAPGEO_LightmapBake")
+                    if node is None:
+                        node = nodes.new('ShaderNodeTexImage')
+                        node.name = "MAPGEO_LightmapBake"
+                        node.label = "MAPGEO_LightmapBake"
+                    node.image = image
+                    nodes.active = node
+
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+
+                try:
+                    bpy.ops.object.bake(type='DIFFUSE')
+                except Exception as exc:
+                    print(f"Lightmap bake failed for {obj.name}: {exc}")
+                    continue
+
+                filename = f"{safe_name}_lightmap.png"
+                filepath = os.path.join(export_folder, filename)
+                image.file_format = 'PNG'
+                image.filepath_raw = filepath
+                image.save()
+
+                obj["lightmap_texture"] = f"{rel_root}/{safe_name}_lightmap.dds"
+                obj["lightmap_scale"] = [1.0, 1.0]
+                obj["lightmap_bias"] = [0.0, 0.0]
+                obj["lightmap_image_name"] = image.name
+                baked += 1
+        finally:
+            scene.render.engine = prev_engine
+            if hasattr(scene, 'cycles'):
+                scene.cycles.samples = prev_samples
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in initial_selected:
+                if obj and obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if initial_active and initial_active.name in bpy.data.objects:
+                context.view_layer.objects.active = initial_active
+
+        self.report({'INFO'}, f"Baked and saved lightmaps for {baked} mesh(es)")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_export_lightmaps(bpy.types.Operator):
+    """Export existing baked lightmaps to selected folder"""
+    bl_idname = "mapgeo.export_lightmaps"
+    bl_label = "Export Lightmaps"
+    bl_description = "Write stored lightmap images to export folder"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        export_folder = bpy.path.abspath(settings.lightmap_export_folder)
+
+        if not export_folder:
+            self.report({'ERROR'}, "Set a Lightmap Export Folder first")
+            return {'CANCELLED'}
+
+        os.makedirs(export_folder, exist_ok=True)
+
+        targets = [obj for obj in (context.selected_objects if settings.lightmap_selected_only else context.scene.objects) if obj.type == 'MESH']
+        if not targets:
+            self.report({'WARNING'}, "No mesh objects found")
+            return {'CANCELLED'}
+
+        exported = 0
+        for obj in targets:
+            image_name = obj.get("lightmap_image_name", "")
+            if not image_name:
+                continue
+
+            image = bpy.data.images.get(image_name)
+            if image is None:
+                continue
+
+            safe_name = re.sub(r'[^A-Za-z0-9_\-]+', '_', obj.name)
+            filename = f"{safe_name}_lightmap.png"
+            filepath = os.path.join(export_folder, filename)
+            image.file_format = 'PNG'
+            image.filepath_raw = filepath
+            image.save()
+            exported += 1
+
+        self.report({'INFO'}, f"Exported {exported} lightmap texture(s)")
+        return {'FINISHED'}
+
+
 # Register classes
 classes = (
     VIEW3D_PT_mapgeo_panel,
@@ -3316,6 +3695,11 @@ classes = (
     MAPGEO_OT_set_lightgrid_occluder,
     MAPGEO_OT_set_lightgrid_ignore,
     MAPGEO_OT_assign_lightmap_texture,
+    MAPGEO_OT_prepare_lightmap_setup,
+    MAPGEO_OT_create_lightmap_uvs,
+    MAPGEO_OT_remove_no_baked_light_macro,
+    MAPGEO_OT_bake_lightmaps,
+    MAPGEO_OT_export_lightmaps,
     VIEW3D_PT_mapgeo_lightgrid_panel,
 )
 
