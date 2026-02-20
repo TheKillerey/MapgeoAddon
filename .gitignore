@@ -47,6 +47,13 @@ temp/
 _*.py
 !__init__.py
 
+# Standalone implementations (not needed for Blender addon)
+*.cs
+TROYBIN_CSHARP_README.md
+TROYBIN_README.md
+troybin_example.py
+test_troybin_ui.py
+
 # Test troybin files (keep templates only)
 *_custom.troybin
 custom_magical_aura2.troybin
@@ -61,6 +68,20 @@ CONVERSION_COMPLETE.md
 FILE_INVENTORY.md
 QUALITY_FIX_REPORT.md
 *_research_report.txt
+baron_hash_system.md
+SHADER_RESEARCH.md
+MATERIALS_RESEARCH.md
+MATERIALS_INTEGRATION.md
+MATERIALS_SYSTEM_SUMMARY.md
+STATIONARY_LIGHT_RESEARCH.md
+
+# Diagnostic and converter tools
+particle_diagnostic.py
+sco_scb_converter.py
+compare_mapgeo.py
+validate_mapgeo.py
+migrate_legacy_materials.py
+test_lightgrid_registration.py
 
 # Release artifacts
 MapgeoAddon_v*.zip
