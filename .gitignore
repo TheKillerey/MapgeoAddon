@@ -54,10 +54,8 @@ TROYBIN_README.md
 troybin_example.py
 test_troybin_ui.py
 
-# Test troybin files (keep templates only)
-*_custom.troybin
-custom_magical_aura2.troybin
-chaos_inhibit_base_glow.troybin
+# Test troybin files (all test particles)
+*.troybin
 
 # Research and temporary files
 *_research_*.py
@@ -82,6 +80,11 @@ compare_mapgeo.py
 validate_mapgeo.py
 migrate_legacy_materials.py
 test_lightgrid_registration.py
+
+# Developer utility scripts
+baron_hash_parser.py
+create_custom_particle.py
+create_release.ps1
 
 # Release artifacts
 MapgeoAddon_v*.zip
