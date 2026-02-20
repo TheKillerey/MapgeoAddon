@@ -82,7 +82,6 @@ migrate_legacy_materials.py
 test_lightgrid_registration.py
 
 # Developer utility scripts
-baron_hash_parser.py
 create_custom_particle.py
 create_release.ps1
 update_addon.py
