@@ -12,7 +12,7 @@ from typing import Optional
 
 # Late-import helper to avoid circular dependency at module load time
 def _log():
-    from .debug_system import get_debug_log
+    from debug_system import get_debug_log
     return get_debug_log()
 
 
