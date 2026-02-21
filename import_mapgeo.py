@@ -25,6 +25,23 @@ _imported_bucket_grids_cache = {}
 # Module-level cache for imported sampler defs (persists in Blender session)
 _imported_sampler_defs_cache = []
 
+# Blender version check for performance optimizations
+_BLENDER_VERSION = bpy.app.version
+
+
+def _optimized_mesh_update(mesh):
+    """
+    Version-aware mesh update with performance optimizations.
+    Blender 5.1.0 has significantly slower mesh.update() - use optimized path.
+    """
+    if _BLENDER_VERSION >= (5, 1, 0):
+        # Blender 5.1+: Skip expensive validation and edge calculation during batch import
+        mesh.validate(verbose=False, clean_customdata=False)
+        mesh.update(calc_edges=False)
+    else:
+        # Blender 5.0 and earlier: Standard update
+        mesh.update()
+
 
 def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
     """Return the materials file path taking linked-materials mode into account.
@@ -381,7 +398,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Create mesh
                 bl_mesh.from_pydata(vertices, [], faces)
-                bl_mesh.update()
+                _optimized_mesh_update(bl_mesh)
                 
                 # Apply normals - Blender 5.0+ automatically uses custom normals when set
                 if self.import_normals and normals:
@@ -808,7 +825,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                             faces.append((v0, v2, v1))
             
             mesh.from_pydata(verts, [], faces)
-            mesh.update()
+            _optimized_mesh_update(mesh)
             
             total_verts += len(verts)
             total_faces += len(faces)
@@ -945,7 +962,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 (0,4),(1,5),(2,6),(3,7),
             ]
             bbox_mesh.from_pydata(bbox_verts, bbox_edges, [])
-            bbox_mesh.update()
+            _optimized_mesh_update(bbox_mesh)
             
             # Create or get material for bounding box
             bbox_mat_name = f"{bbox_name}_Material"
@@ -1846,7 +1863,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             # ── Create Blender mesh ──
             bl_mesh = bpy.data.meshes.new(mesh_name)
             bl_mesh.from_pydata(vertices, [], faces)
-            bl_mesh.update()
+            _optimized_mesh_update(bl_mesh)
             
             # Normals
             if normals and len(normals) == len(vertices):
