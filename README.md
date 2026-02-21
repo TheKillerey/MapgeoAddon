@@ -19,7 +19,7 @@ Download Blender 5.0+ from [blender.org](https://www.blender.org/download/) (it'
 3. Drag and Drop the `.zip` file into the window
 4. A new sidebar UI will appear
 
-### 3. Install Pillow (for textures)
+### 3. Install Pillow (for textures) (Since 0.2.5 it's not more needed)
 1. In Blender, go to `Scripting` workspace (top menu)
 2. Open the `install_pillow.py` file from the addon folder
 3. Click "Run Script" button
