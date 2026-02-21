@@ -332,6 +332,12 @@ class MapgeoSettings(PropertyGroup):
         default=True
     )
     
+    debug_logging: BoolProperty(
+        name="Debug Logging",
+        description="Enable detailed debug logging during import (may impact performance). Errors and warnings are always logged",
+        default=False
+    )
+    
     # Export Settings
     export_version: IntProperty(
         name="Mapgeo Version",

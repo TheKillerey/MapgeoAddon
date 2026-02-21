@@ -745,6 +745,15 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         col.prop(settings, "import_bucket_grid", text="Bucket Grid")
         col.prop(settings, "merge_vertices", text="Merge Vertices")
         
+        # Debug logging toggle
+        col.separator()
+        debug_row = col.row()
+        debug_row.prop(settings, "debug_logging", text="Debug Logging", toggle=True)
+        if settings.debug_logging:
+            debug_info = col.box()
+            debug_info.scale_y = 0.7
+            debug_info.label(text="⚠ May slow down import", icon='INFO')
+        
         # Materials and Assets
         layout.separator()
         box = layout.box()

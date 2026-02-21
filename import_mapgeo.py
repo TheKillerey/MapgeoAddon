@@ -130,9 +130,13 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         """Execute the import"""
         log = get_debug_log()
         log.begin_session()
+        
+        # Configure debug logging based on user preference
+        settings = context.scene.mapgeo_settings
+        log.enabled = settings.debug_logging
+        
         try:
             # Update settings
-            settings = context.scene.mapgeo_settings
             settings.last_import_path = self.filepath
             
             # Parse the mapgeo file

@@ -16,6 +16,14 @@ def _log():
     return get_debug_log()
 
 
+def _is_debug_enabled():
+    """Check if debug logging is enabled in mapgeo settings."""
+    import bpy
+    if hasattr(bpy.context, 'scene') and hasattr(bpy.context.scene, 'mapgeo_settings'):
+        return bpy.context.scene.mapgeo_settings.debug_logging
+    return False
+
+
 class TexConverter:
     """Converts Riot .tex files to DDS and loads them via Blender's native loader."""
 
@@ -46,7 +54,9 @@ class TexConverter:
         # --- deduplicate — reuse if already loaded ----------------------
         for img in bpy.data.images:
             if img.get('_tex_source_path') == tex_path:
-                print(f"  [Texture] Reusing loaded TEX image: {img.name}")
+                # Only log reuse in debug mode to avoid spam
+                if _is_debug_enabled():
+                    print(f"  [Texture] Reusing loaded TEX image: {img.name}")
                 return img
 
         # --- read TEX ---------------------------------------------------
@@ -88,7 +98,9 @@ class TexConverter:
             # Tag for deduplication
             img['_tex_source_path'] = tex_path
 
-            print(f"  [Texture] TEX loaded via DDS: {tex_path}")
+            # Only log success in debug mode to reduce console spam
+            if _is_debug_enabled():
+                print(f"  [Texture] TEX loaded via DDS: {tex_path}")
             return img
 
         except Exception as exc:
