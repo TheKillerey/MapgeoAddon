@@ -312,15 +312,14 @@ def _sync_sampler_texture(mat, sampler_index, texture_path):
         # Push into Blender node tree --------------------------------------
         if resolved_path and TexConverter:
             try:
-                converter = TexConverter()
-                png_path = None
-                low = resolved_path.lower()
-                if low.endswith('.dds'):
-                    png_path = converter.convert_dds_to_png(resolved_path)
-                else:
-                    png_path = converter.convert_tex_to_png(resolved_path)
+                img = None
+                if resolved_path.lower().endswith('.tex'):
+                    converter = TexConverter()
+                    img = converter.load_tex_as_blender_image(resolved_path)
+                elif os.path.exists(resolved_path):
+                    img = bpy.data.images.load(resolved_path, check_existing=True)
 
-                if png_path and os.path.exists(png_path):
+                if img:
                     if mat.use_nodes and mat.node_tree:
                         # Try to find the correct image node.
                         # First look for a node whose label matches the sampler name.
@@ -338,9 +337,8 @@ def _sync_sampler_texture(mat, sampler_index, texture_path):
                                     target_node = node
                                     break
                         if target_node:
-                            img = bpy.data.images.load(png_path, check_existing=True)
                             target_node.image = img
-                            message += f" | viewport updated ({os.path.basename(png_path)})"
+                            message += f" | viewport updated ({img.name})"
                         else:
                             message += " | no image node found"
                 else:

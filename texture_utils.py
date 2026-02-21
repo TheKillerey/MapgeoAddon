@@ -1,233 +1,185 @@
 """
 Texture Utilities for Mapgeo Addon
-Handles TEX format loading and conversion to PNG
-Based on CommunityDragon CDTB implementation
+Handles Riot .tex format — converts to DDS in-memory, writes a temp file,
+loads via Blender's native DDS support, packs into .blend, then cleans up.
 """
 
 import struct
 import os
-import sys
-import site
 import math
-from io import BytesIO
+import tempfile
 from typing import Optional
 
-# Ensure user site-packages is in sys.path for PIL/Pillow
-if site.USER_SITE not in sys.path:
-    sys.path.append(site.USER_SITE)
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    print("PIL/Pillow not available - texture conversion will be disabled")
-    print(f"  Searched in: {sys.path}")
+# Late-import helper to avoid circular dependency at module load time
+def _log():
+    from .debug_system import get_debug_log
+    return get_debug_log()
 
 
 class TexConverter:
-    """Converts Riot .tex files to PNG format via DDS intermediate format"""
-    
-    def __init__(self):
-        self.cache = {}  # Cache converted textures
-    
-    def convert_tex_to_png(self, tex_path: str, output_path: str = None) -> Optional[str]:
+    """Converts Riot .tex files to DDS and loads them via Blender's native loader."""
+
+    # ------------------------------------------------------------------ #
+    #  Public API                                                         #
+    # ------------------------------------------------------------------ #
+
+    def load_tex_as_blender_image(self, tex_path: str, image_name: str = None):
         """
-        Convert a .tex file to .png
-        
+        Convert a .tex file to DDS, load it natively in Blender, pack it,
+        then delete the temp DDS file.
+
         Args:
-            tex_path: Path to .tex file
-            output_path: Optional output path for .png (defaults to same location)
-        
+            tex_path:   Absolute path to the ``.tex`` file.
+            image_name: Optional display name; defaults to the file basename.
+
         Returns:
-            Path to converted .png file, or None if conversion failed
+            ``bpy.types.Image`` on success, ``None`` on failure.
         """
-        if not PIL_AVAILABLE:
-            print("  Warning: PIL not available, skipping texture conversion")
-            return None
-        
+        import bpy
+
+        tex_path = os.path.normpath(os.path.abspath(tex_path))
+
         if not os.path.exists(tex_path):
-            print(f"  Warning: Texture file not found: {tex_path}")
+            print(f"  [Texture] TEX file not found: {tex_path}")
             return None
-        
-        # Use cache if already converted
-        if tex_path in self.cache:
-            return self.cache[tex_path]
-        
-        # Determine output path
-        if output_path is None:
-            output_path = os.path.splitext(tex_path)[0] + ".png"
-        
-        # Skip if already converted
-        if os.path.exists(output_path):
-            self.cache[tex_path] = output_path
-            return output_path
-        
+
+        # --- deduplicate — reuse if already loaded ----------------------
+        for img in bpy.data.images:
+            if img.get('_tex_source_path') == tex_path:
+                print(f"  [Texture] Reusing loaded TEX image: {img.name}")
+                return img
+
+        # --- read TEX ---------------------------------------------------
         try:
-            with open(tex_path, 'rb') as f:
-                tex_data = f.read()
-            
-            # Convert TEX to DDS in memory
-            dds_data = self.tex_to_dds(tex_data)
-            
-            # Convert DDS to PNG using PIL
-            fdds = BytesIO(dds_data)
-            img = Image.open(fdds)
-            
-            # Create output directory if needed
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            # Save as PNG
-            img.save(output_path, 'PNG')
-            self.cache[tex_path] = output_path
-            return output_path
-        
-        except Exception as e:
-            print(f"  Error converting {os.path.basename(tex_path)}: {e}")
+            with open(tex_path, 'rb') as fh:
+                tex_data = fh.read()
+        except OSError as exc:
+            print(f"  [Texture] Cannot read TEX file: {exc}")
             return None
-    
-    def convert_dds_to_png(self, dds_path: str, output_path: str = None) -> Optional[str]:
-        """
-        Convert a .dds file to .png
-        
-        Args:
-            dds_path: Path to .dds file
-            output_path: Optional output path for .png (defaults to same location)
-        
-        Returns:
-            Path to converted .png file, or None if conversion failed
-        """
-        if not PIL_AVAILABLE:
-            print("  Warning: PIL not available, skipping DDS conversion")
+
+        if len(tex_data) < 12 or tex_data[:4] != b'TEX\0':
+            print(f"  [Texture] Invalid TEX header: {tex_path}")
             return None
-        
-        if not os.path.exists(dds_path):
-            print(f"  Warning: DDS file not found: {dds_path}")
-            return None
-        
-        # Use cache if already converted
-        if dds_path in self.cache:
-            return self.cache[dds_path]
-        
-        # Determine output path
-        if output_path is None:
-            output_path = os.path.splitext(dds_path)[0] + ".png"
-        
-        # Skip if already converted
-        if os.path.exists(output_path):
-            self.cache[dds_path] = output_path
-            return output_path
-        
+
+        # --- convert to DDS bytes ---------------------------------------
         try:
-            # Load DDS and convert to PNG using PIL
-            img = Image.open(dds_path)
-            
-            # Create output directory if needed
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            # Save as PNG
-            img.save(output_path, 'PNG')
-            self.cache[dds_path] = output_path
-            return output_path
-        
-        except Exception as e:
-            print(f"  Error converting {os.path.basename(dds_path)}: {e}")
+            dds_data = self._tex_to_dds(tex_data)
+        except Exception as exc:
+            print(f"  [Texture] TEX→DDS conversion failed for {tex_path}: {exc}")
             return None
-    
+
+        # --- write temp DDS, load, pack, delete -------------------------
+        tmp_fd = None
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dds', prefix='mapgeo_tex_')
+            os.write(tmp_fd, dds_data)
+            os.close(tmp_fd)
+            tmp_fd = None  # mark closed
+
+            img = bpy.data.images.load(tmp_path, check_existing=False)
+            img.pack()  # embed valid DDS data into .blend
+
+            # Give it a nice name
+            if image_name is None:
+                image_name = os.path.basename(tex_path)
+            img.name = image_name
+
+            # Tag for deduplication
+            img['_tex_source_path'] = tex_path
+
+            print(f"  [Texture] TEX loaded via DDS: {tex_path}")
+            return img
+
+        except Exception as exc:
+            print(f"  [Texture] Failed to load TEX as DDS: {tex_path}: {exc}")
+            return None
+        finally:
+            # Clean up temp file
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    # kept for API compatibility
+    def clear_cache(self):
+        """No-op kept for API compatibility."""
+        pass
+
+    # ------------------------------------------------------------------ #
+    #  TEX → DDS conversion                                               #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
-    def tex_to_dds(data: bytes) -> bytes:
+    def _tex_to_dds(data: bytes) -> bytes:
         """
-        Convert TEX format to DDS format
-        Based on CommunityDragon CDTB implementation
+        Build a valid DDS file from raw TEX data.
+        Based on CommunityDragon CDTB implementation.
         """
-        # Parse TEX header (12 bytes total)
-        if len(data) < 12 or data[:4] != b'TEX\0':
-            raise ValueError("Invalid TEX file")
-        
-        # Unpack all 12 bytes of header
-        magic, width, height, is_extended, tex_format, resource_type, flags = struct.unpack('<4sHHBBBB', data[:12])
-        
+        _magic, width, height, _ext, tex_fmt, _res, flags = \
+            struct.unpack('<4sHHBBBB', data[:12])
         has_mipmaps = bool(flags & 0x01)
         has_dx10 = False
-        
-        # Map TEX format to DDS pixel format
-        if tex_format == 0x0a:  # DXT1 (BC1)
+
+        # Map TEX format → DDS pixel-format struct (32 bytes)
+        if tex_fmt == 0x0a:        # DXT1 / BC1
             ddspf = struct.pack('<LL4s20x', 32, 0x4, b'DXT1')
-        elif tex_format == 0x0c:  # DXT5 (BC3)
+        elif tex_fmt == 0x0c:      # DXT5 / BC3
             ddspf = struct.pack('<LL4s20x', 32, 0x4, b'DXT5')
-        elif tex_format == 0x14:  # BGRA8
-            ddspf = struct.pack('<LL4x5L', 32, 0x41, 8*4, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000)
-        elif tex_format == 0x15:  # RGBA16
+        elif tex_fmt == 0x14:      # BGRA8
+            ddspf = struct.pack('<LL4x5L', 32, 0x41,
+                                8 * 4, 0x00ff0000, 0x0000ff00,
+                                0x000000ff, 0xff000000)
+        elif tex_fmt == 0x15:      # RGBA16 → needs DX10 extension
             ddspf = struct.pack('<LL4s20x', 32, 0x4, b'DX10')
             dx10 = struct.pack('<LL4xLL', 13, 3, 1, 1)
             has_dx10 = True
         else:
-            raise ValueError(f"Unsupported TEX format: {tex_format:x}")
-        
-        # Calculate pixel data size for the largest mipmap only
-        if tex_format == 0x0a:  # DXT1
-            block_size = 4
-            bytes_per_block = 8
-        elif tex_format == 0x0c:  # DXT5
-            block_size = 4
-            bytes_per_block = 16
-        elif tex_format == 0x14:  # BGRA8
-            block_size = 1
-            bytes_per_block = 4
+            raise ValueError(f"Unsupported TEX format: 0x{tex_fmt:02x}")
+
+        # Block / pixel sizes
+        if tex_fmt == 0x0a:
+            bs, bpb = 4, 8
+        elif tex_fmt == 0x0c:
+            bs, bpb = 4, 16
+        elif tex_fmt == 0x14:
+            bs, bpb = 1, 4
         else:
-            # RGBA16 format
-            block_size = 1
-            bytes_per_block = 8
-        
-        # Calculate size of largest mipmap
-        block_width = (width + block_size - 1) // block_size
-        block_height = (height + block_size - 1) // block_size
-        largest_mip_size = block_width * block_height * bytes_per_block
-        
-        # Extract only the largest mipmap
-        # TEX stores mipmaps in reverse order (smallest to largest)
-        # The largest mipmap is at the end of the file
+            bs, bpb = 1, 8
+
+        bw = (width + bs - 1) // bs
+        bh = (height + bs - 1) // bs
+        largest = bw * bh * bpb
+
+        # TEX stores mipmaps smallest→largest; largest is at the end
         if has_mipmaps:
-            # Calculate total size of all mipmaps
-            mip_count = int(math.floor(math.log2(max(height, width))) + 1)
-            
-            # Skip to the largest mipmap by calculating offset from end
-            total_data_size = len(data) - 12
-            pixels = data[total_data_size - largest_mip_size + 12:]
+            total = len(data) - 12
+            start = 12 + total - largest
+            pixels = data[start:]
         else:
-            # No mipmaps, just get all pixel data
-            pixels = data[12:12 + largest_mip_size]
-        
-        # Build DDS header
-        # DDS file structure: magic + DDS_HEADER (124 bytes)
-        dds_header = struct.pack('<4s7L', 
-            b'DDS ',  # magic (4 bytes)
-            124,      # dwSize - header size (4 bytes)
-            0x1 | 0x2 | 0x4 | 0x1000,  # dwFlags: CAPS, HEIGHT, WIDTH, PIXELFORMAT
-            height,   # dwHeight
-            width,    # dwWidth
-            0,        # dwPitchOrLinearSize
-            0,        # dwDepth
-            0         # dwMipMapCount
-        )
-        
-        # Reserved space (11 DWORDs = 44 bytes)
-        dds_header += b'\x00' * 44
-        
-        # DDS_PIXELFORMAT (32 bytes)
-        dds_header += ddspf
-        
-        # DDS_CAPS (16 bytes: 4 DWORDs)
-        dds_header += struct.pack('<4L', 0x1000, 0, 0, 0)
-        
-        # Reserved (4 bytes)
-        dds_header += b'\x00' * 4
-        
-        # Add DX10 header if needed
+            pixels = data[12:12 + largest]
+
+        # Build DDS header (128 bytes)
+        hdr = struct.pack('<4s7L',
+            b'DDS ', 124,
+            0x1 | 0x2 | 0x4 | 0x1000,  # CAPS | HEIGHT | WIDTH | PIXELFORMAT
+            height, width,
+            0, 0, 0)                    # pitch, depth, mipcount
+        hdr += b'\x00' * 44            # reserved1[11]
+        hdr += ddspf                   # pixel format (32 bytes)
+        hdr += struct.pack('<4L', 0x1000, 0, 0, 0)  # caps
+        hdr += b'\x00' * 4             # reserved2
+
         if has_dx10:
-            dds_header += dx10
-        
-        return dds_header + pixels
+            hdr += dx10
+
+        return hdr + pixels
 
 
 def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_folder: str = "", prioritize_custom: bool = False) -> Optional[str]:
@@ -245,6 +197,8 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
     Returns:
         Full resolved path to texture file, or None if not found
     """
+    original_texture_path = texture_path
+
     # Remove "ASSETS/" prefix if present
     if texture_path.startswith("ASSETS/"):
         texture_path = texture_path[7:]
@@ -269,12 +223,16 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
         if custom_assets_folder:
             folders.append(custom_assets_folder)
     
+    attempted_paths = []
+
     # Try each folder in order
     for folder in folders:
         full_path = os.path.join(folder, texture_path)
+        attempted_paths.append(full_path)
         
         # Try exact path first
         if os.path.exists(full_path):
+            _log().info("Texture", f"Resolved: {original_texture_path}", full_path)
             return full_path
         
         # Try alternative extensions in order: .tex -> .dds -> .png
@@ -283,7 +241,12 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
         
         for ext in extensions:
             test_path = base_path + ext
+            attempted_paths.append(test_path)
             if os.path.exists(test_path):
+                _log().info("Texture", f"Resolved: {original_texture_path}", test_path)
                 return test_path
     
+    tried_str = ", ".join(attempted_paths[:4])
+    _log().texture_missing(original_texture_path, f"Tried: {tried_str}")
+
     return None

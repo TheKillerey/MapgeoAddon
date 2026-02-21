@@ -12,6 +12,12 @@ from typing import Dict, Optional
 from .texture_utils import TexConverter, resolve_texture_path
 
 
+def _log():
+    """Lazy accessor for the debug log singleton."""
+    from .debug_system import get_debug_log
+    return get_debug_log()
+
+
 class MaterialLoader:
     """Loads and creates Blender materials from League materials JSON or Python format"""
     
@@ -103,12 +109,12 @@ class MaterialLoader:
                         settings['min_env_color_contribution'] = comp.get('MinimumEnvironmentColorContribution', 0.8)
             
             if settings:
-                print(f"[MapSettings] Loaded map settings from {os.path.basename(json_path)}")
+                _log().info("MapSettings", f"Loaded map settings from {os.path.basename(json_path)}")
                 if 'lightmap_color_scale' in settings:
-                    print(f"  lightMapColorScale: {settings['lightmap_color_scale']}")
+                    _log().info("MapSettings", f"lightMapColorScale: {settings['lightmap_color_scale']}")
             return settings
         except Exception as e:
-            print(f"[MapSettings] Error loading map settings from JSON: {e}")
+            _log().error("MapSettings", f"Error loading map settings from JSON: {e}")
             return {}
     
     def _load_map_settings_py(self, py_path: str) -> dict:
@@ -224,12 +230,12 @@ class MaterialLoader:
                     settings['min_env_color_contribution'] = float(m.group(1))
             
             if settings:
-                print(f"[MapSettings] Loaded map settings from {os.path.basename(py_path)}")
+                _log().info("MapSettings", f"Loaded map settings from {os.path.basename(py_path)}")
                 if 'lightmap_color_scale' in settings:
-                    print(f"  lightMapColorScale: {settings['lightmap_color_scale']}")
+                    _log().info("MapSettings", f"lightMapColorScale: {settings['lightmap_color_scale']}")
             return settings
         except Exception as e:
-            print(f"[MapSettings] Error loading map settings from .py: {e}")
+            _log().error("MapSettings", f"Error loading map settings from .py: {e}")
             return {}
     
     def _load_materials_json(self, json_path: str) -> Dict[str, dict]:
@@ -281,11 +287,11 @@ class MaterialLoader:
                     
                     materials[key] = value
             
-            print(f"Loaded {len(materials)} static materials from {os.path.basename(json_path)}")
+            _log().info("Material", f"Loaded {len(materials)} static materials from {os.path.basename(json_path)}")
             return materials
         
         except Exception as e:
-            print(f"Error loading materials JSON: {e}")
+            _log().error("Material", f"Error loading materials JSON: {e}")
             return {}
     
     def _load_materials_py(self, py_path: str) -> Dict[str, dict]:
@@ -527,11 +533,11 @@ class MaterialLoader:
                 
                 materials[mat_name] = mat_data
             
-            print(f"Loaded {len(materials)} static materials from {os.path.basename(py_path)}")
+            _log().info("Material", f"Loaded {len(materials)} static materials from {os.path.basename(py_path)}")
             return materials
         
         except Exception as e:
-            print(f"Error loading materials .py: {e}")
+            _log().error("Material", f"Error loading materials .py: {e}")
             return {}
     
     def _get_shader_short_name(self, mat_data: dict) -> str:
@@ -616,7 +622,7 @@ class MaterialLoader:
                     if isinstance(value, dict) and value.get('__type') == 'mapContainer':
                         return key
         except Exception as e:
-            print(f"[GrassTint] Error extracting mapContainer: {e}")
+            _log().error("GrassTint", f"Error extracting mapContainer: {e}")
         return ''
     
     def _parse_map_file_grass_tints(self, map_file_path: str, container_name: str) -> dict:
@@ -667,13 +673,13 @@ class MaterialLoader:
                     continue
                 
                 skin_name = skin_match.group(1)
-                print(f"[GrassTint] Found matching MapSkin: {skin_name}")
+                _log().info("GrassTint", f"Found matching MapSkin: {skin_name}")
                 
                 # Extract base grass tint texture
                 base_match = re.search(r'mGrassTintTexture:\s*string\s*=\s*"([^"]+)"', skin_body)
                 if base_match:
                     result['base'] = base_match.group(1)
-                    print(f"[GrassTint]   Base: {result['base']}")
+                    _log().info("GrassTint", f"Base: {result['base']}")
                 
                 # Extract per-dragon alternate assets using brace-counting
                 # (MapAlternateAsset blocks have deeply nested braces)
@@ -697,13 +703,13 @@ class MaterialLoader:
                         flag_name = flag_match.group(1)
                         tint_path = tint_match.group(1)
                         result['alternates'][flag_name] = tint_path
-                        print(f"[GrassTint]   {flag_name}: {tint_path}")
+                        _log().info("GrassTint", f"{flag_name}: {tint_path}")
                 
                 # Found our matching skin, no need to continue
                 break
         
         except Exception as e:
-            print(f"[GrassTint] Error parsing map file: {e}")
+            _log().error("GrassTint", f"Error parsing map file: {e}")
         
         return result
     
@@ -740,9 +746,9 @@ class MaterialLoader:
             alt_path = alternates[flag_name]
             resolved = self._resolve_assets_path(alt_path)
             if resolved:
-                print(f"[GrassTint] Using dragon variant ({flag_name}): {os.path.basename(resolved)}")
+                _log().info("GrassTint", f"Using dragon variant ({flag_name}): {os.path.basename(resolved)}")
                 return resolved
-            print(f"[GrassTint] Dragon variant {flag_name} texture not found: {alt_path}")
+            _log().warning("GrassTint", f"Dragon variant {flag_name} texture not found", detail=alt_path)
         
         # Use base grass tint texture (filename only, lives in levels_folder)
         if base_name:
@@ -773,8 +779,8 @@ class MaterialLoader:
         Example: "GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
                  -> "levels/map11/info/GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
         """
-        print(f"[GrassTint] Resolving base: {base_name}")
-        print(f"[GrassTint]   levels_folder: {self.levels_folder}")
+        _log().info("GrassTint", f"Resolving base: {base_name}")
+        _log().info("GrassTint", f"levels_folder: {self.levels_folder}")
         
         if not base_name:
             return ''
@@ -788,34 +794,34 @@ class MaterialLoader:
             if alt_ext.lower() != name_ext.lower():
                 variants.append(name_stem + alt_ext)
         
-        print(f"[GrassTint]   Trying variants: {variants}")
+        _log().info("GrassTint", f"Trying variants: {variants}")
         
         # Search levels_folder first (primary location for base grass tint)
         if self.levels_folder:
             if not os.path.isdir(self.levels_folder):
-                print(f"[GrassTint]   ERROR: levels_folder is not a directory!")
+                _log().error("GrassTint", "levels_folder is not a directory!")
                 return ''
             
             # Try exact filename match (case-sensitive)
             for variant in variants:
                 full_path = os.path.join(self.levels_folder, variant)
                 if os.path.exists(full_path):
-                    print(f"[GrassTint]   ✓ Found: {variant}")
+                    _log().info("GrassTint", f"Found: {variant}")
                     return full_path
             
             # Try case-insensitive match
             try:
                 dir_entries = os.listdir(self.levels_folder)
-                print(f"[GrassTint]   levels_folder contains {len(dir_entries)} files")
+                _log().info("GrassTint", f"levels_folder contains {len(dir_entries)} files")
             except OSError as e:
-                print(f"[GrassTint]   ERROR: Cannot list levels_folder: {e}")
+                _log().error("GrassTint", f"Cannot list levels_folder: {e}")
                 return ''
             
             lower_variants = {v.lower() for v in variants}
             for f in dir_entries:
                 if f.lower() in lower_variants:
                     found = os.path.join(self.levels_folder, f)
-                    print(f"[GrassTint]   ✓ Found (case-insensitive): {f}")
+                    _log().info("GrassTint", f"Found (case-insensitive): {f}")
                     return found
             
             # Try partial match on the base name (without extension)
@@ -823,35 +829,35 @@ class MaterialLoader:
             for f in dir_entries:
                 if base_lower in f.lower():
                     found = os.path.join(self.levels_folder, f)
-                    print(f"[GrassTint]   ✓ Found (partial match): {f}")
+                    _log().info("GrassTint", f"Found (partial match): {f}")
                     return found
             
             # Try recursive search in subdirectories (e.g., levels/map11/info/)
-            print(f"[GrassTint]   Searching recursively in levels_folder...")
+            _log().info("GrassTint", "Searching recursively in levels_folder...")
             import glob
             for variant in variants:
                 pattern = os.path.join(self.levels_folder, '**', variant)
                 matches = glob.glob(pattern, recursive=True)
                 if matches:
-                    print(f"[GrassTint]   ✓ Found (recursive): {os.path.basename(matches[0])}")
-                    print(f"[GrassTint]     Full path: {matches[0]}")
+                    _log().info("GrassTint", f"Found (recursive): {os.path.basename(matches[0])}")
+                    _log().info("GrassTint", f"Full path: {matches[0]}")
                     return matches[0]
             
-            print(f"[GrassTint]   ✗ Not found in levels_folder (even recursively)")
+            _log().warning("GrassTint", "Not found in levels_folder (even recursively)")
         else:
-            print(f"[GrassTint]   WARNING: levels_folder not set!")
+            _log().warning("GrassTint", "levels_folder not set!")
         
         # Fallback: search assets folder recursively (slower, shouldn't normally be needed)
         if self.assets_folder:
-            print(f"[GrassTint]   Trying assets_folder as fallback...")
+            _log().info("GrassTint", "Trying assets_folder as fallback...")
             import glob
             for variant in variants:
                 matches = glob.glob(os.path.join(self.assets_folder, '**', variant), recursive=True)
                 if matches:
-                    print(f"[GrassTint]   ✓ Found in assets: {os.path.basename(matches[0])}")
+                    _log().info("GrassTint", f"Found in assets: {os.path.basename(matches[0])}")
                     return matches[0]
         
-        print(f"[GrassTint]   ✗ Base grass tint not found anywhere!")
+        _log().warning("GrassTint", "Base grass tint not found anywhere!")
         return ''
     
     def _find_file_case_insensitive(self, base_dir: str, rel_path: str) -> str:
@@ -894,14 +900,14 @@ class MaterialLoader:
         
         container_name = self._extract_map_container_name(self._materials_path)
         if not container_name:
-            print("[GrassTint] No mapContainer found in materials file")
+            _log().warning("GrassTint", "No mapContainer found in materials file")
             return ''
         
-        print(f"[GrassTint] mapContainer: {container_name}")
+        _log().info("GrassTint", f"mapContainer: {container_name}")
         
         grass_tint_info = self._parse_map_file_grass_tints(self.map_py_path, container_name)
         if not grass_tint_info.get('base') and not grass_tint_info.get('alternates'):
-            print("[GrassTint] No grass tint textures found in map file")
+            _log().warning("GrassTint", "No grass tint textures found in map file")
             return ''
         
         return self._resolve_grass_tint_path(grass_tint_info)
@@ -922,7 +928,7 @@ class MaterialLoader:
         for pattern in search_patterns:
             matches = glob.glob(pattern, recursive=True)
             if matches:
-                print(f"  Found grass tint texture (fallback): {os.path.basename(matches[0])}")
+                _log().info("GrassTint", f"Found grass tint texture (fallback): {os.path.basename(matches[0])}")
                 return matches[0]
         
         # Check levels folder
@@ -930,7 +936,7 @@ class MaterialLoader:
             for f in os.listdir(self.levels_folder):
                 if 'grasstint' in f.lower():
                     found = os.path.join(self.levels_folder, f)
-                    print(f"  Found grass tint texture (levels): {f}")
+                    _log().info("GrassTint", f"Found grass tint texture (levels): {f}")
                     return found
         
         return ''
@@ -988,23 +994,20 @@ class MaterialLoader:
         if not new_path:
             return 0
         
-        # Convert to PNG
-        png_path = None
-        if new_path.lower().endswith('.dds'):
-            png_path = loader.tex_converter.convert_dds_to_png(new_path)
-        else:
-            png_path = loader.tex_converter.convert_tex_to_png(new_path)
-        
-        if not png_path or not os.path.exists(png_path):
-            print(f"[GrassTint] Could not convert grass tint texture: {new_path}")
-            return 0
-        
-        # Load or find the image
+        # Load the image
         try:
-            new_img = bpy.data.images.load(png_path, check_existing=True)
-            new_img.colorspace_settings.name = 'sRGB'
+            if new_path.lower().endswith('.tex'):
+                new_img = loader.tex_converter.load_tex_as_blender_image(new_path)
+            else:
+                new_img = bpy.data.images.load(new_path, check_existing=True)
+            if new_img:
+                new_img.colorspace_settings.name = 'sRGB'
         except Exception as e:
-            print(f"[GrassTint] Could not load grass tint image: {e}")
+            new_img = None
+            _log().error("GrassTint", f"Could not load grass tint image: {e}")
+        
+        if not new_img:
+            _log().error("GrassTint", f"Failed to load grass tint texture", detail=new_path)
             return 0
         
         # Swap the image on all materials that have a grass tint node
@@ -1025,7 +1028,7 @@ class MaterialLoader:
                 'LAYER_4': 'Ocean', 'LAYER_5': 'Cloud', 'LAYER_6': 'Hextech',
                 'LAYER_7': 'Chemtech', 'LAYER_8': 'Void',
             }.get(dragon_layer, 'Base')
-            print(f"[GrassTint] Switched {updated} materials to {dragon_name} grass tint: {os.path.basename(new_path)}")
+            _log().info("GrassTint", f"Switched {updated} materials to {dragon_name} grass tint: {os.path.basename(new_path)}")
         
         return updated
     
@@ -1219,6 +1222,7 @@ class MaterialLoader:
         
         # Cache and return
         self.materials_cache[cache_key] = bl_mat
+        _log().material_loaded(mat_name)
         return bl_mat
     
     # =========================================================================
@@ -1363,20 +1367,18 @@ class MaterialLoader:
                 grass_tint_node.label = "Grass Tint (World UV)"
                 links.new(combine_xy.outputs['Vector'], grass_tint_node.inputs['Vector'])
                 
-                # Load the texture (supports .tex and .dds)
+                # Load the texture (supports .tex, .dds, .png)
                 if grass_tint_path:
-                    png_path = None
-                    if grass_tint_path.lower().endswith('.dds'):
-                        png_path = self.tex_converter.convert_dds_to_png(grass_tint_path)
-                    else:
-                        png_path = self.tex_converter.convert_tex_to_png(grass_tint_path)
-                    if png_path and os.path.exists(png_path):
-                        try:
-                            img = bpy.data.images.load(png_path, check_existing=True)
+                    try:
+                        if grass_tint_path.lower().endswith('.tex'):
+                            img = self.tex_converter.load_tex_as_blender_image(grass_tint_path)
+                        else:
+                            img = bpy.data.images.load(grass_tint_path, check_existing=True)
+                        if img:
                             grass_tint_node.image = img
-                            img.colorspace_settings.name = 'sRGB'  # It's a color tint map
-                        except Exception as e:
-                            print(f"  Warning: Could not load grass tint texture: {e}")
+                            img.colorspace_settings.name = 'sRGB'
+                    except Exception as e:
+                        _log().error("GrassTint", f"Could not load grass tint texture: {e}")
                 
                 # Multiply grass tint with tinted diffuse
                 grass_tint_mix = nodes.new('ShaderNodeMix')
@@ -1942,46 +1944,24 @@ class MaterialLoader:
         
         full_tex_path = resolve_texture_path(texture_path, self.assets_folder, self.custom_assets_folder, self.prioritize_custom)
         if not full_tex_path:
+            _log().texture_missing(texture_path, "Could not resolve path")
             return None
-        
-        png_path = None
-        file_ext = os.path.splitext(full_tex_path)[1].lower()
-        
-        if file_ext == '.tex':
-            png_path = self.tex_converter.convert_tex_to_png(full_tex_path)
-            if not png_path:
-                base_path = os.path.splitext(full_tex_path)[0]
-                for alt_ext in ['.dds', '.png']:
-                    alt_path = base_path + alt_ext
-                    if os.path.exists(alt_path):
-                        png_path = alt_path
-                        break
-        elif file_ext == '.dds':
-            base_path = os.path.splitext(full_tex_path)[0]
-            png_alt = base_path + '.png'
-            if os.path.exists(png_alt):
-                png_path = png_alt
-            else:
-                png_path = self.tex_converter.convert_dds_to_png(full_tex_path)
-                if not png_path:
-                    png_path = full_tex_path
-        elif file_ext == '.png':
-            png_path = full_tex_path
-        else:
-            png_path = full_tex_path
-        
-        if not png_path:
-            return None
+        _log().info("Texture", f"Resolved sampler: {texture_path} -> {full_tex_path}")
         
         tex_node = nodes.new('ShaderNodeTexImage')
         tex_node.extension = extension
         
         try:
-            img = bpy.data.images.load(png_path, check_existing=True)
-            tex_node.image = img
-            return tex_node
+            if full_tex_path.lower().endswith('.tex'):
+                img = self.tex_converter.load_tex_as_blender_image(full_tex_path)
+            else:
+                img = bpy.data.images.load(full_tex_path, check_existing=True)
+            if img:
+                tex_node.image = img
+                _log().texture_loaded(full_tex_path)
+                return tex_node
         except Exception as e:
-            print(f"  Error loading texture {os.path.basename(png_path)}: {e}")
+            _log().texture_failed(full_tex_path, str(e))
         
         return None
     
@@ -2008,38 +1988,9 @@ class MaterialLoader:
         # Resolve texture path (tries .tex -> .dds -> .png)
         full_tex_path = resolve_texture_path(texture_path, self.assets_folder, self.custom_assets_folder, self.prioritize_custom)
         if not full_tex_path:
-            print(f"  Warning: Could not find texture: {texture_path}")
+            _log().texture_missing(texture_path, "Could not resolve path")
             return None
-        
-        png_path = None
-        file_ext = os.path.splitext(full_tex_path)[1].lower()
-        
-        # Handle different file types
-        if file_ext == '.tex':
-            png_path = self.tex_converter.convert_tex_to_png(full_tex_path)
-            if not png_path:
-                base_path = os.path.splitext(full_tex_path)[0]
-                for alt_ext in ['.dds', '.png']:
-                    alt_path = base_path + alt_ext
-                    if os.path.exists(alt_path):
-                        png_path = alt_path
-                        break
-        elif file_ext == '.dds':
-            base_path = os.path.splitext(full_tex_path)[0]
-            png_alt = base_path + '.png'
-            if os.path.exists(png_alt):
-                png_path = png_alt
-            else:
-                png_path = self.tex_converter.convert_dds_to_png(full_tex_path)
-                if not png_path:
-                    png_path = full_tex_path
-        elif file_ext == '.png':
-            png_path = full_tex_path
-        else:
-            png_path = full_tex_path
-        
-        if not png_path:
-            return None
+        _log().info("Texture", f"Resolved sampler: {texture_path} -> {full_tex_path}")
         
         # Create UV Map node to select the right UV channel
         uv_node = nodes.new('ShaderNodeUVMap')
@@ -2054,16 +2005,17 @@ class MaterialLoader:
         
         # Load image
         try:
-            img = bpy.data.images.load(png_path, check_existing=True)
-            tex_node.image = img
-            
-            # Position UV node next to texture node (will be repositioned by caller)
-            uv_node.location = (tex_node.location[0] - 200, tex_node.location[1])
-            uv_node.label = uv_map_name
-            
-            return tex_node
+            if full_tex_path.lower().endswith('.tex'):
+                img = self.tex_converter.load_tex_as_blender_image(full_tex_path)
+            else:
+                img = bpy.data.images.load(full_tex_path, check_existing=True)
+            if img:
+                tex_node.image = img
+                uv_node.location = (tex_node.location[0] - 200, tex_node.location[1])
+                uv_node.label = uv_map_name
+                return tex_node
         except Exception as e:
-            print(f"  Error loading texture {os.path.basename(png_path)}: {e}")
+            _log().texture_failed(full_tex_path, str(e))
         
         return None
     
@@ -2105,7 +2057,7 @@ class MaterialLoader:
                                                     baked_paint_scale, baked_paint_bias)
         
         # Material not found - create a simple material
-        print(f"  Warning: Material not found in database: {mat_name}")
+        _log().material_missing(mat_name, "Not found in database")
         if mat_name not in self.materials_cache:
             bl_mat = bpy.data.materials.get(mat_name)
             if bl_mat is None:

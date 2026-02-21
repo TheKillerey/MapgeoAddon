@@ -62,24 +62,26 @@ def _update_material_diffuse_node(mat, texture_path, assets_folder, custom_asset
 
     resolved_path = resolve_texture_path(texture_path, assets_folder, custom_assets_folder, prioritize_custom) if (assets_folder or custom_assets_folder) else None
     if not resolved_path:
-        return False
-
-    converter = TexConverter()
-    png_path = None
-    if resolved_path.lower().endswith('.dds'):
-        png_path = converter.convert_dds_to_png(resolved_path)
-    else:
-        png_path = converter.convert_tex_to_png(resolved_path)
-
-    if not png_path:
+        print(f"[Texture] Could not resolve diffuse texture: {texture_path}")
         return False
 
     try:
-        img = bpy.data.images.load(png_path, check_existing=True)
-        diffuse_node.image = img
-        return True
-    except Exception:
+        if resolved_path.lower().endswith('.tex'):
+            converter = TexConverter()
+            img = converter.load_tex_as_blender_image(resolved_path)
+        else:
+            img = bpy.data.images.load(resolved_path, check_existing=True)
+    except Exception as e:
+        img = None
+        print(f"[Texture] Failed to load image {resolved_path}: {e}")
+
+    if not img:
+        print(f"[Texture] Could not load: {resolved_path}")
         return False
+
+    diffuse_node.image = img
+    print(f"[Texture] Updated diffuse node with: {img.name}")
+    return True
 
 
 def _strip_no_baked_light_macros(material):
@@ -719,25 +721,15 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         layout = self.layout
         settings = context.scene.mapgeo_settings
         
-        # Pillow Installation Status (check dynamically)
-        pillow_installed = False
-        try:
-            import PIL
-            pillow_installed = True
-        except ImportError:
-            pass
-        
-        pillow_box = layout.box()
-        pillow_row = pillow_box.row()
-        if pillow_installed:
-            pillow_row.label(text="Pillow: Installed", icon='CHECKMARK')
-        else:
-            pillow_row.label(text="Pillow: Not Installed", icon='ERROR')
-            install_row = pillow_box.row()
-            install_row.operator("mapgeo.install_pillow", text="Install Pillow for Textures", icon='IMPORT')
-            info_box = pillow_box.box()
-            info_box.scale_y = 0.7
-            info_box.label(text="Pillow is required for texture conversion", icon='INFO')
+        # Python Cache Cleanup
+        cache_box = layout.box()
+        cache_row = cache_box.row()
+        cache_row.label(text="Python Cache", icon='TRASH')
+        cache_cleanup = cache_box.row()
+        cache_cleanup.operator("mapgeo.clear_texture_cache", text="Clear __pycache__", icon='X')
+        info_box = cache_box.box()
+        info_box.scale_y = 0.7
+        info_box.label(text="Clears addon __pycache__ in Blender AppData", icon='INFO')
         
         layout.separator()
         
@@ -781,13 +773,6 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
 
         col.separator()
         col.operator("mapgeo.import_materials_file", text="Import Materials File", icon='IMPORT')
-        
-        # Testing Quick Set Buttons
-        col.separator()
-        test_box = col.box()
-        test_box.label(text="Testing Paths:", icon='EXPERIMENTAL')
-        test_col = test_box.column(align=True)
-        test_col.operator("mapgeo.set_test_paths", text="Set Test Paths (Map11)", icon='FILEBROWSER')
         
         if (settings.assets_folder or settings.custom_assets_folder) and settings.materials_json_path:
             box.label(text="✓ Materials enabled", icon='CHECKMARK')
@@ -1568,25 +1553,7 @@ class MAPGEO_OT_set_diffuse_texture(bpy.types.Operator):
             return {'FINISHED'}
 
 
-class MAPGEO_OT_set_test_paths(bpy.types.Operator):
-    """Set test paths for Map11 materials and assets (for testing only)"""
-    bl_idname = "mapgeo.set_test_paths"
-    bl_label = "Set Test Paths"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        settings = context.scene.mapgeo_settings
-        
-        # Set testing paths
-        # Note: If using Map11LEVELS.wad (separate file), adjust paths accordingly
-        # Levels folder should point to where grass tint textures live (will search recursively)
-        settings.assets_folder = r"C:\Riot Games\League of Legends\Game\DATA\FINAL\Maps\Shipping\Map11.wad\assets"
-        settings.levels_folder = r"C:\Riot Games\League of Legends\Game\DATA\FINAL\Maps\Shipping\Map11.wad\levels"
-        settings.materials_json_path = r"C:\Riot Games\League of Legends\Game\DATA\FINAL\Maps\Shipping\Map11.wad\data\maps\mapgeometry\map11\base_srx.materials.bin.json"
-        settings.map_py_path = ""
-        
-        self.report({'INFO'}, "Test paths set for Map11")
-        return {'FINISHED'}
+# REMOVED: MAPGEO_OT_set_test_paths class (Testing Paths no longer needed)
 
 
 class MAPGEO_OT_show_all(bpy.types.Operator):
@@ -3679,6 +3646,57 @@ class MAPGEO_OT_export_lightmaps(bpy.types.Operator):
 
 
 # Register classes
+class VIEW3D_PT_mapgeo_debug_panel(Panel):
+    """Debug Log Panel — shows import diagnostics"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "Debug Log"
+    bl_idname = "VIEW3D_PT_mapgeo_debug_panel"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 10
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        from .debug_system import get_debug_log, Severity
+        layout = self.layout
+        log = get_debug_log()
+        s = log.stats
+
+        # Summary
+        box = layout.box()
+        box.label(text="Last Import Summary", icon='INFO')
+        if s.duration > 0:
+            box.label(text=f"Duration: {s.duration:.1f}s")
+        col = box.column(align=True)
+        col.label(text=f"Meshes: {s.meshes_imported} loaded, {s.meshes_failed} failed")
+        col.label(text=f"Materials: {s.materials_loaded} loaded, {s.materials_missing} missing")
+        col.label(text=f"Textures: {s.textures_loaded} loaded, {s.textures_missing} missing, {s.textures_failed} failed")
+        if s.lights_created or s.lights_failed:
+            col.label(text=f"Lights: {s.lights_created} created, {s.lights_failed} failed")
+
+        total_issues = log.error_count + log.warning_count
+        if total_issues > 0:
+            box.label(text=f"{log.error_count} errors, {log.warning_count} warnings", icon='ERROR')
+        else:
+            box.label(text="No issues detected", icon='CHECKMARK')
+
+        # Issues list (warnings and errors)
+        issues = [e for e in log.entries if e.severity in (Severity.WARNING, Severity.ERROR)]
+        if issues:
+            layout.separator()
+            box = layout.box()
+            box.label(text="Issues", icon='ERROR')
+            # Show up to 30 issues to avoid overflowing the panel
+            for entry in issues[:30]:
+                icon = 'ERROR' if entry.severity == Severity.ERROR else 'INFO'
+                row = box.row()
+                row.alert = entry.severity == Severity.ERROR
+                row.label(text=f"[{entry.category}] {entry.message}", icon=icon)
+            if len(issues) > 30:
+                box.label(text=f"... and {len(issues) - 30} more", icon='THREE_DOTS')
+
+
 classes = (
     VIEW3D_PT_mapgeo_panel,
     VIEW3D_PT_mapgeo_layers_panel,
@@ -3695,7 +3713,6 @@ classes = (
     MAPGEO_OT_assign_baron_hash,
     MAPGEO_OT_assign_render_region_hash,
     MAPGEO_OT_set_diffuse_texture,
-    MAPGEO_OT_set_test_paths,
     MAPGEO_OT_show_all,
     MAPGEO_OT_show_not_used,
     MAPGEO_OT_toggle_bucket_grid_selectable,
@@ -3723,6 +3740,7 @@ classes = (
     MAPGEO_OT_bake_lightmaps,
     MAPGEO_OT_export_lightmaps,
     VIEW3D_PT_mapgeo_lightgrid_panel,
+    VIEW3D_PT_mapgeo_debug_panel,
 )
 
 

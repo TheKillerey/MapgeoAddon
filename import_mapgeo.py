@@ -16,6 +16,7 @@ from . import mapgeo_parser
 from . import utils
 from . import material_loader as mat_loader
 from . import baron_hash_parser
+from .debug_system import get_debug_log
 
 # DEPRECATED: Module-level cache no longer used. Bucket grid data is stored 
 # on the BucketGrid collection's "bucket_data_json" custom property instead.
@@ -23,6 +24,48 @@ _imported_bucket_grids_cache = {}
 
 # Module-level cache for imported sampler defs (persists in Blender session)
 _imported_sampler_defs_cache = []
+
+
+def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
+    """Return the materials file path taking linked-materials mode into account.
+
+    When ``use_linked_materials`` is enabled the function searches the same
+    directory as the .mapgeo file for a matching materials file:
+        base.mapgeo  ->  base.materials.py  /  base.materials.bin.json
+        base_srx.mapgeo  ->  base_srx.materials.py  /  ...
+
+    Falls back to the manually-specified ``materials_json_path`` if linked
+    mode is off or no linked file can be found.
+    """
+    log = get_debug_log()
+    use_linked = getattr(settings, 'use_linked_materials', False)
+
+    if use_linked and mapgeo_filepath:
+        mapgeo_dir = os.path.dirname(mapgeo_filepath)
+        mapgeo_base = os.path.splitext(os.path.basename(mapgeo_filepath))[0]
+
+        # Try common naming patterns
+        candidates = [
+            os.path.join(mapgeo_dir, mapgeo_base + ".materials.py"),
+            os.path.join(mapgeo_dir, mapgeo_base + ".materials.bin.json"),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                log.info("Material", f"Linked materials found: {candidate}")
+                return candidate
+
+        # Also scan the directory for any .materials.py / .materials.bin.json
+        for fname in os.listdir(mapgeo_dir):
+            if fname.endswith('.materials.py') or fname.endswith('.materials.bin.json'):
+                found = os.path.join(mapgeo_dir, fname)
+                log.info("Material", f"Linked materials fallback found: {found}")
+                return found
+
+        log.warning("Material", f"No materials file found next to {os.path.basename(mapgeo_filepath)}")
+
+    # Fall back to manually specified path
+    manual = getattr(settings, 'materials_json_path', '')
+    return manual if manual else ""
 
 
 class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
@@ -85,6 +128,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
     
     def execute(self, context):
         """Execute the import"""
+        log = get_debug_log()
+        log.begin_session()
         try:
             # Update settings
             settings = context.scene.mapgeo_settings
@@ -101,7 +146,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 for sd in mapgeo.sampler_defs
             ]
             if _imported_sampler_defs_cache:
-                print(f"Cached {len(_imported_sampler_defs_cache)} sampler defs for export")
+                log.info("Import", f"Cached {len(_imported_sampler_defs_cache)} sampler defs for export")
             
             # Import into Blender
             self.import_mapgeo(context, mapgeo)
@@ -114,9 +159,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     settings = context.scene.mapgeo_settings
                     addon_module.update_environment_visibility(settings, context)
                 else:
-                    print("Warning: update_environment_visibility not found in addon module")
+                    log.warning("Import", "update_environment_visibility not found")
             except Exception as e:
-                print(f"Warning: Could not update visibility: {e}")
+                log.warning("Import", f"Could not update visibility: {e}")
             
             # Set viewport clipping for large maps
             for area in context.screen.areas:
@@ -126,10 +171,18 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                             space.clip_start = 10.01
                             space.clip_end = 1e+07
             
-            self.report({'INFO'}, f"Successfully imported {os.path.basename(self.filepath)}")
+            log.end_session()
+            # Build a concise status line for the user
+            s = log.stats
+            status = f"Imported {os.path.basename(self.filepath)}: {s.meshes_imported} meshes, {s.textures_loaded} textures"
+            issues = log.error_count + log.warning_count
+            if issues:
+                status += f" ({issues} issues — see Debug Log)"
+            self.report({'INFO'}, status)
             return {'FINISHED'}
         
         except Exception as e:
+            log.end_session()
             self.report({'ERROR'}, f"Failed to import mapgeo: {str(e)}")
             import traceback
             traceback.print_exc()
@@ -137,6 +190,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
     
     def import_mapgeo(self, context, mapgeo: mapgeo_parser.MapgeoFile):
         """Import mapgeo data into Blender"""
+        log = get_debug_log()
         
         # Use fixed root collection name from settings (not filename)
         settings = context.scene.mapgeo_settings
@@ -187,12 +241,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         render_regions_collection = bpy.data.collections.new(f"{collection_name}_RenderRegions")
         collection.children.link(render_regions_collection)
         
-        print(f"Importing {len(mapgeo.meshes)} meshes from {collection_name}")
-        print(f"  Vertex buffers: {len(mapgeo.vertex_buffers)}")
-        print(f"  Index buffers: {len(mapgeo.index_buffers)}")
-        print(f"  Vertex buffer descriptions: {len(mapgeo.vertex_buffer_descriptions)}")
-        print(f"  Created layer collections for multi-layer support")
-        print(f"  Created baron state collections for baron hash support")
+        log.info("Import", f"Importing {len(mapgeo.meshes)} meshes from {collection_name}")
+        log.info("Import", f"Vertex buffers: {len(mapgeo.vertex_buffers)}, Index buffers: {len(mapgeo.index_buffers)}, Descriptions: {len(mapgeo.vertex_buffer_descriptions)}")
         
         # Store materials
         materials = {}
@@ -204,16 +254,21 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         map_settings = {}
         settings = context.scene.mapgeo_settings
         
-        if settings.materials_json_path and os.path.exists(settings.materials_json_path):
+        # Resolve materials path (linked mode or manual)
+        resolved_materials = _resolve_materials_path(settings, self.filepath)
+        if resolved_materials:
+            settings.materials_json_path = resolved_materials
+        
+        if resolved_materials and os.path.exists(resolved_materials):
             has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
             has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
             
             if has_original_assets or has_custom_assets:
-                print(f"  Loading materials from: {os.path.basename(settings.materials_json_path)}")
+                log.info("Material", f"Loading materials from: {os.path.basename(resolved_materials)}")
                 if has_original_assets:
-                    print(f"  Original assets folder: {settings.assets_folder}")
+                    log.info("Material", f"Original assets folder: {settings.assets_folder}")
                 if has_custom_assets:
-                    print(f"  Custom assets folder (fallback): {settings.custom_assets_folder}")
+                    log.info("Material", f"Custom assets folder (fallback): {settings.custom_assets_folder}")
                 
                 material_loader = mat_loader.MaterialLoader(
                     assets_folder=settings.assets_folder,
@@ -223,19 +278,18 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     custom_assets_folder=settings.custom_assets_folder if hasattr(settings, 'custom_assets_folder') else "",
                     prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
                 )
-                materials_db = material_loader.load_materials(settings.materials_json_path)
+                materials_db = material_loader.load_materials(resolved_materials)
                 
                 # Load map settings (sun, lightmap, fog)
-                map_settings = material_loader.load_map_settings(settings.materials_json_path)
+                map_settings = material_loader.load_map_settings(resolved_materials)
                 
                 # Initialize baron hash parser for visibility decoding
-                baron_parser = baron_hash_parser.MaterialsBinParser(settings.materials_json_path)
-                print(f"  Baron hash parser initialized")
+                baron_parser = baron_hash_parser.MaterialsBinParser(resolved_materials)
+                log.info("Import", "Baron hash parser initialized")
             else:
-                print(f"  Warning: Assets folder not set or doesn't exist")
-                print(f"  Materials will be created without textures")
+                log.warning("Material", "Assets folder not set or doesn't exist — materials will be created without textures")
         else:
-            print(f"  No materials JSON specified - using simple materials")
+            log.info("Material", "No materials JSON specified — using simple materials")
         
         # Get lightmap color scale from map settings
         lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
@@ -250,24 +304,24 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Validate vertex buffer IDs
                 if not mesh_data.vertex_buffer_ids:
-                    print(f"Warning: Mesh {mesh_idx} has no vertex buffers")
+                    log.mesh_failed(mesh_name, "No vertex buffers")
                     continue
                 
                 # Get the first vertex buffer (main geometry)
                 vb_id = mesh_data.vertex_buffer_ids[0]
                 if vb_id >= len(mapgeo.vertex_buffers):
-                    print(f"Warning: Invalid vertex buffer ID {vb_id}")
+                    log.mesh_failed(mesh_name, f"Invalid vertex buffer ID {vb_id}")
                     continue
                 
                 if mesh_data.index_buffer_id >= len(mapgeo.index_buffers):
-                    print(f"Warning: Invalid index buffer ID {mesh_data.index_buffer_id}")
+                    log.mesh_failed(mesh_name, f"Invalid index buffer ID {mesh_data.index_buffer_id}")
                     continue
                 
                 # Get vertex buffer and its description
                 vertex_buffer = mapgeo.vertex_buffers[vb_id]
                 desc_id = mesh_data.vertex_declaration_id
                 if desc_id >= len(mapgeo.vertex_buffer_descriptions):
-                    print(f"Warning: Invalid vertex declaration ID {desc_id}")
+                    log.mesh_failed(f"mesh_{mesh_idx:03d}", f"Invalid vertex declaration ID {desc_id}")
                     continue
                 
                 vb_description = mapgeo.vertex_buffer_descriptions[desc_id]
@@ -314,11 +368,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 faces, face_materials = self.parse_index_buffer(index_buffer, mesh_data)
                 
                 if not vertices:
-                    print(f"  ! Mesh {mesh_idx}: No vertices parsed (vb_id={vb_id}, desc_id={desc_id})")
+                    log.mesh_failed(f"mesh_{mesh_idx:03d}", f"No vertices parsed (vb_id={vb_id}, desc_id={desc_id})")
                     continue
                     
                 if not faces:
-                    print(f"  ! Mesh {mesh_idx}: No faces parsed (ib_id={mesh_data.index_buffer_id})")
+                    log.mesh_failed(f"mesh_{mesh_idx:03d}", f"No faces parsed (ib_id={mesh_data.index_buffer_id})")
                     continue
                 
                 # Create mesh
@@ -426,7 +480,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                                 mesh_texture_overrides[sampler_def.name] = override.texture
                                 break
                     if mesh_texture_overrides and imported_count <= 5:
-                        print(f"    Texture overrides: {mesh_texture_overrides}")
+                        log.info("Material", f"Texture overrides for mesh {mesh_idx}", str(mesh_texture_overrides))
                 
                 # Get per-mesh baked paint UV transform
                 baked_paint_scale = mesh_data.baked_paint_scale
@@ -511,7 +565,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                             if baron_state_bit in baron_collections:
                                 baron_collections[baron_state_bit].objects.link(obj)
                     except Exception as e:
-                        print(f"    Warning: Could not link mesh to baron collections: {e}")
+                        log.warning("Import", f"Could not link mesh to baron collections: {e}")
                 
                 # Link to Bushes collection if mesh has TEXCOORD5 (bush animation data)
                 if texcoord5_data and len(texcoord5_data) > 0:
@@ -591,16 +645,16 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                             obj["baron_parent_mode"] = controller.parent_mode
                             
                             if imported_count <= 5:
-                                print(f"    Baron Hash {baron_hash_str}:")
-                                print(f"      ParentMode: {controller.parent_mode} ({'Not Visible on this layer' if controller.parent_mode == 3 else 'Visible on this layer' if controller.parent_mode == 1 else 'Unknown'})")
+                                detail_parts = [f"ParentMode: {controller.parent_mode}"]
                                 if controller.baron_layers:
                                     baron_names = [baron_hash_parser.get_baron_layer_name(l) for l in controller.baron_layers]
-                                    print(f"      Baron Layers: {', '.join(baron_names)}")
+                                    detail_parts.append(f"Baron: {', '.join(baron_names)}")
                                 if controller.dragon_layers:
                                     dragon_names = [baron_hash_parser.get_dragon_layer_name(l) for l in controller.dragon_layers]
-                                    print(f"      Dragon Layers: {', '.join(dragon_names)}")
+                                    detail_parts.append(f"Dragon: {', '.join(dragon_names)}")
+                                log.info("Import", f"Baron Hash {baron_hash_str}", " | ".join(detail_parts))
                         except Exception as e:
-                            print(f"    Warning: Could not decode baron hash {baron_hash_str}: {e}")
+                            log.warning("Import", f"Could not decode baron hash {baron_hash_str}: {e}")
                 
                 # Create Blender point light if mesh has point_light custom properties
                 # This is a CUSTOM FEATURE (stationary_light field is unused in official maps)
@@ -629,29 +683,34 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                         light_obj.parent = obj
                         
                         if imported_count <= 5:
-                            print(f"    Created point light (Custom feature)")
+                            log.info("Light", f"Created point light for {mesh_name}")
+                        log.light_created()
                     except Exception as e:
-                        print(f"    Warning: Could not create point light: {e}")
+                        log.light_failed(f"{obj.name}: {e}")
                 
                 imported_count += 1
+                log.mesh_imported()
                 if imported_count <= 5 or imported_count % 100 == 0:
                     uv_info = f", {uv_channels_created} UV" if uv_channels_created > 0 else ", no UV"
-                    print(f"  ✓ Imported mesh {mesh_idx}: {len(vertices)} verts, {len(faces)} faces{uv_info}")
+                    log.info("Mesh", f"Imported mesh {mesh_idx}: {len(vertices)} verts, {len(faces)} faces{uv_info}")
             
             except Exception as e:
-                print(f"  ✗ Error importing mesh {mesh_idx}: {str(e)}")
+                log.mesh_failed(f"mesh_{mesh_idx:03d}", str(e))
                 import traceback
                 traceback.print_exc()
                 continue        
         
-        print(f"\n✓ Successfully imported {imported_count}/{len(mapgeo.meshes)} meshes")
+        log.info("Import", f"Successfully imported {imported_count}/{len(mapgeo.meshes)} meshes")
         
-        # Print layer statistics
-        print(f"\nLayer Distribution:")
+        # Layer statistics
+        layer_stats = []
         for layer_flag, layer_col in layer_collections.items():
             layer_name = layer_names[layer_flag]
             mesh_count = len(layer_col.objects)
-            print(f"  {layer_name}: {mesh_count} meshes")
+            if mesh_count > 0:
+                layer_stats.append(f"{layer_name}: {mesh_count}")
+        if layer_stats:
+            log.info("Import", f"Layer distribution: {', '.join(layer_stats)}")
         
         # Import bucket grids
         if self.import_bucket_grid and mapgeo.bucket_grids:
@@ -682,6 +741,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         - Bounding box empties showing grid extents
         - Custom properties storing metadata for export
         """
+        log = get_debug_log()
         import json
         
         scale = self.scale_factor
@@ -701,11 +761,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         
         for grid_idx, grid in enumerate(mapgeo.bucket_grids):
             if grid.is_disabled:
-                print(f"  Bucket grid {grid_idx}: disabled, skipping visual")
+                log.info("BucketGrid", f"Grid {grid_idx}: disabled, skipping")
                 continue
             
             if not grid.vertices or not grid.indices:
-                print(f"  Bucket grid {grid_idx}: no geometry, skipping visual")
+                log.info("BucketGrid", f"Grid {grid_idx}: no geometry, skipping")
                 continue
             
             # --- Create mesh from bucket grid geometry ---
@@ -846,7 +906,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 "face_visibility_flags": grid.face_visibility_flags,
             }
             all_grid_jsons.append(grid_json)
-            print(f"  Stored bucket grid {grid_idx} data for export")
+            log.info("BucketGrid", f"Stored grid {grid_idx} data for export")
             
             # --- Create bounding box wireframe ---
             bbox_name = f"{grid_name}_Bounds"
@@ -934,8 +994,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         if layer_col:
             layer_col.hide_viewport = True
         
-        print(f"\n✓ Imported {len(mapgeo.bucket_grids)} bucket grid(s): {total_verts} verts, {total_faces} faces")
-        print(f"  Collection '{bg_col_name}' created (hidden by default)")
+        log.info("BucketGrid", f"Imported {len(mapgeo.bucket_grids)} grid(s): {total_verts} verts, {total_faces} faces")
     
     def create_scene_lighting(self, context, collection, map_settings):
         """
@@ -954,6 +1013,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         Lightmapped materials use Emission (not affected by scene lights).
         Non-lightmapped materials (NO_BAKED_LIGHTING) respond to these lights.
         """
+        log = get_debug_log()
         import math
         from mathutils import Vector
         
@@ -991,7 +1051,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             sun_obj["sun_direction_league"] = list(sun_direction)
             sun_obj["sun_color"] = list(sun_color)
             
-            print(f"  ✓ Created Sun light: dir={sun_direction}, color=({sun_color[0]:.3f}, {sun_color[1]:.3f}, {sun_color[2]:.3f})")
+            log.info("MapSettings", f"Created Sun light: dir={sun_direction}, color=({sun_color[0]:.3f}, {sun_color[1]:.3f}, {sun_color[2]:.3f})")
         
         # --- World Environment (ambient lighting + fog) ---
         # League uses a 3-color hemisphere ambient lighting system:
@@ -1064,7 +1124,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         world["horizon_color"] = list(horizon_color)
         world["ground_color"] = list(ground_color)
         
-        print(f"  ✓ Created World ambient: sky=({sky_color[0]:.3f}, {sky_color[1]:.3f}, {sky_color[2]:.3f}), "
+        log.info("MapSettings", f"Created World ambient: sky=({sky_color[0]:.3f}, {sky_color[1]:.3f}, {sky_color[2]:.3f}), "
               f"horizon=({horizon_color[0]:.3f}, {horizon_color[1]:.3f}, {horizon_color[2]:.3f}), "
               f"ground=({ground_color[0]:.3f}, {ground_color[1]:.3f}, {ground_color[2]:.3f}), scale={sky_scale}")
         
@@ -1137,12 +1197,12 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 eevee.volumetric_start = max(1.0, fog_start * 0.1)
                 eevee.volumetric_end = fog_end * 1.5
                 
-                print(f"  ✓ Created Fog mesh volume: color=({fog_color[0]:.3f}, {fog_color[1]:.3f}, {fog_color[2]:.3f}), "
-                      f"density={fog_density:.6f}, range=[{fog_start:.0f}, {fog_end:.0f}], size={fog_size:.0f}")
+                log.info("MapSettings", f"Created Fog volume: color=({fog_color[0]:.3f}, {fog_color[1]:.3f}, {fog_color[2]:.3f}), "
+                      f"density={fog_density:.6f}, range=[{fog_start:.0f}, {fog_end:.0f}]")
             else:
-                print(f"  ℹ Fog skipped: invalid range [{fog_start_end[0]}, {fog_start_end[1]}]")
+                log.info("MapSettings", f"Fog skipped: invalid range [{fog_start_end[0]}, {fog_start_end[1]}]")
         elif not fog_enabled:
-            print(f"  ℹ Fog disabled in map settings")
+            log.info("MapSettings", "Fog disabled in map settings")
         
         # --- Store MapSunProperties on World object (visible in World > Custom Properties) ---
         world["fog_enabled"] = fog_enabled
@@ -1183,10 +1243,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         if min_env is not None:
             world["lighting_v2_min_env_color_contribution"] = min_env
         
-        print(f"  ✓ Stored all map properties on World ({world.name}) custom properties")
+        log.info("MapSettings", f"Stored all map properties on World ({world.name})")
     
     def parse_vertex_buffer(self, vb: mapgeo_parser.VertexBuffer, vb_description: mapgeo_parser.VertexBufferDescription, mesh_data, mesh_idx: int = -1):
         """Parse vertex buffer data"""
+        log = get_debug_log()
         vertices = []
         normals = []
         uvs = [[] for _ in range(8)]  # Support up to 8 UV channels
@@ -1214,7 +1275,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Debug: log vertex declaration for first few meshes and meshes without UVs
         should_log = (mesh_idx >= 0 and mesh_idx < 3) or (mesh_idx in [199, 1] and not has_uvs)
         if should_log:
-            print(f"    Mesh {mesh_idx} vertex buffer description: {len(vb_description.elements)} elements, stride={vertex_size}")
+            log.info("VertexBuffer", f"Mesh {mesh_idx}: {len(vb_description.elements)} elements, stride={vertex_size}")
             for elem in vb_description.elements:
                 elem_name_str = f"ElementName.{elem.name}"
                 if elem.name == mapgeo_parser.VertexElementName.POSITION:
@@ -1233,7 +1294,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     elem_name_str = "BLEND_WEIGHT"
                 elif mapgeo_parser.VertexElementName.TEXCOORD0 <= elem.name <= mapgeo_parser.VertexElementName.TEXCOORD7:
                     elem_name_str = f"TEXCOORD{elem.name - mapgeo_parser.VertexElementName.TEXCOORD0}"
-                print(f"      {elem_name_str}: format={elem.format}, offset={elem.offset}, size={elem.get_size()}")
+                log.info("VertexBuffer", f"  {elem_name_str}: format={elem.format}, offset={elem.offset}, size={elem.get_size()}")
         
         for elem in vb_description.elements:
             if elem.name == mapgeo_parser.VertexElementName.POSITION:
@@ -1345,7 +1406,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 return tuple(v / 255.0 for v in values)
         except Exception as e:
             # Debug: log what failed
-            print(f"    ! Failed to read element at offset {offset}, format {fmt}: {e}")
+            log.warning("VertexBuffer", f"Failed to read element at offset {offset}, format {fmt}: {e}")
         
         return None
     
@@ -1615,6 +1676,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
         (imported_count, error_message) - count of imported meshes, or error string
     """
     import hashlib
+    log = get_debug_log()
     
     # Parse mapgeo file
     parser = mapgeo_parser.MapgeoParser()
@@ -1688,7 +1750,12 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
     lightmap_color_scale = 1.0
     settings = context.scene.mapgeo_settings
     
-    if settings.materials_json_path and os.path.exists(settings.materials_json_path):
+    # Resolve materials path (linked mode or manual)
+    resolved_materials = _resolve_materials_path(settings, filepath)
+    if resolved_materials:
+        settings.materials_json_path = resolved_materials
+    
+    if resolved_materials and os.path.exists(resolved_materials):
         has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
         has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
         
@@ -1701,12 +1768,12 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                 custom_assets_folder=settings.custom_assets_folder if hasattr(settings, 'custom_assets_folder') else "",
                 prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
             )
-            materials_db = material_loader_inst.load_materials(settings.materials_json_path)
+            materials_db = material_loader_inst.load_materials(resolved_materials)
             
-            map_settings = material_loader_inst.load_map_settings(settings.materials_json_path)
+            map_settings = material_loader_inst.load_map_settings(resolved_materials)
             lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
             
-            baron_parser_inst = baron_hash_parser.MaterialsBinParser(settings.materials_json_path)
+            baron_parser_inst = baron_hash_parser.MaterialsBinParser(resolved_materials)
     
     # ─── Import matching meshes ───
     imported_count = 0
@@ -1955,7 +2022,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                             obj["baron_dragon_layers_decoded"] = str(dragon_layers_list)
                         obj["baron_parent_mode"] = controller.parent_mode
                     except Exception as e:
-                        print(f"    Warning: Could not decode baron hash {baron_hash_str}: {e}")
+                        log.warning("Import", f"Could not decode baron hash {baron_hash_str}: {e}")
             
             # Link to baron collections after properties are set
             if "baron_layers_decoded" in obj and obj["baron_layers_decoded"]:
@@ -1988,22 +2055,24 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                     light_obj.location.z += offset_z
                     meshes_collection.objects.link(light_obj)
                     light_obj.parent = obj
-                except Exception:
-                    pass
+                    log.light_created()
+                except Exception as e:
+                    log.light_failed(f"{mesh_name}: {e}")
             
             imported_count += 1
+            log.mesh_imported()
             if imported_count <= 5 or imported_count % 100 == 0:
                 uv_info = f", {uv_channels_created} UV" if uv_channels_created > 0 else ""
-                print(f"  ✓ Mesh {mesh_idx}: {len(vertices)} verts, {len(faces)} faces{uv_info}")
+                log.info("Mesh", f"Mesh {mesh_idx}: {len(vertices)} verts, {len(faces)} faces{uv_info}")
         
         except Exception as e:
-            print(f"  ✗ Error importing mesh {mesh_idx}: {e}")
+            log.mesh_failed(f"mesh_{mesh_idx:03d}", str(e))
             import traceback
             traceback.print_exc()
             continue
     
     suffix_label = collection_suffix.strip('_') if collection_suffix else 'filtered'
-    print(f"\n✓ Filtered import ({suffix_label}): {imported_count} meshes into '{root_name}'")
+    log.info("Import", f"Filtered import ({suffix_label}): {imported_count} meshes into '{root_name}'")
     
     # Update visibility
     try:

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.2.5] - 2026-02-21
+
+### 🔍 Centralized Debug System
+- **New Debug Module** (`debug_system.py`) - Unified logging and diagnostics system
+  - `DebugLog` singleton tracks all import operations with categories and severity levels
+  - `ImportStats` counters: meshes (loaded/failed), materials (loaded/missing), textures (loaded/missing/failed), lights (created/failed)
+  - Session tracking: duration measurement, summary generation, error/warning counts
+  - Integration with all import paths for comprehensive issue detection
+
+### 🎨 Debug UI Panel
+- **Debug Log Panel** in Sidebar ("LoL Mapgeo" > "Debug Log")
+  - Shows last import summary: duration, mesh/material/texture/light counts
+  - Displays warnings and errors with category tags and severity highlighting
+  - Up to 30 most recent issues visible; expandable count for more
+
+### ✅ Integrated Debug Logging
+- **import_mapgeo.py** - All ~30+ print statements → debug log calls
+  - Tracks: mesh import success/failures, material loading, baron hash decoding, point lights
+  - Both import paths (main + filtered meshes) tracked separately
+  - Session start/end with status report showing issue count
+  - Layer distribution statistics logged
+  - Bucket grid import diagnostics
+  - Map settings (sun, lighting, fog) creation tracked
+
+- **material_loader.py** - All ~50 print statements → debug log calls
+  - Material loading: loaded, missing, not found in database
+  - Texture resolution and loading: loaded, missing, failed with reasons
+  - Grass tint system: resolution, fallback searches, dragon variant selection
+  - Map settings loading: success, errors, lightmap color scale
+
+- **texture_utils.py** (prior session) - All print statements replaced with debug calls
+
+### 🧹 UI Cleanup
+- **Removed Testing Paths Section** - Deleted unused "Testing Paths" UI buttons that referenced deleted operator
+- **Fixed operator references** - Removed stale `MAPGEO_OT_set_test_paths` from registration
+
+### 📋 Technical Details
+- Debug log entries include: timestamp, severity (INFO/WARNING/ERROR), category, message, optional detail
+- All debug calls still print to Blender's System Console for developer visibility
+- Zero breaking changes: debug system is opt-in monitoring layer
+
 ## [0.2.4] - 2026-02-20
 
 ### 🧹 Repository Cleanup

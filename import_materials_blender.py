@@ -19,6 +19,11 @@ except ImportError:
     Material = None
     MaterialsParser = None
 
+try:
+    from texture_utils import TexConverter
+except ImportError:
+    TexConverter = None
+
 def import_materials_from_file(filepath: str, create_textures: bool = True) -> Dict[str, bpy.types.Material]:
     """
     Import materials from League .materials.py file
@@ -256,14 +261,24 @@ def _load_texture_into_node(tex_node: bpy.types.ShaderNodeTexImage, texture_path
         Path(r"C:\Users\theki\AppData\Local\Programs\Python\Python310"),  # For local development
     ]
     
+    converter = TexConverter() if TexConverter else None
+
+    def _load_image(file_path_str):
+        """Load an image, handling .tex via TexConverter."""
+        if converter and file_path_str.lower().endswith('.tex'):
+            return converter.load_tex_as_blender_image(file_path_str)
+        return bpy.data.images.load(file_path_str, check_existing=True)
+
     # Try direct path first
     if Path(texture_path).exists():
         try:
-            img = bpy.data.images.load(str(Path(texture_path)))
-            tex_node.image = img
-            return True
-        except:
-            pass
+            img = _load_image(str(Path(texture_path)))
+            if img:
+                tex_node.image = img
+                print(f"[Texture] Loaded direct path: {texture_path}")
+                return True
+        except Exception as e:
+            print(f"[Texture] Failed to load direct path {texture_path}: {e}")
     
     # Try searching in League folders
     for base_path in search_bases:
@@ -271,11 +286,23 @@ def _load_texture_into_node(tex_node: bpy.types.ShaderNodeTexImage, texture_path
             base_path / texture_path,
             base_path / f"ASSETS/{texture_path.split('ASSETS/')[-1] if 'ASSETS/' in texture_path else texture_path}",
         ]:
-            if possible_path.with_suffix('.tex').exists():
-                # Found .tex file, can't load directly but note it
-                print(f"Found texture: {possible_path.with_suffix('.tex')}")
-                return False
+            tex_candidate = possible_path.with_suffix('.tex')
+            dds_candidate = possible_path.with_suffix('.dds')
+            png_candidate = possible_path.with_suffix('.png')
+
+            for candidate in [dds_candidate, png_candidate, tex_candidate]:
+                if not candidate.exists():
+                    continue
+                try:
+                    img = _load_image(str(candidate))
+                    if img:
+                        tex_node.image = img
+                        print(f"[Texture] Loaded searched path: {candidate}")
+                        return True
+                except Exception as e:
+                    print(f"[Texture] Failed to load searched path {candidate}: {e}")
     
+    print(f"[Texture] Could not find texture: {texture_path}")
     return False
 
 def assign_material_to_object(obj: bpy.types.Object, material: bpy.types.Material, slot_index: int = 0):

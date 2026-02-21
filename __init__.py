@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 4),
+    "version": (0, 2, 5),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -235,42 +235,43 @@ def update_bucket_grid_visibility(self, context):
     print(f"Bucket grids {status} ({len(bg_layer_cols)} collections)")
 
 # Operators
-class MAPGEO_OT_install_pillow(bpy.types.Operator):
-    """Install Pillow library for texture conversion"""
-    bl_idname = "mapgeo.install_pillow"
-    bl_label = "Install Pillow"
-    bl_description = "Install Pillow (PIL) library for texture conversion (.tex to .png)"
+class MAPGEO_OT_clear_texture_cache(bpy.types.Operator):
+    """Clear Python cache files in addon folder"""
+    bl_idname = "mapgeo.clear_texture_cache"
+    bl_label = "Clear Python Cache"
+    bl_description = "Clear __pycache__ folders and .pyc files in the installed addon folder"
     bl_options = {'REGISTER'}
     
     def execute(self, context):
-        import subprocess
-        import site
-        
-        self.report({'INFO'}, "Installing Pillow... This may take a moment.")
-        
-        try:
-            # Install to user site-packages (no admin needed)
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "Pillow"])
-            
-            # Add user site-packages to path immediately
-            import site
-            site.addsitedir(site.USER_SITE)
-            
-            # Test import
-            try:
-                import PIL
-                self.report({'INFO'}, "Pillow installed successfully! Restart Blender for full effect.")
-                return {'FINISHED'}
-            except ImportError:
-                self.report({'WARNING'}, "Pillow installed but requires Blender restart to take effect.")
-                return {'FINISHED'}
-                
-        except subprocess.CalledProcessError as e:
-            self.report({'ERROR'}, f"Installation failed: {e}")
-            return {'CANCELLED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Installation error: {e}")
-            return {'CANCELLED'}
+        import os
+        import shutil
+
+        addon_dir = os.path.dirname(os.path.abspath(__file__))
+        pycache_dirs = 0
+        pyc_files = 0
+        errors = 0
+
+        for root, dirs, files in os.walk(addon_dir, topdown=False):
+            for filename in files:
+                if filename.endswith('.pyc'):
+                    file_path = os.path.join(root, filename)
+                    try:
+                        os.remove(file_path)
+                        pyc_files += 1
+                    except Exception:
+                        errors += 1
+
+            for dirname in dirs:
+                if dirname == '__pycache__':
+                    dir_path = os.path.join(root, dirname)
+                    try:
+                        shutil.rmtree(dir_path)
+                        pycache_dirs += 1
+                    except Exception:
+                        errors += 1
+
+        self.report({'INFO'}, f"Cleared {pycache_dirs} __pycache__ folders and {pyc_files} .pyc files" + (f" ({errors} errors)" if errors else ""))
+        return {'FINISHED'}
 
 # Property Groups for storing mapgeo data
 class MapgeoLayerItem(PropertyGroup):
@@ -400,9 +401,15 @@ class MapgeoSettings(PropertyGroup):
         subtype='DIR_PATH'
     )
     
+    use_linked_materials: BoolProperty(
+        name="Use Linked Materials",
+        description="Automatically find materials file next to the .mapgeo file (e.g. base.mapgeo -> base.materials.py). Disable to manually specify a materials path",
+        default=True
+    )
+
     materials_json_path: StringProperty(
         name="Materials File Path",
-        description="Path to the .materials.bin.json or .materials.py file",
+        description="Path to the .materials.bin.json or .materials.py file (used when Linked Materials is disabled)",
         default="",
         subtype='FILE_PATH'
     )
@@ -521,7 +528,7 @@ class MapgeoSettings(PropertyGroup):
 
 # Classes to register
 classes = (
-    MAPGEO_OT_install_pillow,
+    MAPGEO_OT_clear_texture_cache,
     MapgeoLayerItem,
     MapgeoSettings,
     import_mapgeo.IMPORT_SCENE_OT_mapgeo,
@@ -535,7 +542,7 @@ classes = (
     ui_panel.MAPGEO_OT_assign_baron_hash,
     ui_panel.MAPGEO_OT_assign_render_region_hash,
     ui_panel.MAPGEO_OT_set_diffuse_texture,
-    ui_panel.MAPGEO_OT_set_test_paths,
+    # ui_panel.MAPGEO_OT_set_test_paths,  # removed
     ui_panel.MAPGEO_OT_show_all,
     ui_panel.MAPGEO_OT_show_not_used,
     ui_panel.MAPGEO_OT_toggle_bucket_grid_selectable,
