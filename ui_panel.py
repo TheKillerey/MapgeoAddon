@@ -480,7 +480,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.4"
+        addon_version = "0.2.5"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
