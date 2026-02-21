@@ -31,6 +31,7 @@ class TexConverter:
         """Initialize with an empty cache for O(1) texture lookups."""
         self._texture_cache = {}  # Maps normalized tex_path -> bpy.types.Image
         self._unpacked_images = []  # Track images that need packing
+        self._temp_files = []  # Track temp DDS files for deferred cleanup
 
     # ------------------------------------------------------------------ #
     #  Public API                                                         #
@@ -102,8 +103,12 @@ class TexConverter:
             # Defer packing to batch operation for better performance
             if defer_packing:
                 self._unpacked_images.append(img)
+                # Keep temp file until packing is complete to avoid GPU errors
+                self._temp_files.append(tmp_path)
+                tmp_path = None  # Prevent cleanup in finally block
             else:
                 img.pack()  # embed valid DDS data into .blend immediately
+                # Temp file can be deleted immediately since image is packed
 
             # Give it a nice name
             if image_name is None:
@@ -123,7 +128,7 @@ class TexConverter:
             print(f"  [Texture] Failed to load TEX as DDS: {tex_path}: {exc}")
             return None
         finally:
-            # Clean up temp file
+            # Clean up temp file (only if not deferred)
             if tmp_fd is not None:
                 try:
                     os.close(tmp_fd)
@@ -137,12 +142,21 @@ class TexConverter:
 
     # kept for API compatibility
     def clear_cache(self):
-        """Clear the texture cache."""
+        """Clear the texture cache and clean up any temp files."""
         self._texture_cache.clear()
+        # Clean up any remaining temp files
+        for temp_file in self._temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except OSError:
+                pass
+        self._temp_files.clear()
+        self._unpacked_images.clear()
     
     def pack_all_images(self):
         """
-        Pack all deferred images in a single batch operation.
+        Pack all deferred images in a single batch operation, then clean up temp files.
         Call this after loading all textures to finalize them.
         Significantly faster than packing each image individually.
         """
@@ -160,6 +174,15 @@ class TexConverter:
                     print(f"  [Texture] Failed to pack image: {exc}")
         
         self._unpacked_images.clear()
+        
+        # Now it's safe to delete temp DDS files since all images are packed
+        for temp_file in self._temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except OSError:
+                pass
+        self._temp_files.clear()
         
         if _is_debug_enabled():
             print(f"  [Texture] Batch packed {packed_count} images")
