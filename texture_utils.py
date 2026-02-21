@@ -27,11 +27,16 @@ def _is_debug_enabled():
 class TexConverter:
     """Converts Riot .tex files to DDS and loads them via Blender's native loader."""
 
+    def __init__(self):
+        """Initialize with an empty cache for O(1) texture lookups."""
+        self._texture_cache = {}  # Maps normalized tex_path -> bpy.types.Image
+        self._unpacked_images = []  # Track images that need packing
+
     # ------------------------------------------------------------------ #
     #  Public API                                                         #
     # ------------------------------------------------------------------ #
 
-    def load_tex_as_blender_image(self, tex_path: str, image_name: str = None):
+    def load_tex_as_blender_image(self, tex_path: str, image_name: str = None, defer_packing: bool = True):
         """
         Convert a .tex file to DDS, load it natively in Blender, pack it,
         then delete the temp DDS file.
@@ -39,6 +44,7 @@ class TexConverter:
         Args:
             tex_path:   Absolute path to the ``.tex`` file.
             image_name: Optional display name; defaults to the file basename.
+            defer_packing: If True, defer image packing for batch operation (faster). Default True.
 
         Returns:
             ``bpy.types.Image`` on success, ``None`` on failure.
@@ -51,13 +57,17 @@ class TexConverter:
             print(f"  [Texture] TEX file not found: {tex_path}")
             return None
 
-        # --- deduplicate — reuse if already loaded ----------------------
-        for img in bpy.data.images:
-            if img.get('_tex_source_path') == tex_path:
-                # Only log reuse in debug mode to avoid spam
+        # --- deduplicate using cache (O(1) instead of O(n)) -------------
+        if tex_path in self._texture_cache:
+            cached_img = self._texture_cache[tex_path]
+            # Verify the cached image still exists in Blender
+            if cached_img and cached_img.name in bpy.data.images:
                 if _is_debug_enabled():
-                    print(f"  [Texture] Reusing loaded TEX image: {img.name}")
-                return img
+                    print(f"  [Texture] Reusing cached TEX image: {cached_img.name}")
+                return cached_img
+            else:
+                # Image was deleted, remove from cache
+                del self._texture_cache[tex_path]
 
         # --- read TEX ---------------------------------------------------
         try:
@@ -88,15 +98,21 @@ class TexConverter:
             tmp_fd = None  # mark closed
 
             img = bpy.data.images.load(tmp_path, check_existing=False)
-            img.pack()  # embed valid DDS data into .blend
+            
+            # Defer packing to batch operation for better performance
+            if defer_packing:
+                self._unpacked_images.append(img)
+            else:
+                img.pack()  # embed valid DDS data into .blend immediately
 
             # Give it a nice name
             if image_name is None:
                 image_name = os.path.basename(tex_path)
             img.name = image_name
 
-            # Tag for deduplication
+            # Tag for deduplication and add to cache
             img['_tex_source_path'] = tex_path
+            self._texture_cache[tex_path] = img
 
             # Only log success in debug mode to reduce console spam
             if _is_debug_enabled():
@@ -121,8 +137,32 @@ class TexConverter:
 
     # kept for API compatibility
     def clear_cache(self):
-        """No-op kept for API compatibility."""
-        pass
+        """Clear the texture cache."""
+        self._texture_cache.clear()
+    
+    def pack_all_images(self):
+        """
+        Pack all deferred images in a single batch operation.
+        Call this after loading all textures to finalize them.
+        Significantly faster than packing each image individually.
+        """
+        if not self._unpacked_images:
+            return
+        
+        packed_count = 0
+        for img in self._unpacked_images:
+            try:
+                if img and img.name:  # Verify image still exists
+                    img.pack()
+                    packed_count += 1
+            except Exception as exc:
+                if _is_debug_enabled():
+                    print(f"  [Texture] Failed to pack image: {exc}")
+        
+        self._unpacked_images.clear()
+        
+        if _is_debug_enabled():
+            print(f"  [Texture] Batch packed {packed_count} images")
 
     # ------------------------------------------------------------------ #
     #  TEX → DDS conversion                                               #

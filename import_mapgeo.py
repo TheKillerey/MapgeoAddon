@@ -735,6 +735,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Create scene lighting from map settings (Sun, World ambient)
         if self.import_lightmaps and map_settings:
             self.create_scene_lighting(context, collection, map_settings)
+        
+        # Finalize texture packing (batch operation for performance)
+        if material_loader and hasattr(material_loader, 'tex_converter'):
+            material_loader.tex_converter.pack_all_images()
             
     def import_bucket_grids(self, context, parent_collection, collection_name, mapgeo):
         """
@@ -2077,6 +2081,10 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
     
     suffix_label = collection_suffix.strip('_') if collection_suffix else 'filtered'
     log.info("Import", f"Filtered import ({suffix_label}): {imported_count} meshes into '{root_name}'")
+    
+    # Finalize texture packing (batch operation for performance)
+    if material_loader_inst and hasattr(material_loader_inst, 'tex_converter'):
+        material_loader_inst.tex_converter.pack_all_images()
     
     # Update visibility
     try:
