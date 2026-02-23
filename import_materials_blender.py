@@ -217,6 +217,8 @@ def _create_material_nodes(mat: bpy.types.Material, league_material: Material, c
     # Create principled shader
     principled = nodes.new(type='ShaderNodeBsdfPrincipled')
     principled.location = (0, 0)
+    if principled.inputs.get('Emission Strength'):
+        principled.inputs['Emission Strength'].default_value = 0.0
     
     # Link to output
     links.new(principled.outputs['BSDF'], output_node.inputs['Surface'])

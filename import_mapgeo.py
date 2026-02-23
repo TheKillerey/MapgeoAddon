@@ -43,6 +43,73 @@ def _optimized_mesh_update(mesh):
         mesh.update()
 
 
+def _extract_visibility_controller_layers(materials_path: str) -> dict:
+    """
+    Extract layer→hash mappings from materials.bin visibility controllers.
+    
+    Uses BaronHashParser to load and index controllers, then maps each
+    layer bit to its corresponding path_hash.
+    
+    Args:
+        materials_path: Path to materials.py or materials.bin.json
+        
+    Returns: 
+        dict[layer_bit: int] → path_hash: int
+        Example: {1: 0x12345678, 2: 0xABCDEF00, ...}
+    """
+    if not materials_path or not os.path.exists(materials_path):
+        return {}
+    
+    layer_map = {}
+
+    try:
+        # Use BaronHashParser to load materials
+        parser = baron_hash_parser.MaterialsBinParser(materials_path)
+
+        if not parser.controllers:
+            return {}
+
+        seen_hashes = set()
+
+        # Walk through indexed controllers to find layer→hash mappings
+        for path_hash_str in parser.controllers.keys():
+            if not isinstance(path_hash_str, str):
+                continue
+
+            cleaned = path_hash_str.strip().strip("{}")
+            if cleaned.lower().startswith("0x"):
+                cleaned = cleaned[2:]
+
+            if len(cleaned) != 8:
+                continue
+
+            try:
+                path_hash = int(cleaned, 16)
+            except ValueError:
+                continue
+
+            cleaned_upper = cleaned.upper()
+            if cleaned_upper in seen_hashes:
+                continue
+            seen_hashes.add(cleaned_upper)
+
+            controller = parser.decode_baron_hash(cleaned_upper)
+
+            for layer_bit in controller.dragon_layers:
+                if layer_bit not in layer_map:  # First match wins
+                    layer_map[layer_bit] = path_hash
+
+            for baron_bit in controller.baron_layers:
+                if baron_bit not in layer_map:  # First match wins
+                    layer_map[baron_bit] = path_hash
+
+    except Exception as e:
+        log = get_debug_log()
+        log.warning("BucketGrid", f"Error extracting visibility controller layers: {e}")
+
+    return layer_map
+
+
 def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
     """Return the materials file path taking linked-materials mode into account.
 
@@ -170,7 +237,17 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 log.info("Import", f"Cached {len(_imported_sampler_defs_cache)} sampler defs for export")
             
             # Import into Blender
-            self.import_mapgeo(context, mapgeo)
+            imported_materials = self.import_mapgeo(context, mapgeo)
+
+            # Post-import refresh: rebuild League material previews from stored
+            # samplers/parameters/techniques for consistent final state.
+            try:
+                from . import material_editor_ui as mat_ui
+                refreshed = mat_ui.refresh_league_materials(imported_materials)
+                if refreshed:
+                    log.info("Material", f"Refreshed {refreshed} League materials after import")
+            except Exception as e:
+                log.warning("Material", f"Post-import material refresh skipped: {e}")
             
             # Update visibility based on current dragon/baron layer filters
             try:
@@ -756,6 +833,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Finalize texture packing (batch operation for performance)
         if material_loader and hasattr(material_loader, 'tex_converter'):
             material_loader.tex_converter.pack_all_images()
+
+        # Return imported materials so caller can run post-import refresh/update.
+        return list(materials.values())
             
     def import_bucket_grids(self, context, parent_collection, collection_name, mapgeo):
         """
@@ -889,7 +969,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             obj["is_disabled"] = grid.is_disabled
             obj["flags"] = grid.flags
             if grid.unknown_v18_float is not None:
-                obj["unknown_v18_float"] = grid.unknown_v18_float
+                # Store as hex string (interpreting float bytes as uint32)
+                import struct
+                float_bytes = struct.pack('<f', grid.unknown_v18_float)
+                uint_value = struct.unpack('<I', float_bytes)[0]
+                obj["unknown_v18_float"] = f"{uint_value:08X}"
             
             # Store face visibility flags if present
             if grid.face_visibility_flags:
@@ -909,7 +993,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 "buckets_per_side": grid.buckets_per_side,
                 "is_disabled": grid.is_disabled,
                 "flags": grid.flags,
-                "unknown_v18_float": grid.unknown_v18_float,
+                "unknown_v18_float": f"{struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]:08X}" if grid.unknown_v18_float is not None else "00000000",
                 "max_stickout_x": grid.max_stickout_x,
                 "max_stickout_z": grid.max_stickout_z,
                 "vertices": [(v[0], v[1], v[2]) for v in grid.vertices],

@@ -9,6 +9,7 @@ import os
 import math
 import tempfile
 from typing import Optional
+import bpy
 
 # Late-import helper to avoid circular dependency at module load time
 def _log():
@@ -18,10 +19,17 @@ def _log():
 
 def _is_debug_enabled():
     """Check if debug logging is enabled in mapgeo settings."""
-    import bpy
     if hasattr(bpy.context, 'scene') and hasattr(bpy.context.scene, 'mapgeo_settings'):
         return bpy.context.scene.mapgeo_settings.debug_logging
     return False
+
+
+def _should_defer_packing():
+    """
+    Check if deferred packing is safe for this Blender version.
+    Blender 5.1.0+ has issues with deferred image packing causing hangs.
+    """
+    return bpy.app.version < (5, 1, 0)
 
 
 class TexConverter:
@@ -45,12 +53,15 @@ class TexConverter:
         Args:
             tex_path:   Absolute path to the ``.tex`` file.
             image_name: Optional display name; defaults to the file basename.
-            defer_packing: If True, defer image packing for batch operation (faster). Default True.
+            defer_packing: If True, defer image packing for batch operation (faster). 
+                          Automatically disabled for Blender 5.1+ due to hangs.
 
         Returns:
             ``bpy.types.Image`` on success, ``None`` on failure.
         """
-        import bpy
+        # Override defer_packing for Blender 5.1+ to avoid hangs
+        if not _should_defer_packing():
+            defer_packing = False
 
         tex_path = os.path.normpath(os.path.abspath(tex_path))
 
@@ -159,8 +170,13 @@ class TexConverter:
         Pack all deferred images in a single batch operation, then clean up temp files.
         Call this after loading all textures to finalize them.
         Significantly faster than packing each image individually.
+        
+        Note: Deferred packing is automatically disabled in Blender 5.1+ due to hangs,
+        so this method may have no images to pack in those versions.
         """
         if not self._unpacked_images:
+            if _is_debug_enabled():
+                print(f"  [Texture] No unpacked images to process")
             return
         
         packed_count = 0
@@ -274,10 +290,9 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
     """
     original_texture_path = texture_path
 
-    # Remove "ASSETS/" prefix if present
-    if texture_path.startswith("ASSETS/"):
-        texture_path = texture_path[7:]
-    elif texture_path.startswith("ASSETS\\"):
+    # Remove "ASSETS/" prefix if present (case-insensitive — custom maps may use lowercase)
+    upper_path = texture_path.upper()
+    if upper_path.startswith("ASSETS/") or upper_path.startswith("ASSETS\\"):
         texture_path = texture_path[7:]
     
     # Convert to OS-specific path separators
@@ -297,6 +312,13 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
             folders.append(assets_folder)
         if custom_assets_folder:
             folders.append(custom_assets_folder)
+    
+    # Add LeagueShaderTextures\assets as fallback for shader standard textures
+    # These are textures used by default in shaders but not included in map assets
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    shader_textures_folder = os.path.join(addon_dir, "LeagueShaderTextures", "assets")
+    if os.path.exists(shader_textures_folder):
+        folders.append(shader_textures_folder)
     
     attempted_paths = []
 

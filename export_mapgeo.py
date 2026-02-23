@@ -11,6 +11,7 @@ from mathutils import Vector, Matrix
 import struct
 import os
 import json
+import re
 
 from . import mapgeo_parser
 from . import utils
@@ -715,49 +716,11 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             # Reconstruct BucketGrid objects from stored JSON data
             for grid_data in bucket_grids_data:
-                try:
-                    grid = mapgeo_parser.BucketGrid()
-                    grid.path_hash = grid_data.get("path_hash", 0)
-                    grid.min_x = grid_data.get("min_x", 0.0)
-                    grid.min_z = grid_data.get("min_z", 0.0)
-                    grid.max_x = grid_data.get("max_x", 0.0)
-                    grid.max_z = grid_data.get("max_z", 0.0)
-                    grid.bucket_size_x = grid_data.get("bucket_size_x", 512.0)
-                    grid.bucket_size_z = grid_data.get("bucket_size_z", 512.0)
-                    grid.buckets_per_side = int(grid_data.get("buckets_per_side", 1))
-                    grid.is_disabled = grid_data.get("is_disabled", False)
-                    grid.flags = int(grid_data.get("flags", 0))
-                    grid.unknown_v18_float = grid_data.get("unknown_v18_float", 0.0)
-                    grid.max_stickout_x = grid_data.get("max_stickout_x", 0.0)
-                    grid.max_stickout_z = grid_data.get("max_stickout_z", 0.0)
-                    
-                    # Restore vertices and indices
-                    grid.vertices = [tuple(v) for v in grid_data.get("vertices", [])]
-                    grid.indices = grid_data.get("indices", [])
-                    grid.face_visibility_flags = grid_data.get("face_visibility_flags", [])
-                    
-                    # Restore buckets
-                    for row_data in grid_data.get("buckets", []):
-                        row = []
-                        for bucket_data in row_data:
-                            bucket = mapgeo_parser.GeometryBucket(
-                                max_stickout_x=float(bucket_data.get("max_stickout_x", 0.0)),
-                                max_stickout_z=float(bucket_data.get("max_stickout_z", 0.0)),
-                                start_index=int(bucket_data.get("start_index", 0)),
-                                base_vertex=int(bucket_data.get("base_vertex", 0)),
-                                inside_face_count=int(bucket_data.get("inside_face_count", 0)),
-                                sticking_out_face_count=int(bucket_data.get("sticking_out_face_count", 0))
-                            )
-                            row.append(bucket)
-                        grid.buckets.append(row)
-                    
+                grid = self._reconstruct_grid_from_json(grid_data)
+                if grid is not None:
                     mapgeo.bucket_grids.append(grid)
                     total_grids += 1
                     print(f"  Exported bucket grid (hash: {hex(grid.path_hash)})")
-                except Exception as e:
-                    print(f"  ERROR reconstructing bucket grid: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
         
         print(f"Total bucket grids exported from scene: {total_grids}")
     
@@ -772,33 +735,290 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         return result
     
     def collect_custom_bucket_grids(self, context, mapgeo: mapgeo_parser.MapgeoFile):
-        """Collect bucket grids from custom-created data (EXPERIMENTAL)"""
+        """Collect bucket grids by merging imported originals with custom replacements.
         
-        custom_bucket_grid_objects = []
+        Strategy:
+        1. Load ALL imported grids from the original bucket_data_json as the base
+        2. Load custom grids from custom bucket grid collections
+        3. Match custom grids to imported grids by identifier (checking BOTH
+           path_hash and unknown_v18_float fields)
+        4. For matches: use custom geometry but preserve original metadata
+           (hash/v18 field assignment, flags, buckets_per_side from original doc)
+        5. For unmatched imported grids: include as-is (preserves master terrain grid etc.)
+        6. For unmatched custom grids: include as new grids
         
-        for obj in context.scene.objects:
-            # Find custom bucket grid meshes
-            if obj.get("is_bucket_grid") and obj.get("is_custom_bucket_grid"):
-                custom_bucket_grid_objects.append(obj)
+        This ensures:
+        - Correct hash / unknown_v18_float field placement (game uses both for lookups)
+        - Correct flags and face_visibility_flags
+        - Original grid count is preserved when possible
+        """
+        scene_col_names = {c.name for c in self._get_all_collections(context)}
         
-        if not custom_bucket_grid_objects:
-            print("No custom bucket grids found")
+        # ── Step 1: Load imported (original) grids as reference ──
+        imported_grids = []  # List of reconstructed BucketGrid from original import
+        imported_grid_ids = {}  # identifier (uint32) → index in imported_grids
+        
+        for col in bpy.data.collections:
+            # Find the IMPORTED bucket grid collection (NOT custom)
+            if (col.get("is_bucket_grid_collection") 
+                and not col.get("is_custom_bucket_grid")
+                and col.get("bucket_data_json")
+                and col.name in scene_col_names):
+                try:
+                    bucket_data_json = col.get("bucket_data_json", "[]")
+                    grids_data = json.loads(bucket_data_json)
+                    print(f"Loaded {len(grids_data)} imported grid(s) from '{col.name}' as reference")
+                    
+                    for grid_data in grids_data:
+                        grid = self._reconstruct_grid_from_json(grid_data)
+                        if grid is None:
+                            continue
+                        
+                        # Determine identifier: non-zero path_hash OR non-zero v18
+                        grid_id = grid.path_hash
+                        if grid_id == 0:
+                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
+                            v18_uint = struct.unpack('<I', v18_bytes)[0]
+                            grid_id = v18_uint  # May be 0 for master grid
+                        
+                        idx = len(imported_grids)
+                        imported_grids.append(grid)
+                        if grid_id != 0:
+                            imported_grid_ids[grid_id] = idx
+                        else:
+                            # Master grid (both hash and v18 are 0)
+                            imported_grid_ids[0] = idx
+                        
+                        v18_bytes = struct.pack('<f', grid.unknown_v18_float)
+                        v18_uint = struct.unpack('<I', v18_bytes)[0]
+                        print(f"  Imported grid: hash={grid.path_hash:08X} v18={v18_uint:08X} "
+                              f"flags={grid.flags} fvf={len(grid.face_visibility_flags)} "
+                              f"bps={grid.buckets_per_side} verts={len(grid.vertices)}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"  ERROR parsing imported bucket_data_json: {e}")
+        
+        if not imported_grids:
+            print("WARNING: No imported grids found as reference. Custom grids will export without metadata merging.")
+        
+        # ── Step 2: Load custom grids ──
+        custom_grids = []  # List of (identifier, BucketGrid)
+        
+        for col in bpy.data.collections:
+            if (col.get("is_custom_bucket_grid") 
+                and col.get("bucket_data_json")
+                and col.name in scene_col_names):
+                try:
+                    bucket_data_json = col.get("bucket_data_json", "[]")
+                    grids_data = json.loads(bucket_data_json)
+                    
+                    for grid_data in grids_data:
+                        grid = self._reconstruct_grid_from_json(grid_data)
+                        if grid is None:
+                            continue
+                        # Custom grids store their identifier in path_hash
+                        custom_grids.append((grid.path_hash, grid))
+                        print(f"  Custom grid: hash={grid.path_hash:08X} "
+                              f"bps={grid.buckets_per_side} verts={len(grid.vertices)} idx={len(grid.indices)}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"  ERROR parsing custom bucket_data_json: {e}")
+        
+        if not custom_grids:
+            print("No custom bucket grid collections found")
+            # Still export imported grids as fallback
+            for grid in imported_grids:
+                mapgeo.bucket_grids.append(grid)
+            print(f"Exported {len(imported_grids)} imported grids (no custom replacements)")
             return
         
-        print(f"Found {len(custom_bucket_grid_objects)} custom bucket grid mesh(es)")
-        print("WARNING: Custom bucket grids are EXPERIMENTAL and untested in-game!")
+        print(f"Found {len(custom_grids)} custom grid(s), {len(imported_grids)} imported grid(s)")
         
-        # Convert custom bucket grids to BucketGrid data structures
-        for grid_obj in custom_bucket_grid_objects:
-            try:
-                bucket_grid = self.bucket_grid_from_object(grid_obj)
-                if bucket_grid:
-                    mapgeo.bucket_grids.append(bucket_grid)
-                    print(f"  Exported custom bucket grid: {grid_obj.name}")
-            except Exception as e:
-                print(f"  ERROR exporting bucket grid {grid_obj.name}: {str(e)}")
-                import traceback
-                traceback.print_exc()
+        # ── Step 3: Merge - imported grids as base, custom grids as overrides ──
+        matched_imported = set()   # Indices of imported grids that got replaced
+        matched_custom = set()     # Indices of custom grids that replaced an import
+        
+        # Build custom grid lookup: identifier → list of (custom_idx, grid)
+        custom_by_id = {}
+        for ci, (cid, cgrid) in enumerate(custom_grids):
+            if cid not in custom_by_id:
+                custom_by_id[cid] = []
+            custom_by_id[cid].append((ci, cgrid))
+        
+        total_grids = 0
+        
+        # Process each imported grid in order (preserves original grid ordering)
+        for ii, igrid in enumerate(imported_grids):
+            # Determine identifier from original
+            orig_id = igrid.path_hash
+            if orig_id == 0:
+                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
+                orig_id = struct.unpack('<I', v18_bytes)[0]
+            
+            # Master grid (both hash=0 and v18=0, flags=1) contains ALL scene
+            # geometry with per-face visibility flags.  The custom grid system
+            # can't replicate this because it splits by layer → keep original.
+            is_master_grid = (igrid.path_hash == 0 
+                              and struct.unpack('<I', struct.pack('<f', igrid.unknown_v18_float))[0] == 0
+                              and igrid.flags & 1)
+            
+            if is_master_grid:
+                mapgeo.bucket_grids.append(igrid)
+                matched_imported.add(ii)
+                total_grids += 1
+                # Also consume the custom hash=0 grid so it isn't added as extra
+                for ci, cgrid in custom_by_id.get(0, []):
+                    if ci not in matched_custom:
+                        matched_custom.add(ci)
+                        print(f"  KEPT original master grid: hash=00000000 v18=00000000 "
+                              f"flags={igrid.flags} bps={igrid.buckets_per_side} "
+                              f"verts={len(igrid.vertices)} idx={len(igrid.indices)} "
+                              f"fvf={len(igrid.face_visibility_flags)} "
+                              f"(custom hash=00000000 grid discarded)")
+                        break
+                else:
+                    print(f"  KEPT original master grid: hash=00000000 v18=00000000 "
+                          f"flags={igrid.flags} bps={igrid.buckets_per_side} "
+                          f"verts={len(igrid.vertices)} idx={len(igrid.indices)} "
+                          f"fvf={len(igrid.face_visibility_flags)}")
+                continue
+            
+            # Look for matching custom grid
+            matching = custom_by_id.get(orig_id, [])
+            # Use the first unmatched custom grid for this identifier
+            custom_match = None
+            custom_match_idx = None
+            for ci, cgrid in matching:
+                if ci not in matched_custom:
+                    custom_match = cgrid
+                    custom_match_idx = ci
+                    break
+            
+            if custom_match is not None:
+                # ── MERGE: custom geometry + original metadata ──
+                merged = mapgeo_parser.BucketGrid()
+                
+                # PRESERVE original field assignment (critical for game lookups)
+                merged.path_hash = igrid.path_hash
+                merged.unknown_v18_float = igrid.unknown_v18_float
+                
+                # Use custom geometry bounds
+                merged.min_x = custom_match.min_x
+                merged.min_z = custom_match.min_z
+                merged.max_x = custom_match.max_x
+                merged.max_z = custom_match.max_z
+                merged.max_stickout_x = custom_match.max_stickout_x
+                merged.max_stickout_z = custom_match.max_stickout_z
+                merged.bucket_size_x = custom_match.bucket_size_x
+                merged.bucket_size_z = custom_match.bucket_size_z
+                merged.buckets_per_side = custom_match.buckets_per_side
+                merged.is_disabled = custom_match.is_disabled
+                
+                # PRESERVE original flags
+                merged.flags = igrid.flags
+                
+                # Custom geometry
+                merged.vertices = custom_match.vertices
+                merged.indices = custom_match.indices
+                merged.buckets = custom_match.buckets
+                
+                # Generate face_visibility_flags if original had them
+                if igrid.flags & 1:
+                    face_count = len(merged.indices) // 3
+                    # Default all faces to 255 (always visible)
+                    merged.face_visibility_flags = [255] * face_count
+                    print(f"  Generated {face_count} face_visibility_flags (all=255) for grid hash={igrid.path_hash:08X}")
+                else:
+                    merged.face_visibility_flags = []
+                
+                mapgeo.bucket_grids.append(merged)
+                matched_imported.add(ii)
+                matched_custom.add(custom_match_idx)
+                total_grids += 1
+                
+                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
+                v18_uint = struct.unpack('<I', v18_bytes)[0]
+                print(f"  MERGED grid: hash={merged.path_hash:08X} v18={v18_uint:08X} "
+                      f"flags={merged.flags} bps={merged.buckets_per_side} "
+                      f"verts={len(merged.vertices)} idx={len(merged.indices)} "
+                      f"(custom replaced imported)")
+            else:
+                # ── No custom replacement: use imported grid as-is ──
+                mapgeo.bucket_grids.append(igrid)
+                matched_imported.add(ii)
+                total_grids += 1
+                
+                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
+                v18_uint = struct.unpack('<I', v18_bytes)[0]
+                print(f"  KEPT imported grid: hash={igrid.path_hash:08X} v18={v18_uint:08X} "
+                      f"flags={igrid.flags} bps={igrid.buckets_per_side} "
+                      f"verts={len(igrid.vertices)} idx={len(igrid.indices)}")
+        
+        # Skip extra custom grids that didn't match any imported grid.
+        # The game expects exactly the grids from the original file — adding
+        # unrecognised grids with unknown hash/v18 placement causes crashes.
+        skipped = 0
+        for ci, (cid, cgrid) in enumerate(custom_grids):
+            if ci not in matched_custom:
+                skipped += 1
+                print(f"  SKIPPED extra custom grid: hash={cid:08X} "
+                      f"bps={cgrid.buckets_per_side} "
+                      f"verts={len(cgrid.vertices)} idx={len(cgrid.indices)} "
+                      f"(no matching imported grid — would create unknown entry)")
+        
+        print(f"Total bucket grids exported: {total_grids} "
+              f"(merged={len(matched_custom)}, kept={len(imported_grids) - len(matched_custom)}, "
+              f"skipped={skipped})")
+    
+    def _reconstruct_grid_from_json(self, grid_data):
+        """Reconstruct a BucketGrid object from stored JSON data."""
+        try:
+            grid = mapgeo_parser.BucketGrid()
+            grid.path_hash = grid_data.get("path_hash", 0)
+            grid.min_x = grid_data.get("min_x", 0.0)
+            grid.min_z = grid_data.get("min_z", 0.0)
+            grid.max_x = grid_data.get("max_x", 0.0)
+            grid.max_z = grid_data.get("max_z", 0.0)
+            grid.bucket_size_x = grid_data.get("bucket_size_x", 512.0)
+            grid.bucket_size_z = grid_data.get("bucket_size_z", 512.0)
+            grid.buckets_per_side = int(grid_data.get("buckets_per_side", 1))
+            grid.is_disabled = grid_data.get("is_disabled", False)
+            grid.flags = int(grid_data.get("flags", 0))
+            
+            # unknown_v18_float is stored as hex string, convert back to float
+            unknown_v18_str = grid_data.get("unknown_v18_float", "00000000")
+            if isinstance(unknown_v18_str, str):
+                uint_value = int(unknown_v18_str, 16)
+                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', uint_value))[0]
+            else:
+                grid.unknown_v18_float = float(unknown_v18_str)
+            grid.max_stickout_x = grid_data.get("max_stickout_x", 0.0)
+            grid.max_stickout_z = grid_data.get("max_stickout_z", 0.0)
+            
+            # Restore vertices and indices
+            grid.vertices = [tuple(v) for v in grid_data.get("vertices", [])]
+            grid.indices = grid_data.get("indices", [])
+            grid.face_visibility_flags = grid_data.get("face_visibility_flags", [])
+            
+            # Restore bucket structure
+            for row_data in grid_data.get("buckets", []):
+                row = []
+                for bucket_data in row_data:
+                    bucket = mapgeo_parser.GeometryBucket(
+                        max_stickout_x=float(bucket_data.get("max_stickout_x", 0.0)),
+                        max_stickout_z=float(bucket_data.get("max_stickout_z", 0.0)),
+                        start_index=int(bucket_data.get("start_index", 0)),
+                        base_vertex=int(bucket_data.get("base_vertex", 0)),
+                        inside_face_count=int(bucket_data.get("inside_face_count", 0)),
+                        sticking_out_face_count=int(bucket_data.get("sticking_out_face_count", 0))
+                    )
+                    row.append(bucket)
+                grid.buckets.append(row)
+            
+            return grid
+        except Exception as e:
+            print(f"  ERROR reconstructing grid: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def bucket_grid_from_object(self, obj):
         """Convert a custom bucket grid object back to BucketGrid data structure"""
@@ -807,18 +1027,33 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         
         # Retrieve metadata
         grid.min_x = obj.get("bounds_min_x", 0.0)
-        grid.min_z = obj.get("bounds_min_y", 0.0)  # Note: Y in Blender is Z in mapgeo
+        grid.min_z = obj.get("bounds_min_z", 0.0)
         grid.max_x = obj.get("bounds_max_x", 0.0)
-        grid.max_z = obj.get("bounds_max_y", 0.0)
+        grid.max_z = obj.get("bounds_max_z", 0.0)
         grid.bucket_size_x = obj.get("bucket_size_x", 512.0)
         grid.bucket_size_z = obj.get("bucket_size_z", 512.0)
         grid.buckets_per_side = int(obj.get("buckets_per_side", 1))
         grid.path_hash = int(obj.get("path_hash", "00000000"), 16) if isinstance(obj.get("path_hash"), str) else int(obj.get("path_hash", 0))
-        grid.unknown_v18_float = obj.get("unknown_v18_float", 0.0)
+        
+        # unknown_v18_float is stored as hex string, convert back to float
+        unknown_v18_str = obj.get("unknown_v18_float", "00000000")
+        if isinstance(unknown_v18_str, str):
+            uint_value = int(unknown_v18_str, 16)
+            grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', uint_value))[0]
+        else:
+            grid.unknown_v18_float = float(unknown_v18_str)
         grid.is_disabled = obj.get("is_disabled", False)
         grid.flags = int(obj.get("flags", 0))
         grid.max_stickout_x = obj.get("stickout_x", 0.0)
         grid.max_stickout_z = obj.get("stickout_z", 0.0)
+
+        if grid.path_hash == 0:
+            name_match = re.match(r"BucketGrid_([0-9A-Fa-f]{8})", obj.name)
+            if name_match:
+                try:
+                    grid.path_hash = int(name_match.group(1), 16)
+                except ValueError:
+                    pass
         
         # Ensure buckets_per_side is valid for ushort
         if grid.buckets_per_side > 65535:
@@ -844,14 +1079,28 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         
         # Get indices - they should be triangulated
         grid.indices = []
+        max_vertex_idx = 0
         for poly in mesh.polygons:
             if len(poly.vertices) == 3:
-                for vert_idx in poly.vertices:
+                v0, v1, v2 = poly.vertices[0], poly.vertices[1], poly.vertices[2]
+                for vert_idx in (v0, v1, v2):
+                    max_vertex_idx = max(max_vertex_idx, vert_idx)
                     if vert_idx > 65535:
-                        print(f"WARNING: Vertex index {vert_idx} exceeds ushort max in bucket grid {obj.name}")
-                    grid.indices.append(min(vert_idx, 65535))
+                        print(f"WARNING: Vertex index {vert_idx} in {obj.name} exceeds ushort max (65535)")
+                        print(f"  → This bucket grid has {len(mesh.vertices)} total vertices (limit: 65535)")
+                        print(f"  → Consider reducing bucket size or splitting mesh by visibility_layer")
+                # Reverse winding to account for Y/Z swap handedness
+                grid.indices.extend([
+                    min(v0, 65535),
+                    min(v2, 65535),
+                    min(v1, 65535),
+                ])
             else:
                 print(f"WARNING: Non-triangle face in bucket grid {obj.name}")
+        
+        if max_vertex_idx > 65535:
+            print(f"  → Max vertex index was {max_vertex_idx}, clamped indices to 65535")
+            print(f"  → Exported grid may have visual/structural issues in-game")
         
         # Reconstruct bucket data from stored JSON
         bucket_data_json = obj.get("bucket_data")

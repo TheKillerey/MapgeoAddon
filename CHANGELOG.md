@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.2.6] - 2026-02-23
+
+### 🪣 Bucket Grid Export Overhaul
+- **Merge-based export pipeline** — CUSTOM bucket grid export now follows a 3-step Load Imported → Load Custom → Merge workflow, preserving original grid ordering and metadata
+- **Fixed hash/v18 field placement** — Original file stores identifiers in either `path_hash` or `unknown_v18_float`; export now preserves the correct field assignment for each grid (game uses both for lookups)
+- **Master grid preservation** — The master grid (hash=0, v18=0, flags=1) containing all scene geometry with per-face visibility flags is kept from the original import, since the custom system can't replicate it
+- **Face visibility flags** — Auto-generates `face_visibility_flags` (default 255 = always visible) for custom grids replacing originals that had `flags=1`
+- **Extra grid filtering** — Custom grids with no matching imported grid are now skipped to prevent game crashes from unknown hash entries
+- **Shared `_reconstruct_grid_from_json()`** — Refactored both import and custom export paths to use a common JSON→BucketGrid reconstruction method
+
+### 🪣 Bucket Grid Generation Improvements
+- **Per-hash-type grouping** — Bucket grids created separately per render region, baron hash, and visibility layer, matching Riot's grouping
+- **Riot-style per-bucket vertex subsets** — Each bucket owns a contiguous vertex slice with `base_vertex`; local indices always fit in ushort
+- **Centroid-based face assignment** — Faces assigned to one bucket based on centroid with stickout tracking for faces extending beyond their home bucket
+- **Visibility controller layer→hash mapping** — Loads `materials.bin` to extract layer→hash mappings via `BaronHashParser`
+- **3D bounding box visualization** — Bucket grid bounding boxes now display as full 3D volumes
+- **Height range clamping** and **max grid size cap** to prevent freezes on large maps
+- **Bush/fog/sun mesh filtering** — Irrelevant meshes are skipped during bucket grid creation
+
+### 🎨 Material Editor — Shader Preview Rewrite
+- **Full shader preview system** (`_rebuild_shader_preview_nodes`) — Clears and rebuilds node graph per shader category, preserving loaded images
+- **20+ shader classifications** — Glass, emissive/glow, water/flow, hologram, alpha_test, foliage, multi-layer, indicator, scrolling, twist, transition, cloth, flipbook, ocean, gradient_color, faelights, and more
+- **Category-specific node builders** — Water (transparent+Fresnel), glass (dual-color Fresnel), hologram, pure emissive, fae lights, gradient color (UV-based with ColorRamp)
+- **Smart diffuse identification** — 3-pass diffuse sampler detection that skips shader template textures
+- **Emissive sampler detection** — Emission params only applied when a real emissive texture sampler is present
+- **Comprehensive texture wiring** — Normal maps, reflection/specular, noise/scrolling, flow maps (R=dirX, G=dirY, B=mask), thickness/deformation masks, emission masks
+- **VertexDeform grass tint map** — World-space UV overlay for `USE_GRASS_TINT_MAP`
+- **Full parameter application** — TintColor, glass colors, hologram params, glow/emission, water colors/flow/fresnel/opacity, alpha test, planar reflection, shadow color, and more
+- **Parameter-only update mode** — Updates material params without rebuilding the entire node graph
+- **Blend mode configuration** — Correct Blender blend/render mode: premultiplied alpha → DITHERED, standard alpha → BLENDED, with backface culling control
+
+### 🔧 Material Loader
+- **Hashed material key resolution** — Supports `0x0221ffad = StaticMaterialDef {}` format; extracts real name from `name` field inside material data
+- **New shader builders** — `DefaultEnv_Glow`, `GradientColor`, `Water`, `Ocean` (diffuse + noise Screen blend), `Twist` (noise-driven UV distortion)
+- **Emission color support** — Handles `EMISSION_EmissionColor`, `EmissionColor`, `FLOW_Color` when emissive texture sampler is present
+- **Starting_Color / ShadowColor support** — Color fallback for base color and shadow tint blending
+
+### 🔧 Other Fixes
+- **Blender 5.1+ deferred packing fix** — Deferred image packing auto-disabled for Blender 5.1.0+ to avoid hangs
+- **Case-insensitive ASSETS/ prefix** — Custom maps using lowercase `assets/` prefix now handled correctly
+- **Shader texture fallback folder** — `LeagueShaderTextures/assets` added as fallback for shader standard textures
+- **Emission strength default** — Emission Strength on new Principled BSDF nodes explicitly set to 0.0 to prevent unwanted glow
+- **Visibility controller extraction** — New `_extract_visibility_controller_layers()` for layer→hash mappings from `materials.bin`
+
 ## [0.2.5] - 2026-02-21
 
 ### 🔍 Centralized Debug System

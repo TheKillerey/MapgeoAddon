@@ -18,6 +18,31 @@ def _log():
     return get_debug_log()
 
 
+def _fnv1a_32(s: str) -> int:
+    """Compute FNV-1a 32-bit hash (lowercase). Used by League .bin files for path hashing."""
+    s = s.lower()
+    h = 0x811c9dc5
+    for c in s:
+        h ^= ord(c)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _is_hash_key(key: str) -> bool:
+    """Check if a dictionary key is a hash (e.g. '0x0221ffad' or '{c406a533}')."""
+    if not key:
+        return False
+    if key.startswith('0x') and len(key) == 10:
+        try:
+            int(key, 16)
+            return True
+        except ValueError:
+            return False
+    if key.startswith('{') and key.endswith('}') and len(key) == 10:
+        return True
+    return False
+
+
 class MaterialLoader:
     """Loads and creates Blender materials from League materials JSON or Python format"""
     
@@ -252,6 +277,7 @@ class MaterialLoader:
                 data = json.load(f)
             
             # Iterate through all entries and find StaticMaterialDef
+            hash_resolved = 0
             for key, value in data.items():
                 if isinstance(value, dict) and value.get("__type") == "StaticMaterialDef":
                     # Normalize: extract shader/blend/cull from techniques into top-level keys
@@ -285,8 +311,21 @@ class MaterialLoader:
                                     switches_dict[sw_name] = sw_on
                         value['switches'] = switches_dict
                     
-                    materials[key] = value
+                    # Resolve hashed keys: if key is a hash like "0x0221ffad",
+                    # use the 'name' field inside the material data as the real key
+                    mat_key = key
+                    if _is_hash_key(key):
+                        inner_name = value.get('name', '')
+                        if inner_name:
+                            mat_key = inner_name
+                            hash_resolved += 1
+                        # Also store under hash key for fallback
+                        materials[key] = value
+                    
+                    materials[mat_key] = value
             
+            if hash_resolved:
+                _log().info("Material", f"Resolved {hash_resolved} hashed material name(s)")
             _log().info("Material", f"Loaded {len(materials)} static materials from {os.path.basename(json_path)}")
             return materials
         
@@ -346,13 +385,20 @@ class MaterialLoader:
                 return blocks
 
             # Find all StaticMaterialDef blocks
+            # Match both quoted names: "Material/Path" = StaticMaterialDef {
+            # AND hashed keys:        0x0221ffad = StaticMaterialDef {
             mat_pattern = re.compile(
-                r'"([^"]+)"\s*=\s*StaticMaterialDef\s*\{',
+                r'(?:"([^"]+)"|((0x[0-9a-fA-F]{8})))\s*=\s*StaticMaterialDef\s*\{',
                 re.MULTILINE
             )
             
+            hash_resolved = 0
             for match in mat_pattern.finditer(content):
-                mat_name = match.group(1)
+                mat_name = match.group(1)  # Quoted name
+                hash_key = match.group(2)  # Hex hash key (e.g. 0x0221ffad)
+                is_hashed = mat_name is None
+                if is_hashed:
+                    mat_name = hash_key  # Temporary — will extract real name from body
                 start_pos = match.end()
                 
                 # Find matching closing brace
@@ -531,8 +577,21 @@ class MaterialLoader:
                             sw_on = sw_on_m.group(1) == 'true'
                         mat_data['switches'][sw_name_m.group(1)] = sw_on
                 
+                # For hashed keys, extract the real name from the body
+                if is_hashed:
+                    name_in_body = re.search(r'name:\s*string\s*=\s*"([^"]+)"', body)
+                    if name_in_body:
+                        real_name = name_in_body.group(1)
+                        mat_data['name'] = real_name
+                        # Store under both hash key (fallback) and real name (primary)
+                        materials[hash_key] = mat_data
+                        mat_name = real_name
+                        hash_resolved += 1
+                
                 materials[mat_name] = mat_data
             
+            if hash_resolved:
+                _log().info("Material", f"Resolved {hash_resolved} hashed material name(s) from .py")
             _log().info("Material", f"Loaded {len(materials)} static materials from {os.path.basename(py_path)}")
             return materials
         
@@ -1095,6 +1154,7 @@ class MaterialLoader:
         bsdf_node.location = (300, 0)
         bsdf_node.inputs['IOR'].default_value = 1.0
         bsdf_node.inputs['Roughness'].default_value = 1.0
+        bsdf_node.inputs['Emission Strength'].default_value = 0.0
         
         links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
         
@@ -1158,23 +1218,37 @@ class MaterialLoader:
             bl_mat["child_techniques"] = json.dumps(child_techniques)
         
         # --- Dispatch to shader-specific builder ---
-        if shader_name in ('ENV_Glass', 'ENV_Glass_Vertex_Offset', 'ENV_Glass_Diffuse'):
+        if shader_name in ('ENV_Glass', 'ENV_Glass_Vertex_Offset', 'ENV_Glass_Diffuse',
+                           'DefaultEnv_Glass_BlendAndReflection'):
             self._build_glass_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         elif shader_name in ('ENV_GlowSign', 'ENV_GlowSign_Atlas'):
             self._build_glow_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name in ('DefaultEnv_Glow',):
+            self._build_defaultenv_glow(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         elif shader_name in ('Emissive_Basic',):
             self._build_emissive_basic(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         elif shader_name in ('Hologram', 'Hologram_Rotate'):
             self._build_hologram_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         elif shader_name == 'Indicator_Faelights':
             self._build_faelights_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name == 'ENV_UVGradientColorMapping':
+            self._build_gradient_color(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name in ('Flowmap_River', 'FlowMap_Radial', 'OD_FlowMap',
+                              'TFT_Water', 'TFT_Env_Rain'):
+            self._build_water_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data,
+                                      lightmap_texture, lightmap_color_scale, has_baked_lighting)
+        elif shader_name == 'SRX_Blend_Ocean':
+            self._build_ocean_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data,
+                                      lightmap_texture, lightmap_color_scale, has_baked_lighting)
+        elif shader_name in ('Env_TwistByNoise', 'TFT_TwistByNoise'):
+            self._build_twist_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         elif shader_name == 'DefaultEnv_Flat_BakedTerrain':
             self._build_baked_terrain(bl_mat, nodes, links, bsdf_node, output_node, mat_data,
                                      lightmap_texture, lightmap_color_scale, has_baked_lighting,
                                      baked_paint_scale, baked_paint_bias)
         elif shader_name == 'DefaultEnv_Metal':
             self._build_metal_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
-        elif shader_name == 'DefaultEnv_Flat_PlanarReflection':
+        elif shader_name in ('DefaultEnv_Flat_PlanarReflection', 'TFT_PlanarReflection'):
             self._build_planar_reflection(bl_mat, nodes, links, bsdf_node, output_node, mat_data,
                                           lightmap_texture, lightmap_color_scale, has_baked_lighting)
         elif shader_name == '4TextureBlend_WorldProjected':
@@ -1229,6 +1303,568 @@ class MaterialLoader:
     # Shader-specific builders
     # =========================================================================
     
+    def _build_defaultenv_glow(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        DefaultEnv_Glow: Diffuse + Mask → animated glow overlay.
+        
+        Samplers: Diffuse_Texture, Mask_Texture
+        Key params: Glow_Color, Bloom_Factor, Diffuse_Color, UV_Glow_Opacity
+        The mask texture alpha drives glow intensity, colored by Glow_Color.
+        """
+        # Load diffuse
+        diffuse_path = self._get_sampler_path(mat_data, 'Diffuse_Texture')
+        diffuse_sampler = self._get_sampler_data(mat_data, 'Diffuse_Texture')
+        diffuse_ext = 'CLIP' if self._sampler_needs_clip(diffuse_sampler) else 'REPEAT'
+        diffuse_node = None
+        if diffuse_path:
+            diffuse_node = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap", diffuse_ext)
+            if diffuse_node:
+                diffuse_node.location = (-700, 300)
+        
+        if diffuse_ext == 'CLIP':
+            bl_mat.surface_render_method = 'BLENDED'
+        
+        # Diffuse_Color multiplier (default white = no change)
+        diffuse_color = self._get_param(mat_data, 'Diffuse_Color', [1.0, 1.0, 1.0, 1.0])
+        
+        if diffuse_node:
+            is_white = all(abs(c - 1.0) < 0.01 for c in diffuse_color[:3])
+            if not is_white:
+                # Multiply diffuse by Diffuse_Color
+                diff_tint = nodes.new('ShaderNodeMix')
+                diff_tint.data_type = 'RGBA'
+                diff_tint.blend_type = 'MULTIPLY'
+                diff_tint.location = (-400, 300)
+                diff_tint.inputs['Factor'].default_value = 1.0
+                diff_tint.label = "Diffuse × Color"
+                links.new(diffuse_node.outputs['Color'], diff_tint.inputs[6])
+                diff_tint.inputs[7].default_value = (diffuse_color[0], diffuse_color[1], diffuse_color[2], 1.0)
+                links.new(diff_tint.outputs[2], bsdf_node.inputs['Base Color'])
+            else:
+                links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+            links.new(diffuse_node.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+        
+        # Load mask texture (glow mask)
+        mask_path = self._get_sampler_path(mat_data, 'Mask_Texture')
+        if mask_path:
+            mask_node = self._load_texture_node(bl_mat, nodes, links, mask_path, "UVMap")
+            if mask_node:
+                mask_node.location = (-700, -100)
+                if mask_node.image:
+                    mask_node.image.colorspace_settings.name = 'Non-Color'
+                
+                # Glow parameters
+                glow_color = self._get_param(mat_data, 'Glow_Color', [0.451, 0.526, 0.741, 1.0])
+                bloom_factor = self._get_param(mat_data, 'Bloom_Factor', [1.0])
+                uv_glow_opacity = self._get_param(mat_data, 'UV_Glow_Opacity', [1.0])
+                
+                # Mask × Glow_Color → Emission
+                glow_mix = nodes.new('ShaderNodeMix')
+                glow_mix.data_type = 'RGBA'
+                glow_mix.blend_type = 'MULTIPLY'
+                glow_mix.location = (-400, -100)
+                glow_mix.inputs['Factor'].default_value = 1.0
+                glow_mix.label = "Mask × Glow Color"
+                links.new(mask_node.outputs['Color'], glow_mix.inputs[6])
+                glow_mix.inputs[7].default_value = (glow_color[0], glow_color[1], glow_color[2], 1.0)
+                
+                links.new(glow_mix.outputs[2], bsdf_node.inputs['Emission Color'])
+                
+                # Emission strength = Bloom_Factor × UV_Glow_Opacity
+                strength = (bloom_factor[0] if bloom_factor else 1.0) * (uv_glow_opacity[0] if uv_glow_opacity else 1.0)
+                bsdf_node.inputs['Emission Strength'].default_value = min(strength, 10.0)
+        else:
+            # No mask → use Glow_Color as flat emission
+            glow_color = self._get_param(mat_data, 'Glow_Color', [0.451, 0.526, 0.741, 1.0])
+            bloom_factor = self._get_param(mat_data, 'Bloom_Factor', [1.0])
+            bsdf_node.inputs['Emission Color'].default_value = (glow_color[0], glow_color[1], glow_color[2], 1.0)
+            bsdf_node.inputs['Emission Strength'].default_value = bloom_factor[0] if bloom_factor else 1.0
+    
+    def _build_gradient_color(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        ENV_UVGradientColorMapping: No textures, UV-based gradient between two colors.
+        
+        Uses UV.y (or UV.x with USE_HORIZONTAL_GRADIENT) to blend ColorTop → ColorBottom.
+        Fresnel-based alpha with Alpha_Bias + Alpha_Intensity.
+        Optional specular highlight.
+        """
+        color_top = self._get_param(mat_data, 'ColorTop', [0.702, 0.682, 0.769, 1.0])
+        color_bottom = self._get_param(mat_data, 'ColorBottom', [0.298, 0.314, 0.529, 1.0])
+        remap = self._get_param(mat_data, 'Remap_Gradient', [0.0, 1.0])
+        alpha_fresnel = self._get_param(mat_data, 'Alph_Fresnel_Size', [4.0])
+        alpha_bias = self._get_param(mat_data, 'Alpha_Bias', [0.9])
+        alpha_intensity = self._get_param(mat_data, 'Alpha_Intensity', [1.0])
+        spec_size = self._get_param(mat_data, 'Specular_Highlight_Size', [48.0])
+        spec_intensity = self._get_param(mat_data, 'Specular_Intensity', [0.16])
+        
+        switches = mat_data.get('switches', {})
+        use_horizontal = switches.get('USE_HORIZONTAL_GRADIENT', False)
+        use_alpha = switches.get('USE_ALPHA', False)
+        use_spec = switches.get('USE_SPEC', False)
+        
+        # TexCoord → Separate XYZ → use Y (or X) as gradient factor
+        tex_coord = nodes.new('ShaderNodeTexCoord')
+        tex_coord.location = (-900, 200)
+        
+        sep_xyz = nodes.new('ShaderNodeSeparateXYZ')
+        sep_xyz.location = (-700, 200)
+        links.new(tex_coord.outputs['UV'], sep_xyz.inputs['Vector'])
+        
+        # Use X for horizontal, Y for vertical gradient
+        gradient_axis = sep_xyz.outputs['X'] if use_horizontal else sep_xyz.outputs['Y']
+        
+        # Map Range to apply Remap_Gradient (min, max)
+        remap_min = remap[0] if remap and len(remap) > 0 else 0.0
+        remap_max = remap[1] if remap and len(remap) > 1 else 1.0
+        
+        if abs(remap_min) > 0.001 or abs(remap_max - 1.0) > 0.001:
+            map_range = nodes.new('ShaderNodeMapRange')
+            map_range.location = (-500, 200)
+            map_range.inputs['From Min'].default_value = remap_min
+            map_range.inputs['From Max'].default_value = remap_max
+            map_range.inputs['To Min'].default_value = 0.0
+            map_range.inputs['To Max'].default_value = 1.0
+            map_range.clamp = True
+            links.new(gradient_axis, map_range.inputs['Value'])
+            gradient_factor = map_range.outputs['Result']
+        else:
+            gradient_factor = gradient_axis
+        
+        # ColorRamp: Bottom color at 0, Top color at 1
+        ramp = nodes.new('ShaderNodeValToRGB')
+        ramp.location = (-300, 200)
+        ramp.color_ramp.elements[0].color = (color_bottom[0], color_bottom[1], color_bottom[2], 1.0)
+        ramp.color_ramp.elements[1].color = (color_top[0], color_top[1], color_top[2], 1.0)
+        links.new(gradient_factor, ramp.inputs['Fac'])
+        
+        links.new(ramp.outputs['Color'], bsdf_node.inputs['Base Color'])
+        
+        # Alpha via Fresnel (if USE_ALPHA)
+        if use_alpha:
+            fresnel = nodes.new('ShaderNodeFresnel')
+            fresnel.location = (-300, -100)
+            fresnel_ior = 1.0 + (alpha_fresnel[0] if alpha_fresnel else 4.0) * 0.1
+            fresnel.inputs['IOR'].default_value = min(fresnel_ior, 3.0)
+            
+            # Fresnel × Alpha_Intensity + Alpha_Bias → Alpha
+            multiply = nodes.new('ShaderNodeMath')
+            multiply.operation = 'MULTIPLY'
+            multiply.location = (-100, -100)
+            multiply.inputs[1].default_value = alpha_intensity[0] if alpha_intensity else 1.0
+            links.new(fresnel.outputs['Fac'], multiply.inputs[0])
+            
+            add_bias = nodes.new('ShaderNodeMath')
+            add_bias.operation = 'ADD'
+            add_bias.location = (50, -100)
+            add_bias.inputs[1].default_value = alpha_bias[0] if alpha_bias else 0.9
+            add_bias.use_clamp = True
+            links.new(multiply.outputs[0], add_bias.inputs[0])
+            
+            links.new(add_bias.outputs[0], bsdf_node.inputs['Alpha'])
+            bl_mat.surface_render_method = 'BLENDED'
+            bl_mat.show_transparent_back = True
+        
+        # Specular (if USE_SPEC)
+        if use_spec:
+            roughness = 1.0 - min((spec_size[0] if spec_size else 48.0) / 128.0, 1.0)
+            bsdf_node.inputs['Roughness'].default_value = max(roughness, 0.05)
+            if 'Specular IOR Level' in bsdf_node.inputs:
+                bsdf_node.inputs['Specular IOR Level'].default_value = spec_intensity[0] if spec_intensity else 0.16
+    
+    def _build_water_shader(self, bl_mat, nodes, links, bsdf_node, output_node,
+                            mat_data, lightmap_texture, lightmap_color_scale, has_baked_lighting):
+        """
+        Water shaders: Flowmap_River, FlowMap_Radial, OD_FlowMap, TFT_Water, TFT_Env_Rain.
+        
+        Creates a water-like Principled BSDF with:
+        - Low roughness, high IOR (1.333)
+        - Water color from params (Color_Outside/Water_Color or diffuse tint)
+        - Diffuse texture if available
+        - Normal map from Flowing_Normal_Map or Normal_Rain_Texture
+        - Alpha for translucency
+        - Transparent mix via Fresnel for realism
+        """
+        shader_name = self._get_shader_short_name(mat_data)
+        
+        # Determine water colors based on shader variant
+        if shader_name == 'Flowmap_River':
+            color_outside = self._get_param(mat_data, 'Color_Outside', [0.15, 0.56, 0.7, 1.0])
+            color_inside = self._get_param(mat_data, 'Color_Inside', [0.44, 0.87, 0.92, 1.0])
+            translucent = self._get_param(mat_data, 'TranslucentControl', [0.74])
+            water_color = color_outside  # Use outside color as base
+            water_alpha = translucent[0] if translucent else 0.74
+        elif shader_name == 'TFT_Water':
+            water_color_param = self._get_param(mat_data, 'Water_Color', [0.02, 0.2, 0.02, 0.54])
+            water_color = water_color_param
+            water_alpha = water_color_param[3] if len(water_color_param) > 3 else 0.54
+        elif shader_name == 'TFT_Env_Rain':
+            tint = self._get_param(mat_data, 'Tint', [0.91, 0.91, 0.91, 1.0])
+            water_color = tint
+            water_alpha = 0.85
+        elif shader_name == 'OD_FlowMap':
+            emissive_color = self._get_param(mat_data, 'Emissive_Color', [0.34, 0.53, 0.65, 1.0])
+            water_color = emissive_color
+            alpha_strength = self._get_param(mat_data, 'Alpha_Strength', [0.6])
+            water_alpha = alpha_strength[0] if alpha_strength else 0.6
+        else:  # FlowMap_Radial
+            alpha_param = self._get_param(mat_data, 'Alpha', [0.445])
+            water_color = [0.2, 0.5, 0.7, 1.0]  # Default blue-ish
+            water_alpha = alpha_param[0] if alpha_param else 0.445
+        
+        # Remove default BSDF, build custom water graph
+        nodes.remove(bsdf_node)
+        
+        # New Principled BSDF for water surface
+        water_bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        water_bsdf.location = (200, 300)
+        water_bsdf.inputs['Base Color'].default_value = (water_color[0], water_color[1], water_color[2], 1.0)
+        water_bsdf.inputs['Roughness'].default_value = 0.05
+        water_bsdf.inputs['IOR'].default_value = 1.333
+        water_bsdf.inputs['Metallic'].default_value = 0.0
+        if 'Specular IOR Level' in water_bsdf.inputs:
+            water_bsdf.inputs['Specular IOR Level'].default_value = 0.8
+        
+        # Transparent BSDF for see-through
+        transparent = nodes.new('ShaderNodeBsdfTransparent')
+        transparent.location = (200, 0)
+        transparent.inputs['Color'].default_value = (water_color[0], water_color[1], water_color[2], 1.0)
+        
+        # Fresnel for water surface blending
+        fresnel = nodes.new('ShaderNodeFresnel')
+        fresnel.location = (0, 150)
+        fresnel.inputs['IOR'].default_value = 1.333
+        
+        # Power node to control fresnel falloff
+        power = nodes.new('ShaderNodeMath')
+        power.operation = 'POWER'
+        power.location = (200, 150)
+        power.inputs[1].default_value = 0.5
+        links.new(fresnel.outputs['Fac'], power.inputs[0])
+        
+        # Mix Shader: Transparent ↔ Water BSDF based on Fresnel
+        mix_shader = nodes.new('ShaderNodeMixShader')
+        mix_shader.location = (500, 200)
+        links.new(power.outputs[0], mix_shader.inputs['Fac'])
+        links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
+        links.new(water_bsdf.outputs['BSDF'], mix_shader.inputs[2])
+        
+        links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
+        
+        # Load diffuse texture (Flowmap_River, FlowMap_Radial, OD_FlowMap, TFT_Env_Rain)
+        diffuse_path = self._get_sampler_path(mat_data, 'Diffuse_Texture')
+        if diffuse_path:
+            diffuse_node = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap")
+            if diffuse_node:
+                diffuse_node.location = (-700, 400)
+                # Mix diffuse color with water base color
+                diff_mix = nodes.new('ShaderNodeMix')
+                diff_mix.data_type = 'RGBA'
+                diff_mix.blend_type = 'MULTIPLY'
+                diff_mix.location = (-100, 400)
+                diff_mix.inputs['Factor'].default_value = 1.0
+                diff_mix.label = "Diffuse × Water Color"
+                links.new(diffuse_node.outputs['Color'], diff_mix.inputs[6])
+                diff_mix.inputs[7].default_value = (water_color[0], water_color[1], water_color[2], 1.0)
+                links.new(diff_mix.outputs[2], water_bsdf.inputs['Base Color'])
+        
+        # Load normal map (Flowing_Normal_Map or Normal_Rain_Texture)
+        normal_path = (self._get_sampler_path(mat_data, 'Flowing_Normal_Map') or
+                       self._get_sampler_path(mat_data, 'Normal_Rain_Texture'))
+        if normal_path:
+            normal_tex = self._load_texture_node(bl_mat, nodes, links, normal_path, "UVMap")
+            if normal_tex:
+                normal_tex.location = (-700, -200)
+                if normal_tex.image:
+                    normal_tex.image.colorspace_settings.name = 'Non-Color'
+                
+                normal_map = nodes.new('ShaderNodeNormalMap')
+                normal_map.location = (-300, -200)
+                # Flow normal tiling
+                flow_tile = self._get_param(mat_data, 'FlowNormal_Tile', [4.0, 3.0])
+                normal_map.inputs['Strength'].default_value = min(flow_tile[0] if flow_tile else 4.0, 2.0) * 0.25
+                links.new(normal_tex.outputs['Color'], normal_map.inputs['Color'])
+                links.new(normal_map.outputs['Normal'], water_bsdf.inputs['Normal'])
+        
+        # Load flow map — channels: R=flowX, G=flowY (0.5=neutral), B=flow mask/intensity
+        # Blender can't animate the flow, but we use the B channel as a water mask
+        # and RG as a static normal-like distortion hint
+        flow_path = (self._get_sampler_path(mat_data, 'Flow_Map') or
+                     self._get_sampler_path(mat_data, 'FlowMap'))
+        if flow_path:
+            flow_tex = self._load_texture_node(bl_mat, nodes, links, flow_path, "UVMap")
+            if flow_tex:
+                flow_tex.location = (-700, -500)
+                flow_tex.label = "Flow Map (R=dirX, G=dirY, B=mask)"
+                if flow_tex.image:
+                    flow_tex.image.colorspace_settings.name = 'Non-Color'
+                
+                # Separate channels: R=flow dir X, G=flow dir Y, B=flow mask
+                sep_flow = nodes.new('ShaderNodeSeparateColor')
+                sep_flow.location = (-400, -500)
+                sep_flow.label = "Flow Channels"
+                links.new(flow_tex.outputs['Color'], sep_flow.inputs['Color'])
+                
+                # Use RG as a subtle normal map (flow direction → surface distortion)
+                # Combine: R→X, G→Y, constant 1.0→Z (like a normal map)
+                combine_flow = nodes.new('ShaderNodeCombineColor')
+                combine_flow.location = (-200, -550)
+                combine_flow.label = "Flow → Normal"
+                links.new(sep_flow.outputs['Red'], combine_flow.inputs['Red'])
+                links.new(sep_flow.outputs['Green'], combine_flow.inputs['Green'])
+                combine_flow.inputs['Blue'].default_value = 1.0  # Z = up
+                
+                # Only apply flow-as-normal if no dedicated normal map was loaded
+                if not normal_path:
+                    flow_normal = nodes.new('ShaderNodeNormalMap')
+                    flow_normal.location = (-50, -550)
+                    flow_normal.label = "Flow Direction Normal"
+                    flowmap_strength = self._get_param(mat_data, 'Flowmap_Strength', [1.0, 1.0])
+                    flow_normal.inputs['Strength'].default_value = min(
+                        (flowmap_strength[0] if flowmap_strength else 1.0) * 0.3, 1.0
+                    )
+                    links.new(combine_flow.outputs['Color'], flow_normal.inputs['Color'])
+                    links.new(flow_normal.outputs['Normal'], water_bsdf.inputs['Normal'])
+                
+                # B channel = flow mask → modulate water opacity
+                # Where B=1 (white) water flows strongly, B=0 (black) no water
+                flow_mask_multiply = nodes.new('ShaderNodeMath')
+                flow_mask_multiply.operation = 'MULTIPLY'
+                flow_mask_multiply.location = (-200, -650)
+                flow_mask_multiply.label = "Flow Mask × Alpha"
+                links.new(sep_flow.outputs['Blue'], flow_mask_multiply.inputs[0])
+                flow_mask_multiply.inputs[1].default_value = water_alpha
+                
+                # Feed flow mask into the fresnel mix factor (blend with existing fresnel)
+                flow_alpha_mix = nodes.new('ShaderNodeMath')
+                flow_alpha_mix.operation = 'MULTIPLY'
+                flow_alpha_mix.location = (350, 150)
+                flow_alpha_mix.label = "Fresnel × Flow Mask"
+                links.new(power.outputs[0], flow_alpha_mix.inputs[0])
+                links.new(flow_mask_multiply.outputs[0], flow_alpha_mix.inputs[1])
+                
+                # Reconnect mix shader to use flow-modulated factor
+                links.new(flow_alpha_mix.outputs[0], mix_shader.inputs['Fac'])
+        
+        # Load distortion texture (FlowMap_Radial, TFT_Water)
+        distortion_path = self._get_sampler_path(mat_data, 'Distortion_Texture')
+        if distortion_path:
+            dist_tex = self._load_texture_node(bl_mat, nodes, links, distortion_path, "UVMap")
+            if dist_tex:
+                dist_tex.location = (-700, -350)
+                dist_tex.label = "Distortion (Reference)"
+                if dist_tex.image:
+                    dist_tex.image.colorspace_settings.name = 'Non-Color'
+        
+        # Load reflection texture (TFT_Water, TFT_Env_Rain)
+        reflection_path = self._get_sampler_path(mat_data, 'Reflection_Texture')
+        if reflection_path:
+            refl_tex = self._load_texture_node(bl_mat, nodes, links, reflection_path, "UVMap")
+            if refl_tex:
+                refl_tex.location = (-700, -650)
+                refl_tex.label = "Reflection (Reference)"
+        
+        # Emissive for OD_FlowMap
+        if shader_name == 'OD_FlowMap':
+            emissive_color = self._get_param(mat_data, 'Emissive_Color', [0.34, 0.53, 0.65, 1.0])
+            emissive_intensity = self._get_param(mat_data, 'Emmissive_Intensity', [1.15, 1.0])
+            water_bsdf.inputs['Emission Color'].default_value = (
+                emissive_color[0], emissive_color[1], emissive_color[2], 1.0
+            )
+            water_bsdf.inputs['Emission Strength'].default_value = emissive_intensity[0] if emissive_intensity else 1.15
+        
+        # Flowmap_River: color blend for inside/outside
+        if shader_name == 'Flowmap_River':
+            color_inside = self._get_param(mat_data, 'Color_Inside', [0.44, 0.87, 0.92, 1.0])
+            # Store as custom property for reference
+            bl_mat["water_color_inside"] = list(color_inside)
+            bl_mat["water_color_outside"] = list(water_color)
+        
+        bl_mat.surface_render_method = 'BLENDED'
+        bl_mat.show_transparent_back = True
+        bl_mat.use_backface_culling = True
+    
+    def _build_ocean_shader(self, bl_mat, nodes, links, bsdf_node, output_node,
+                            mat_data, lightmap_texture, lightmap_color_scale, has_baked_lighting):
+        """
+        SRX_Blend_Ocean: Diffuse + Noise texture, specular highlights, tint color.
+        
+        Samplers: Diffuse_Texture, Noise_Texture
+        Key params: Tint_Color, Spec_Color, Specular_Intensity, Specular_Min_Max, Transition_Opacity
+        """
+        # Load diffuse
+        diffuse_path = self._get_sampler_path(mat_data, 'Diffuse_Texture')
+        diffuse_node = None
+        if diffuse_path:
+            diffuse_node = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap")
+            if diffuse_node:
+                diffuse_node.location = (-700, 300)
+        
+        # Load noise texture (used as detail/variation overlay)
+        noise_path = self._get_sampler_path(mat_data, 'Noise_Texture')
+        noise_node = None
+        if noise_path:
+            noise_node = self._load_texture_node(bl_mat, nodes, links, noise_path, "UVMap")
+            if noise_node:
+                noise_node.location = (-700, -100)
+                noise_node.label = "Noise (Detail)"
+        
+        # Tint_Color (additive offset, can be negative — unusual)
+        tint_color = self._get_param(mat_data, 'Tint_Color', [-0.075, -0.04, -0.03, 0.0])
+        
+        # Combine diffuse + noise + tint
+        if diffuse_node and noise_node:
+            # Overlay noise on diffuse (Screen blend for subtle detail)
+            overlay_mix = nodes.new('ShaderNodeMix')
+            overlay_mix.data_type = 'RGBA'
+            overlay_mix.blend_type = 'SCREEN'
+            overlay_mix.location = (-400, 200)
+            overlay_mix.inputs['Factor'].default_value = 0.3  # Subtle noise overlay
+            overlay_mix.label = "Diffuse + Noise"
+            links.new(diffuse_node.outputs['Color'], overlay_mix.inputs[6])
+            links.new(noise_node.outputs['Color'], overlay_mix.inputs[7])
+            
+            # Apply tint as additive offset
+            if any(abs(c) > 0.01 for c in tint_color[:3]):
+                tint_add = nodes.new('ShaderNodeMix')
+                tint_add.data_type = 'RGBA'
+                tint_add.blend_type = 'ADD'
+                tint_add.location = (-200, 200)
+                tint_add.inputs['Factor'].default_value = 1.0
+                tint_add.label = "Tint Offset"
+                links.new(overlay_mix.outputs[2], tint_add.inputs[6])
+                tint_add.inputs[7].default_value = (
+                    max(tint_color[0], 0), max(tint_color[1], 0), max(tint_color[2], 0), 1.0
+                )
+                links.new(tint_add.outputs[2], bsdf_node.inputs['Base Color'])
+            else:
+                links.new(overlay_mix.outputs[2], bsdf_node.inputs['Base Color'])
+            
+            if diffuse_node:
+                links.new(diffuse_node.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+        elif diffuse_node:
+            links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+            links.new(diffuse_node.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+        
+        # Specular properties
+        spec_color = self._get_param(mat_data, 'Spec_Color', [0.651, 0.839, 1.0, 1.0])
+        spec_intensity = self._get_param(mat_data, 'Specular_Intensity', [0.35])
+        spec_min_max = self._get_param(mat_data, 'Specular_Min_Max', [0.1, 0.65])
+        
+        # Low roughness for ocean specular highlights
+        roughness = 1.0 - (spec_min_max[1] if spec_min_max and len(spec_min_max) > 1 else 0.65)
+        bsdf_node.inputs['Roughness'].default_value = max(roughness, 0.1)
+        
+        if 'Specular IOR Level' in bsdf_node.inputs:
+            bsdf_node.inputs['Specular IOR Level'].default_value = spec_intensity[0] if spec_intensity else 0.35
+        
+        # Slight specular tint via Spec_Color as emission hint
+        # Store spec color for reference
+        bl_mat["ocean_spec_color"] = list(spec_color[:3])
+        
+        # Transition opacity for blend transitions
+        transition_opacity = self._get_param(mat_data, 'Transition_Opacity', [0.6])
+        switches = mat_data.get('switches', {})
+        if switches.get('ENV_TRANSITION', False) or switches.get('ENABLE_TRANSITION_FADE', False):
+            bsdf_node.inputs['Alpha'].default_value = transition_opacity[0] if transition_opacity else 0.6
+            bl_mat.surface_render_method = 'BLENDED'
+        
+        # Lightmap support (same as default)
+        if has_baked_lighting and lightmap_texture and self.assets_folder:
+            lightmap_node = self._load_texture_node(bl_mat, nodes, links, lightmap_texture, "LightmapUV")
+            if lightmap_node:
+                lightmap_node.location = (-700, -400)
+                if lightmap_node.image:
+                    lightmap_node.image.colorspace_settings.name = 'Non-Color'
+    
+    def _build_twist_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        Env_TwistByNoise / TFT_TwistByNoise: Diffuse + Noise with UV distortion effect.
+        
+        Samplers: Diffuse_Texture, Noise_Texture, (TFT: Strength_Texture)
+        Key params: MainColor, EmissiveFactor, AlphaTestValue, Strength, NoiseUVInfo
+        
+        The noise texture drives UV distortion (twist) on the diffuse.
+        MainColor is used as an emissive tint when EmissiveFactor > 0.
+        """
+        shader_name = self._get_shader_short_name(mat_data)
+        
+        # Load diffuse
+        diffuse_path = self._get_sampler_path(mat_data, 'Diffuse_Texture')
+        diffuse_node = None
+        if diffuse_path:
+            diffuse_node = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap")
+            if diffuse_node:
+                diffuse_node.location = (-700, 300)
+        
+        # Load noise texture (drives UV distortion)
+        noise_path = self._get_sampler_path(mat_data, 'Noise_Texture')
+        noise_node = None
+        if noise_path:
+            noise_node = self._load_texture_node(bl_mat, nodes, links, noise_path, "UVMap")
+            if noise_node:
+                noise_node.location = (-700, -100)
+                noise_node.label = "Noise (Twist Driver)"
+                if noise_node.image:
+                    noise_node.image.colorspace_settings.name = 'Non-Color'
+        
+        # Load strength texture (TFT variant only)
+        if shader_name == 'TFT_TwistByNoise':
+            strength_path = self._get_sampler_path(mat_data, 'Strength_Texture')
+            if strength_path:
+                strength_node = self._load_texture_node(bl_mat, nodes, links, strength_path, "UVMap")
+                if strength_node:
+                    strength_node.location = (-700, -400)
+                    strength_node.label = "Strength Mask"
+                    if strength_node.image:
+                        strength_node.image.colorspace_settings.name = 'Non-Color'
+        
+        # MainColor tint
+        main_color = self._get_param(mat_data, 'MainColor', [1.0, 1.0, 1.0, 1.0])
+        emissive_factor = self._get_param(mat_data, 'EmissiveFactor', [1.0])
+        alpha_test = self._get_param(mat_data, 'AlphaTestValue', [0.5])
+        
+        if diffuse_node:
+            is_white = all(abs(c - 1.0) < 0.01 for c in main_color[:3])
+            if not is_white:
+                # Multiply diffuse by MainColor
+                tint_mix = nodes.new('ShaderNodeMix')
+                tint_mix.data_type = 'RGBA'
+                tint_mix.blend_type = 'MULTIPLY'
+                tint_mix.location = (-400, 300)
+                tint_mix.inputs['Factor'].default_value = 1.0
+                tint_mix.label = "Diffuse × MainColor"
+                links.new(diffuse_node.outputs['Color'], tint_mix.inputs[6])
+                tint_mix.inputs[7].default_value = (main_color[0], main_color[1], main_color[2], 1.0)
+                
+                links.new(tint_mix.outputs[2], bsdf_node.inputs['Base Color'])
+                # Also use as emission if factor > 0
+                if emissive_factor and emissive_factor[0] > 0.01:
+                    links.new(tint_mix.outputs[2], bsdf_node.inputs['Emission Color'])
+                    bsdf_node.inputs['Emission Strength'].default_value = emissive_factor[0]
+            else:
+                links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+                if emissive_factor and emissive_factor[0] > 0.01:
+                    links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Emission Color'])
+                    bsdf_node.inputs['Emission Strength'].default_value = emissive_factor[0]
+            
+            links.new(diffuse_node.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+        else:
+            # No diffuse — use MainColor directly
+            bsdf_node.inputs['Base Color'].default_value = (main_color[0], main_color[1], main_color[2], 1.0)
+            if emissive_factor and emissive_factor[0] > 0.01:
+                bsdf_node.inputs['Emission Color'].default_value = (main_color[0], main_color[1], main_color[2], 1.0)
+                bsdf_node.inputs['Emission Strength'].default_value = emissive_factor[0]
+        
+        # Alpha test
+        if alpha_test and len(alpha_test) > 0:
+            bl_mat.alpha_threshold = alpha_test[0]
+        
+        # Store twist params for reference (can't animate UV distortion in Blender)
+        strength = self._get_param(mat_data, 'Strength', [0.01, 0.01])
+        noise_uv = self._get_param(mat_data, 'NoiseUVInfo', [0.1, 0.0, 0.25, 0.25])
+        bl_mat["twist_strength"] = list(strength) if strength else [0.01, 0.01]
+        bl_mat["twist_noise_uv"] = list(noise_uv) if noise_uv else [0.1, 0.0, 0.25, 0.25]
+    
     def _build_default_shader(self, bl_mat, nodes, links, bsdf_node, output_node,
                               mat_data, lightmap_texture, lightmap_color_scale, has_baked_lighting):
         """
@@ -1260,7 +1896,15 @@ class MaterialLoader:
             bl_mat.surface_render_method = 'BLENDED'
         
         # TintColor: League's tint is multiplied × 2 (0.5 = neutral, 1.0 = 2× bright)
-        tint_color = self._get_param(mat_data, 'TintColor') or self._get_param(mat_data, 'BaseTex_TintColor')
+        # Also checks: Tint, BaseTint, Diffuse_Tint, DiffuseTint, Tint_Color, ColorTint
+        tint_color = (self._get_param(mat_data, 'TintColor') or
+                      self._get_param(mat_data, 'BaseTex_TintColor') or
+                      self._get_param(mat_data, 'Tint') or
+                      self._get_param(mat_data, 'BaseTint') or
+                      self._get_param(mat_data, 'Diffuse_Tint') or
+                      self._get_param(mat_data, 'DiffuseTint') or
+                      self._get_param(mat_data, 'Tint_Color') or
+                      self._get_param(mat_data, 'ColorTint'))
         
         # Apply tint as multiply node if we have a diffuse texture and tint differs from neutral
         tinted_color_output = None
@@ -1404,7 +2048,7 @@ class MaterialLoader:
                     lightmap_node.image.colorspace_settings.name = 'Non-Color'
         
         # Connect: Diffuse × Lightmap → Emission (or Diffuse → Base Color)
-        if tinted_color_output and lightmap_node:
+        if tinted_color_output and lightmap_node and lightmap_node.image:
             # Lightmap × Scale
             lm_multiply = nodes.new('ShaderNodeMix')
             lm_multiply.data_type = 'RGBA'
@@ -1451,6 +2095,47 @@ class MaterialLoader:
         if not has_baked_lighting:
             if 'Specular IOR Level' in bsdf_node.inputs:
                 bsdf_node.inputs['Specular IOR Level'].default_value = 0.5
+        
+        # Emission color support (EMISSION_EmissionColor, EmissionColor, FLOW_Color, etc.)
+        # Only apply if an emissive texture sampler is actually present — the game
+        # ignores EmissionColor when there is no emission texture assigned.
+        has_emission_tex = bool(
+            self._get_sampler_path(mat_data, 'Emissive_Texture') or
+            self._get_sampler_path(mat_data, 'EmissionTex') or
+            self._get_sampler_path(mat_data, 'Emission_Tex') or
+            self._get_sampler_path(mat_data, 'EmissiveTexture') or
+            self._get_sampler_path(mat_data, 'EmissionMaskTex'))
+        if has_emission_tex:
+            emission_color = (self._get_param(mat_data, 'EMISSION_EmissionColor') or
+                              self._get_param(mat_data, 'EmissionColor') or
+                              self._get_param(mat_data, 'FLOW_Color'))
+            if emission_color and len(emission_color) >= 3:
+                ec_r, ec_g, ec_b = float(emission_color[0]), float(emission_color[1]), float(emission_color[2])
+                is_nonblack = (ec_r > 0.01 or ec_g > 0.01 or ec_b > 0.01)
+                if is_nonblack:
+                    bsdf_node.inputs['Emission Color'].default_value = (ec_r, ec_g, ec_b, 1.0)
+                    em_intensity = self._get_param(mat_data, 'Emissive_Intensity')
+                    if em_intensity:
+                        bsdf_node.inputs['Emission Strength'].default_value = max(0.0, float(em_intensity[0]))
+                    else:
+                        bsdf_node.inputs['Emission Strength'].default_value = 1.0
+        
+        # Starting_Color / Color fallback for base color (when no texture)
+        if not diffuse_path and not tint_color:
+            starting_color = (self._get_param(mat_data, 'Starting_Color') or
+                              self._get_param(mat_data, 'Color') or
+                              self._get_param(mat_data, 'UnderColor') or
+                              self._get_param(mat_data, 'Color_Bottom'))
+            if starting_color and len(starting_color) >= 3:
+                bsdf_node.inputs['Base Color'].default_value = (
+                    float(starting_color[0]), float(starting_color[1]),
+                    float(starting_color[2]), 1.0
+                )
+        
+        # ShadowColor hint (blend into base color slightly)
+        shadow_color = self._get_param(mat_data, 'ShadowColor')
+        if shadow_color and len(shadow_color) >= 3:
+            bl_mat["shadow_color"] = list(shadow_color[:3])
     
     def _build_glass_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
         """
@@ -2055,6 +2740,26 @@ class MaterialLoader:
                                                     lightmap_texture, lightmap_color_scale,
                                                     texture_overrides,
                                                     baked_paint_scale, baked_paint_bias)
+        
+        # Try FNV-1a hash lookup: material name → hash → check if hash is a key
+        mat_hash = f"0x{_fnv1a_32(mat_name):08x}"
+        if mat_hash in materials_db:
+            _log().info("Material", f"Resolved '{mat_name}' via FNV-1a hash {mat_hash}")
+            return self.create_blender_material(mat_name, materials_db[mat_hash],
+                                                lightmap_texture, lightmap_color_scale,
+                                                texture_overrides,
+                                                baked_paint_scale, baked_paint_bias)
+        
+        # Try matching by 'name' field inside material data (for hashed entries)
+        for key, value in materials_db.items():
+            if isinstance(value, dict):
+                inner_name = value.get('name', '')
+                if inner_name and inner_name.lower() == mat_name_lower:
+                    _log().info("Material", f"Resolved '{mat_name}' via inner name in {key}")
+                    return self.create_blender_material(mat_name, value,
+                                                        lightmap_texture, lightmap_color_scale,
+                                                        texture_overrides,
+                                                        baked_paint_scale, baked_paint_bias)
         
         # Material not found - create a simple material
         _log().material_missing(mat_name, "Not found in database")

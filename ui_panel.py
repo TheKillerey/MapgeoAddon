@@ -480,7 +480,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.5"
+        addon_version = "0.2.6"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -1633,10 +1633,22 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         max=MAX_BUCKET_SIZE
     )
     
-    height: bpy.props.FloatProperty(
-        name="Height",
-        description="Height (Z coordinate) for the flat bounding box plane",
-        default=0.0
+    height_min: bpy.props.FloatProperty(
+        name="Min Height (Z)",
+        description="Minimum height (Z coordinate) for bucket grid bounding box",
+        default=-10000.0
+    )
+    
+    height_max: bpy.props.FloatProperty(
+        name="Max Height (Z)",
+        description="Maximum height (Z coordinate) for bucket grid bounding box",
+        default=10000.0
+    )
+
+    use_selected_only: bpy.props.BoolProperty(
+        name="Use Selected Only",
+        description="Only include currently selected mesh objects (falls back to all meshes if none selected)",
+        default=True
     )
 
     include_render_regions: bpy.props.BoolProperty(
@@ -1651,21 +1663,49 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "bucket_size")
-        layout.prop(self, "height")
+        col = layout.column()
+        col.label(text="Height Range (Z):")
+        row = col.row()
+        row.prop(self, "height_min", text="Min")
+        row.prop(self, "height_max", text="Max")
+        layout.prop(self, "use_selected_only")
         layout.prop(self, "include_render_regions")
     
     def execute(self, context):
         import mathutils
         import bmesh
         from collections import defaultdict
+        import json
+        from . import import_mapgeo
+        from . import material_loader as mat_loader
+        
+        # Load materials data to get visibility controller layer mappings
+        settings = context.scene.mapgeo_settings
+        layer_to_hash = {}
+        
+        try:
+            last_import_path = getattr(settings, 'last_import_path', '')
+            materials_path = import_mapgeo._resolve_materials_path(settings, last_import_path)
+            if materials_path and os.path.exists(materials_path):
+                # Extract layer→hash mappings from visibility controllers
+                layer_to_hash = import_mapgeo._extract_visibility_controller_layers(materials_path)
+            else:
+                print("Warning: No materials file found for visibility controller lookup")
+        except Exception as e:
+            print(f"Warning: Could not load materials visibility controllers: {e}")
         
         # Keywords to ignore when creating bucket grids
-        ignore_keywords = ['sun', 'fog', 'render', 'region', 'bush']
+        ignore_keywords = ['sun', 'fog', 'bush']
         
-        # Collect mesh objects grouped by visibility_layer
-        objects_by_layer = defaultdict(list)
-        
-        for obj in context.scene.objects:
+        # Collect mesh objects grouped by hash type (render_region, baron, or visibility_layer)
+        # Key format: ('type', hash_value) where type is 'render_region', 'baron', or 'visibility_layer'
+        objects_by_hash_type = defaultdict(list)
+
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        use_selection = self.use_selected_only and len(selected_meshes) > 0
+        source_objects = selected_meshes if use_selection else context.scene.objects
+
+        for obj in source_objects:
             if obj.type != 'MESH':
                 continue
             if obj.get("is_bucket_grid") or obj.get("is_bucket_grid_bounds"):
@@ -1680,10 +1720,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             if in_bucket_collection:
                 continue
             
-            # Skip bushes and render region meshes (by custom properties)
+            # Skip bushes
             if obj.get("is_bush", False):
-                continue
-            if not self.include_render_regions and obj.get("render_region_hash"):
                 continue
             
             # Skip objects with ignored keywords in name (fallback)
@@ -1692,11 +1730,34 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             if should_ignore:
                 continue
             
-            # Group by visibility_layer
+            # Group by hash type (priority: render_region > baron > visibility_layer)
+            # Riot creates separate bucket grids for each render region, baron hash, and visibility layer
+            
+            render_region_hash = obj.get("render_region_hash", "")
+            if render_region_hash and render_region_hash != "00000000":
+                # Render region hash (highest priority)
+                try:
+                    hash_val = int(render_region_hash, 16)
+                    objects_by_hash_type[('render_region', hash_val)].append(obj)
+                    continue
+                except ValueError:
+                    pass
+            
+            baron_hash = obj.get("baron_hash", "")
+            if baron_hash and baron_hash != "00000000":
+                # Baron visibility hash
+                try:
+                    hash_val = int(baron_hash, 16)
+                    objects_by_hash_type[('baron', hash_val)].append(obj)
+                    continue
+                except ValueError:
+                    pass
+            
+            # Fall back to visibility_layer (dragon layers)
             visibility_layer = obj.get("visibility_layer", 0)
-            objects_by_layer[visibility_layer].append(obj)
+            objects_by_hash_type[('visibility_layer', visibility_layer)].append(obj)
         
-        if not objects_by_layer:
+        if not objects_by_hash_type:
             self.report({'WARNING'}, "No valid mesh objects found to create bucket grid from")
             return {'CANCELLED'}
         
@@ -1722,52 +1783,58 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 bpy.data.objects.remove(obj, do_unlink=True)
             bpy.data.collections.remove(col)
         
-        # Process each visibility layer separately
+        # Process each hash group separately
         total_grids_created = 0
         
-        for visibility_layer in sorted(objects_by_layer.keys()):
-            mesh_objects = objects_by_layer[visibility_layer]
+        for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
+                # Find the parent of the _Meshes collection
+                for parent_col in bpy.data.collections:
+                    if col.name in [c.name for c in parent_col.children]:
+                        parent_collection = parent_col
+                        break
+                break
+        
+        # Remove existing custom bucket grid collections
+        to_remove = []
+        for col in bpy.data.collections:
+            if col.get("is_bucket_grid_collection") and col.get("is_custom_bucket_grid"):
+                to_remove.append(col)
+        
+        for col in to_remove:
+            for obj in list(col.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.collections.remove(col)
+        
+        # Process each hash group separately
+        total_grids_created = 0
+        
+        for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
             
-            # Calculate scene bounds from layer's mesh objects
-            all_min = mathutils.Vector((float('inf'), float('inf'), float('inf')))
-            all_max = mathutils.Vector((float('-inf'), float('-inf'), float('-inf')))
+            # Determine path_hash and layer suffix based on hash type
+            if hash_type == 'render_region':
+                path_hash = hash_value
+                layer_suffix = f"_RR{path_hash:08X}"
+                visibility_layer = 0  # Render regions don't use dragon layers
+            elif hash_type == 'baron':
+                path_hash = hash_value
+                layer_suffix = f"_Baron{path_hash:08X}"
+                visibility_layer = 0  # Baron uses its own hash system
+            else:  # visibility_layer (dragon layers)
+                visibility_layer = hash_value
+                # Try to get path_hash from layer_to_hash mapping
+                path_hash = layer_to_hash.get(visibility_layer, 0)
+                layer_suffix = f"_L{visibility_layer}"
             
-            for obj in mesh_objects:
-                # Use world-space bounding box
-                for corner in obj.bound_box:
-                    world_co = obj.matrix_world @ mathutils.Vector(corner)
-                    all_min.x = min(all_min.x, world_co.x)
-                    all_min.y = min(all_min.y, world_co.y)
-                    all_min.z = min(all_min.z, world_co.z)
-                    all_max.x = max(all_max.x, world_co.x)
-                    all_max.y = max(all_max.y, world_co.y)
-                    all_max.z = max(all_max.z, world_co.z)
-            
-            # Bucket grid uses X/Y plane in Blender (mapgeo X/Z horizontal → Blender X/Y horizontal)
-            # Blender: X/Y is horizontal ground plane, Z is up
-            bucket_size = self.bucket_size
-            
-            # Calculate grid dimensions (using X and Y for horizontal plane)
-            # Expand bounds slightly to ensure all geometry is contained
-            min_x = all_min.x - 1.0
-            min_y = all_min.y - 1.0
-            max_x = all_max.x + 1.0
-            max_y = all_max.y + 1.0
-            
-            range_x = max_x - min_x
-            range_y = max_y - min_y
-            
-            # Calculate buckets_per_side based on the larger dimension (square grid)
-            max_range = max(range_x, range_y)
-            buckets_per_side = max(1, int((max_range / bucket_size) + 0.5))
-            
-            # Cap at maximum grid size to prevent freezing
-            if buckets_per_side > self.MAX_GRID_SIZE:
-                buckets_per_side = self.MAX_GRID_SIZE
-                bucket_size = max_range / buckets_per_side
-            
-            # Collect all triangles in world space from mesh objects
+            # Height range clamp
+            z_min = min(self.height_min, self.height_max)
+            z_max = max(self.height_min, self.height_max)
+
+            # Collect triangles in world space, filtered by height range
             all_triangles = []  # List of (v0, v1, v2, source_obj)
+            min_x = float('inf')
+            min_y = float('inf')
+            max_x = float('-inf')
+            max_y = float('-inf')
             
             for obj in mesh_objects:
                 # Get mesh in world space
@@ -1787,124 +1854,211 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                     v0 = matrix @ mesh.vertices[tri.vertices[0]].co
                     v1 = matrix @ mesh.vertices[tri.vertices[1]].co
                     v2 = matrix @ mesh.vertices[tri.vertices[2]].co
+                    
+                    tri_min_z = min(v0.z, v1.z, v2.z)
+                    tri_max_z = max(v0.z, v1.z, v2.z)
+                    if tri_max_z < z_min or tri_min_z > z_max:
+                        continue
+
                     all_triangles.append((v0.copy(), v1.copy(), v2.copy(), obj))
+                    min_x = min(min_x, v0.x, v1.x, v2.x)
+                    min_y = min(min_y, v0.y, v1.y, v2.y)
+                    max_x = max(max_x, v0.x, v1.x, v2.x)
+                    max_y = max(max_y, v0.y, v1.y, v2.y)
                 
                 eval_obj.to_mesh_clear()
             
             if not all_triangles:
                 continue  # Skip this layer if no triangles
+
+            # Bucket grid uses X/Y plane in Blender (mapgeo X/Z horizontal → Blender X/Y horizontal)
+            # Blender: X/Y is horizontal ground plane, Z is up
+            bucket_size = self.bucket_size
+
+            # Calculate grid dimensions (using X and Y for horizontal plane)
+            # Expand bounds slightly to ensure all geometry is contained
+            min_x = min_x - 1.0
+            min_y = min_y - 1.0
+            max_x = max_x + 1.0
+            max_y = max_y + 1.0
+
+            range_x = max_x - min_x
+            range_y = max_y - min_y
+
+            # Calculate buckets_per_side based on the larger dimension (square grid)
+            max_range = max(range_x, range_y)
+            buckets_per_side = max(1, int((max_range / bucket_size) + 0.5))
+
+            # Cap at maximum grid size to prevent freezing
+            if buckets_per_side > self.MAX_GRID_SIZE:
+                buckets_per_side = self.MAX_GRID_SIZE
+                bucket_size = max_range / buckets_per_side
             
-            # Build 2D bucket grid structure
-            # Each bucket stores: list of triangle indices that touch it
-            bucket_triangles = [[[] for _ in range(buckets_per_side)] for _ in range(buckets_per_side)]
+            # ────────────────────────────────────────────────────────────
+            # RIOT-STYLE: Per-bucket vertex subsets with unique base_vertex
+            # Each bucket owns a contiguous slice of the vertex array
+            # Indices are relative to base_vertex (always fits in ushort)
+            # ────────────────────────────────────────────────────────────
             
-            # Determine which bucket each triangle belongs to
-            for tri_idx, (v0, v1, v2, obj) in enumerate(all_triangles):
-                # Find bounding box of triangle in X/Y plane (Blender horizontal)
+            # Step 1: Build deduplicated vertex buffer and face index list
+            all_unique_vertices = []
+            vertex_map = {}  # (x,y,z) rounded → global index
+            face_global_indices = []  # List of (idx0, idx1, idx2) per triangle
+            
+            tolerance = 0.001
+            for (v0, v1, v2, obj) in all_triangles:
+                def get_or_add_vertex(v):
+                    key = (round(v.x / tolerance) * tolerance,
+                           round(v.y / tolerance) * tolerance,
+                           round(v.z / tolerance) * tolerance)
+                    if key not in vertex_map:
+                        vertex_map[key] = len(all_unique_vertices)
+                        all_unique_vertices.append(v)
+                    return vertex_map[key]
+                
+                idx0 = get_or_add_vertex(v0)
+                idx1 = get_or_add_vertex(v1)
+                idx2 = get_or_add_vertex(v2)
+                face_global_indices.append((idx0, idx1, idx2))
+            
+            # Step 2: Assign each face to bucket(s) based on triangle bounding box
+            bucket_face_lists = [[{'inside': [], 'sticking': []} for _ in range(buckets_per_side)]
+                                 for _ in range(buckets_per_side)]
+            
+            for face_idx, (v0, v1, v2, obj) in enumerate(all_triangles):
+                # Assign face to ONE bucket based on centroid (matches Riot's pattern)
+                cx = (v0.x + v1.x + v2.x) / 3.0
+                cy = (v0.y + v1.y + v2.y) / 3.0
+                
+                home_bx = max(0, min(buckets_per_side - 1, int((cx - min_x) / bucket_size)))
+                home_by = max(0, min(buckets_per_side - 1, int((cy - min_y) / bucket_size)))
+                
+                # Check if face extends beyond its home bucket
                 tri_min_x = min(v0.x, v1.x, v2.x)
                 tri_max_x = max(v0.x, v1.x, v2.x)
                 tri_min_y = min(v0.y, v1.y, v2.y)
                 tri_max_y = max(v0.y, v1.y, v2.y)
                 
-                # Convert to bucket indices
-                bucket_min_x = max(0, int((tri_min_x - min_x) / bucket_size))
-                bucket_max_x = min(buckets_per_side - 1, int((tri_max_x - min_x) / bucket_size))
-                bucket_min_y = max(0, int((tri_min_y - min_y) / bucket_size))
-                bucket_max_y = min(buckets_per_side - 1, int((tri_max_y - min_y) / bucket_size))
+                bucket_left = min_x + home_bx * bucket_size
+                bucket_right = bucket_left + bucket_size
+                bucket_bottom = min_y + home_by * bucket_size
+                bucket_top = bucket_bottom + bucket_size
                 
-                # Determine if triangle is fully inside one bucket or sticks out
-                # For simplicity: if it touches only one bucket, it's inside; otherwise it's sticking out
-                touches_single_bucket = (bucket_min_x == bucket_max_x and bucket_min_y == bucket_max_y)
+                sticks_out = (tri_min_x < bucket_left or tri_max_x > bucket_right or
+                              tri_min_y < bucket_bottom or tri_max_y > bucket_top)
                 
-                # Add triangle to all buckets it touches
-                for by in range(bucket_min_y, bucket_max_y + 1):
-                    for bx in range(bucket_min_x, bucket_max_x + 1):
-                        bucket_triangles[by][bx].append((tri_idx, touches_single_bucket))
+                if sticks_out:
+                    bucket_face_lists[home_by][home_bx]['sticking'].append(face_idx)
+                else:
+                    bucket_face_lists[home_by][home_bx]['inside'].append(face_idx)
             
-            # Build unified vertex and index buffers with base_vertex offsets
-            all_vertices = []  # Global vertex buffer
-            all_indices = []   # Global index buffer
-            bucket_data = [[None for _ in range(buckets_per_side)] for _ in range(buckets_per_side)]
+            # Step 3: Build per-bucket vertex subsets and local indices
+            # Each bucket gets its own contiguous region in the vertex array.
+            # Vertices are duplicated across buckets as needed (matches Riot's pattern).
+            final_vertices = []    # Global vertex array (per-bucket sorted, may have duplicates)
+            final_indices = []     # Global index array (per-bucket local indices)
+            bucket_data = [[None for _ in range(buckets_per_side)]
+                           for _ in range(buckets_per_side)]
+            
+            global_max_stickout_x = 0.0
+            global_max_stickout_z = 0.0
             
             for bz in range(buckets_per_side):
                 for bx in range(buckets_per_side):
-                    tri_list = bucket_triangles[bz][bx]
-                    if not tri_list:
-                        # Empty bucket
+                    inside_faces = bucket_face_lists[bz][bx]['inside']
+                    sticking_faces = bucket_face_lists[bz][bx]['sticking']
+                    
+                    inside_count = len(inside_faces)
+                    sticking_count = len(sticking_faces)
+                    total_faces = inside_count + sticking_count
+                    
+                    start_index = len(final_indices)
+                    
+                    if total_faces == 0:
                         bucket_data[bz][bx] = {
                             'base_vertex': 0,
-                            'start_index': len(all_indices),
+                            'start_index': start_index,
                             'inside_face_count': 0,
-                            'sticking_out_face_count': 0
+                            'sticking_out_face_count': 0,
+                            'max_stickout_x': 0.0,
+                            'max_stickout_z': 0.0,
                         }
-                        continue
-                
-                # Build local vertex list for this bucket (deduplication)
-                    local_verts = []
-                    vertex_map = {}  # maps (tri_idx, vert_idx_in_tri) -> local_vert_idx
-                    local_indices = []
-                    inside_count = 0
-                    sticking_out_count = 0
-                    
-                    for tri_idx, is_inside in tri_list:
-                        v0, v1, v2, obj = all_triangles[tri_idx]
+                    else:
+                        base_vertex = len(final_vertices)
                         
-                        # Add vertices (with deduplication)
-                        def get_or_add_vertex(v, key):
-                            if key not in vertex_map:
-                                vertex_map[key] = len(local_verts)
-                                local_verts.append(v)
-                            return vertex_map[key]
+                        # Build local vertex map for this bucket
+                        local_vertex_map = {}  # global_vertex_idx → local_idx
                         
-                        idx0 = get_or_add_vertex(v0, (tri_idx, 0))
-                        idx1 = get_or_add_vertex(v1, (tri_idx, 1))
-                        idx2 = get_or_add_vertex(v2, (tri_idx, 2))
+                        def get_local_index(global_idx):
+                            if global_idx not in local_vertex_map:
+                                local_idx = len(local_vertex_map)
+                                local_vertex_map[global_idx] = local_idx
+                                final_vertices.append(all_unique_vertices[global_idx])
+                            return local_vertex_map[global_idx]
                         
-                        # Add face (note: Blender uses CCW, but we'll reverse on import)
-                        local_indices.extend([idx0, idx1, idx2])
+                        # Process inside faces first, then sticking faces
+                        # Reverse winding for Blender→mapgeo (Y↔Z swap changes handedness)
+                        for face_idx in inside_faces:
+                            g0, g1, g2 = face_global_indices[face_idx]
+                            final_indices.extend([
+                                get_local_index(g0),
+                                get_local_index(g2),
+                                get_local_index(g1)
+                            ])
                         
-                        if is_inside:
-                            inside_count += 1
-                        else:
-                            sticking_out_count += 1
-                    
-                    # Store bucket data
-                    base_vertex = len(all_vertices)
-                    start_index = len(all_indices)
-                    
-                    bucket_data[bz][bx] = {
-                        'base_vertex': base_vertex,
-                        'start_index': start_index,
-                        'inside_face_count': inside_count,
-                        'sticking_out_face_count': sticking_out_count
-                    }
-                    
-                    # Append to global buffers
-                    all_vertices.extend(local_verts)
-                    all_indices.extend(local_indices)
+                        for face_idx in sticking_faces:
+                            g0, g1, g2 = face_global_indices[face_idx]
+                            final_indices.extend([
+                                get_local_index(g0),
+                                get_local_index(g2),
+                                get_local_index(g1)
+                            ])
+                        
+                        # Verify local indices fit in ushort
+                        max_local = max(local_vertex_map.values()) if local_vertex_map else 0
+                        if max_local > 65535:
+                            print(f"WARNING: Bucket [{bz}][{bx}] has {max_local + 1} local vertices (exceeds ushort)")
+                        
+                        # Calculate per-bucket stickout values
+                        bucket_stickout_x = 0.0
+                        bucket_stickout_z = 0.0
+                        
+                        bucket_left = min_x + bx * bucket_size
+                        bucket_right = bucket_left + bucket_size
+                        bucket_bottom = min_y + bz * bucket_size
+                        bucket_top = bucket_bottom + bucket_size
+                        
+                        for face_idx in sticking_faces:
+                            sv0, sv1, sv2, _ = all_triangles[face_idx]
+                            for sv in (sv0, sv1, sv2):
+                                if sv.x < bucket_left:
+                                    bucket_stickout_x = max(bucket_stickout_x, bucket_left - sv.x)
+                                if sv.x > bucket_right:
+                                    bucket_stickout_x = max(bucket_stickout_x, sv.x - bucket_right)
+                                if sv.y < bucket_bottom:
+                                    bucket_stickout_z = max(bucket_stickout_z, bucket_bottom - sv.y)
+                                if sv.y > bucket_top:
+                                    bucket_stickout_z = max(bucket_stickout_z, sv.y - bucket_top)
+                        
+                        global_max_stickout_x = max(global_max_stickout_x, bucket_stickout_x)
+                        global_max_stickout_z = max(global_max_stickout_z, bucket_stickout_z)
+                        
+                        bucket_data[bz][bx] = {
+                            'base_vertex': base_vertex,
+                            'start_index': start_index,
+                            'inside_face_count': inside_count,
+                            'sticking_out_face_count': sticking_count,
+                            'max_stickout_x': bucket_stickout_x,
+                            'max_stickout_z': bucket_stickout_z,
+                        }
             
-            # Create bucket grid mesh (unified mesh with all geometry)
+            # Create bucket grid mesh for Blender display (deduplicated vertices)
             layer_suffix = f"_L{visibility_layer}" if visibility_layer != 0 else ""
             grid_mesh = bpy.data.meshes.new(f"CustomBucketGrid{layer_suffix}_Mesh")
             
-            # Build faces from indices with base_vertex offsets
-            faces = []
-            for bz in range(buckets_per_side):
-                for bx in range(buckets_per_side):
-                    bucket = bucket_data[bz][bx]
-                    face_count = bucket['inside_face_count'] + bucket['sticking_out_face_count']
-                    start_idx = bucket['start_index']
-                    base_vertex = bucket['base_vertex']
-                    
-                    for i in range(face_count):
-                        idx_pos = start_idx + (i * 3)
-                        v0 = all_indices[idx_pos] + base_vertex
-                        v1 = all_indices[idx_pos + 1] + base_vertex
-                        v2 = all_indices[idx_pos + 2] + base_vertex
-                        faces.append((v0, v1, v2))
-            
-            # Convert vertices to tuples
-            verts = [(v.x, v.y, v.z) for v in all_vertices]
+            # Use deduplicated vertices with global indices for clean Blender display
+            verts = [(v.x, v.y, v.z) for v in all_unique_vertices]
+            faces = list(face_global_indices)
             
             grid_mesh.from_pydata(verts, [], faces)
             grid_mesh.update()
@@ -1917,9 +2071,14 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             bg_collection["is_custom_bucket_grid"] = True
             bg_collection["bucket_grid_count"] = 1
             bg_collection["visibility_layer"] = visibility_layer
+            bg_collection["hash_type"] = hash_type  # Store hash type for reference
             
-            # Create bucket grid object
-            grid_obj = bpy.data.objects.new(f"CustomBucketGrid{layer_suffix}_Mesh", grid_mesh)
+            # Use path_hash determined earlier (from render_region, baron, or visibility_layer mapping)
+            path_hash_str = f"{path_hash:08X}"
+            
+            # Create bucket grid object with proper naming (matches import structure)
+            grid_name = f"BucketGrid_{path_hash_str}"
+            grid_obj = bpy.data.objects.new(grid_name, grid_mesh)
             bg_collection.objects.link(grid_obj)
             
             # Apply crimson red material (matching imported bucket grids)
@@ -1947,51 +2106,96 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             
             grid_mesh.materials.append(mat)
             
-            # Store metadata on object
+            # Store metadata on object (matches imported bucket grid format)
             grid_obj["is_bucket_grid"] = True
             grid_obj["is_custom_bucket_grid"] = True
-            grid_obj["visibility_layer"] = visibility_layer
+            grid_obj["bucket_grid_index"] = 0  # First (and only) grid in this collection
             grid_obj["bounds_min_x"] = min_x
-            grid_obj["bounds_min_y"] = min_y
+            grid_obj["bounds_min_z"] = min_y  # Note: Blender Y → mapgeo Z
             grid_obj["bounds_max_x"] = max_x
-            grid_obj["bounds_max_y"] = max_y
+            grid_obj["bounds_max_z"] = max_y
             grid_obj["bucket_size_x"] = bucket_size
             grid_obj["bucket_size_z"] = bucket_size
             grid_obj["buckets_per_side"] = buckets_per_side
-            grid_obj["bounds_height"] = self.height
+            grid_obj["visibility_layer"] = visibility_layer
+            grid_obj["stickout_x"] = global_max_stickout_x
+            grid_obj["stickout_z"] = global_max_stickout_z
             
-            # Store bucket data as JSON for export
-            bucket_data_json = []
+            # Store path_hash (already determined above based on hash_type)
+            grid_obj["path_hash"] = path_hash_str
+            
+            # Store detailed bucket grid data as JSON on the collection level (matches import structure)
+            # This includes full vertex/index data for round-trip export
+            # Vertices stored in mapgeo format (Blender XYZ → mapgeo X,Z,Y swap)
+            bucket_grid_data = {
+                'path_hash': path_hash,
+                'min_x': min_x,
+                'min_z': min_y,  # Note: Blender Y → mapgeo Z
+                'max_x': max_x,
+                'max_z': max_y,
+                'bucket_size_x': bucket_size,
+                'bucket_size_z': bucket_size,
+                'buckets_per_side': buckets_per_side,
+                'is_disabled': False,
+                'flags': 0,
+                'unknown_v18_float': "00000000",  # Stored as hex string
+                'max_stickout_x': global_max_stickout_x,
+                'max_stickout_z': global_max_stickout_z,
+                'vertices': [(v.x, v.z, v.y) for v in final_vertices],  # Blender→mapgeo coord swap
+                'indices': final_indices,  # Local indices (relative to per-bucket base_vertex)
+                'face_visibility_flags': [],
+                'buckets': []
+            }
+            
+            # Add bucket data to grid data
             for bz in range(buckets_per_side):
                 row = []
                 for bx in range(buckets_per_side):
                     bucket = bucket_data[bz][bx]
                     row.append({
-                        'base_vertex': bucket['base_vertex'],
+                        'max_stickout_x': bucket['max_stickout_x'],
+                        'max_stickout_z': bucket['max_stickout_z'],
                         'start_index': bucket['start_index'],
+                        'base_vertex': bucket['base_vertex'],
                         'inside_face_count': bucket['inside_face_count'],
                         'sticking_out_face_count': bucket['sticking_out_face_count']
                     })
-                bucket_data_json.append(row)
+                bucket_grid_data['buckets'].append(row)
             
+            # Store on collection level for export (matches imported bucket grid format)
             import json
-            grid_obj["bucket_data"] = json.dumps(bucket_data_json)
-            grid_obj["vertex_count"] = len(all_vertices)
-            grid_obj["index_count"] = len(all_indices)
+            bg_collection["bucket_data_json"] = json.dumps([bucket_grid_data])
             
-            # Create bounding box visual (flat on X/Y plane at specified Z height)
+            # Also store bucket_data on the object for export
+            grid_obj["bucket_data"] = json.dumps(bucket_grid_data['buckets'])
+            grid_obj["vertex_count"] = len(final_vertices)
+            grid_obj["index_count"] = len(final_indices)
+            
+            # Create bounding box visual (3D box with min and max height)
             bbox_mesh = bpy.data.meshes.new(f"CustomBucketGrid{layer_suffix}_Bounds")
-            z_height = self.height
+            z_min = self.height_min
+            z_max = self.height_max
             
-            # Single horizontal rectangle on X/Y plane at specified Z height
+            # 3D box: bottom rectangle at z_min, top rectangle at z_max
             bbox_verts = [
-                (min_x, min_y, z_height),
-                (max_x, min_y, z_height),
-                (max_x, max_y, z_height),
-                (min_x, max_y, z_height),
+                # Bottom face (at z_min)
+                (min_x, min_y, z_min),
+                (max_x, min_y, z_min),
+                (max_x, max_y, z_min),
+                (min_x, max_y, z_min),
+                # Top face (at z_max)
+                (min_x, min_y, z_max),
+                (max_x, min_y, z_max),
+                (max_x, max_y, z_max),
+                (min_x, max_y, z_max),
             ]
             bbox_edges = [
+                # Bottom rectangle
                 (0, 1), (1, 2), (2, 3), (3, 0),
+                # Top rectangle
+                (4, 5), (5, 6), (6, 7), (7, 4),
+                # Vertical edges connecting bottom to top
+                (0, 4), (1, 5), (2, 6), (3, 7),
             ]
             bbox_mesh.from_pydata(bbox_verts, bbox_edges, [])
             bbox_mesh.update()
@@ -2036,9 +2240,22 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         settings = context.scene.mapgeo_settings
         settings.show_bucket_grid = True
         
+        # Build report message showing what was created
+        hash_type_counts = defaultdict(int)
+        for (hash_type, hash_value) in objects_by_hash_type.keys():
+            hash_type_counts[hash_type] += 1
+        
+        report_parts = []
+        if hash_type_counts['render_region'] > 0:
+            report_parts.append(f"{hash_type_counts['render_region']} render region")
+        if hash_type_counts['baron'] > 0:
+            report_parts.append(f"{hash_type_counts['baron']} baron")
+        if hash_type_counts['visibility_layer'] > 0:
+            report_parts.append(f"{hash_type_counts['visibility_layer']} dragon layer")
+        
         self.report({'INFO'}, 
-            f"Created {total_grids_created} custom bucket grid(s) for layers: "
-            f"{', '.join(str(layer) for layer in sorted(objects_by_layer.keys()))}")
+            f"✓ Created {total_grids_created} custom bucket grid(s): "
+            f"{', '.join(report_parts)}")
         return {'FINISHED'}
 
 
@@ -2513,8 +2730,13 @@ class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
             obj["buckets_per_side"] = grid.buckets_per_side
             obj["is_disabled"] = grid.is_disabled
             obj["flags"] = grid.flags
+            
+            # Convert unknown_v18_float to hex string for consistency
             if grid.unknown_v18_float is not None:
-                obj["unknown_v18_float"] = grid.unknown_v18_float
+                import struct
+                float_bytes = struct.pack('<f', grid.unknown_v18_float)
+                uint_value = struct.unpack('<I', float_bytes)[0]
+                obj["unknown_v18_float"] = f"{uint_value:08X}"
             
             # Store face visibility flags
             if grid.face_visibility_flags:
