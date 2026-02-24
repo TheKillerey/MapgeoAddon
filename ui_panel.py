@@ -6,6 +6,7 @@ Sidebar panels for layer management and import/export settings
 import bpy
 import json
 import os
+import math
 import re
 from bpy.types import Panel, UIList
 
@@ -1620,18 +1621,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     # Constants for bucket grid generation
-    TARGET_GRID_SIZE = 32  # Target ~32x32 grids like riot does
+    TARGET_GRID_SIZE = 32  # Target ~32x32 grids like riot does (automatically calculated)
     MAX_GRID_SIZE = 64  # Absolute maximum grid size to prevent freezing
-    MIN_BUCKET_SIZE = 100.0  # Minimum bucket size
-    MAX_BUCKET_SIZE = 1000.0  # Maximum bucket size
-    
-    bucket_size: bpy.props.FloatProperty(
-        name="Bucket Size",
-        description="Size of each bucket cell in world units",
-        default=500.0,
-        min=MIN_BUCKET_SIZE,
-        max=MAX_BUCKET_SIZE
-    )
     
     height_min: bpy.props.FloatProperty(
         name="Min Height (Z)",
@@ -1662,7 +1653,6 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
     
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "bucket_size")
         col = layout.column()
         col.label(text="Height Range (Z):")
         row = col.row()
@@ -1734,7 +1724,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             # Riot creates separate bucket grids for each render region, baron hash, and visibility layer
             
             render_region_hash = obj.get("render_region_hash", "")
-            if render_region_hash and render_region_hash != "00000000":
+            if self.include_render_regions and render_region_hash and render_region_hash != "00000000":
                 # Render region hash (highest priority)
                 try:
                     hash_val = int(render_region_hash, 16)
@@ -1787,33 +1777,15 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         total_grids_created = 0
         
         for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
-                # Find the parent of the _Meshes collection
-                for parent_col in bpy.data.collections:
-                    if col.name in [c.name for c in parent_col.children]:
-                        parent_collection = parent_col
-                        break
-                break
-        
-        # Remove existing custom bucket grid collections
-        to_remove = []
-        for col in bpy.data.collections:
-            if col.get("is_bucket_grid_collection") and col.get("is_custom_bucket_grid"):
-                to_remove.append(col)
-        
-        for col in to_remove:
-            for obj in list(col.objects):
-                bpy.data.objects.remove(obj, do_unlink=True)
-            bpy.data.collections.remove(col)
-        
-        # Process each hash group separately
-        total_grids_created = 0
-        
-        for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
             
-            # Determine path_hash and layer suffix based on hash type
+            # Determine path_hash/v18 and layer suffix based on hash type
+            # Riot's format: render_region hash → grid.unknown_v18_float (path_hash=0)
+            #                baron/visibility hash → grid.path_hash (v18=0)
+            v18_hash = 0  # unknown_v18_float stored as uint32 bit pattern
             if hash_type == 'render_region':
-                path_hash = hash_value
-                layer_suffix = f"_RR{path_hash:08X}"
+                path_hash = 0  # render_region uses v18, NOT path_hash
+                v18_hash = hash_value
+                layer_suffix = f"_RR{hash_value:08X}"
                 visibility_layer = 0  # Render regions don't use dragon layers
             elif hash_type == 'baron':
                 path_hash = hash_value
@@ -1873,26 +1845,49 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
 
             # Bucket grid uses X/Y plane in Blender (mapgeo X/Z horizontal → Blender X/Y horizontal)
             # Blender: X/Y is horizontal ground plane, Z is up
-            bucket_size = self.bucket_size
 
             # Calculate grid dimensions (using X and Y for horizontal plane)
-            # Expand bounds slightly to ensure all geometry is contained
-            min_x = min_x - 1.0
-            min_y = min_y - 1.0
-            max_x = max_x + 1.0
-            max_y = max_y + 1.0
+            # Add a tiny epsilon to max bounds to avoid edge-case bucket assignment on boundaries.
+            max_x += 1e-3
+            max_y += 1e-3
 
             range_x = max_x - min_x
             range_y = max_y - min_y
 
-            # Calculate buckets_per_side based on the larger dimension (square grid)
+            # RIOT-STYLE: Automatically calculate buckets_per_side based on TARGET_GRID_SIZE
+            # This ensures consistent ~32x32 bucketing across all maps (like Riot does)
+            
             max_range = max(range_x, range_y)
+            
+            # Calculate bucket_size from target: bucket_size = max_range / TARGET_GRID_SIZE
+            # This automatically gives finer buckets for large areas, coarser for small areas
+            bucket_size = max_range / self.TARGET_GRID_SIZE if max_range > 0 else 1.0
             buckets_per_side = max(1, int((max_range / bucket_size) + 0.5))
-
-            # Cap at maximum grid size to prevent freezing
+            
+            # Cap at maximum grid size to prevent freezing (no need for MIN/MAX constants anymore)
             if buckets_per_side > self.MAX_GRID_SIZE:
                 buckets_per_side = self.MAX_GRID_SIZE
-                bucket_size = max_range / buckets_per_side
+            
+            # If grid is too coarse (very small area), ensure minimum bucketing for spatial coherence
+            if buckets_per_side < 2 and max_range > 0:
+                buckets_per_side = 2
+            
+            # Calculate actual bucket sizes based on the grid dimensions (Riot-style)
+            # This ensures each bucket fits the geometry exactly, not based on fixed input bucket_size
+            bucket_size_x = range_x / buckets_per_side if buckets_per_side > 0 else range_x
+            bucket_size_z = range_y / buckets_per_side if buckets_per_side > 0 else range_y
+            
+            # CRITICAL: Prevent division by zero crash in-game
+            # If bucket size is effectively 0 (thin/linear geometry), expand bounds slightly
+            if bucket_size_x < 0.01:
+                bucket_size_x = 0.01
+                max_x = min_x + bucket_size_x * buckets_per_side
+                range_x = max_x - min_x
+            
+            if bucket_size_z < 0.01:
+                bucket_size_z = 0.01
+                max_y = min_y + bucket_size_z * buckets_per_side
+                range_y = max_y - min_y
             
             # ────────────────────────────────────────────────────────────
             # RIOT-STYLE: Per-bucket vertex subsets with unique base_vertex
@@ -1929,9 +1924,14 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 # Assign face to ONE bucket based on centroid (matches Riot's pattern)
                 cx = (v0.x + v1.x + v2.x) / 3.0
                 cy = (v0.y + v1.y + v2.y) / 3.0
-                
-                home_bx = max(0, min(buckets_per_side - 1, int((cx - min_x) / bucket_size)))
-                home_by = max(0, min(buckets_per_side - 1, int((cy - min_y) / bucket_size)))
+
+                # Use floor+clamp (Rust reference behavior) instead of int truncation.
+                # Use calculated bucket_size_x and bucket_size_z for each dimension separately.
+                # Double-clamp to ensure safety against floating-point precision issues
+                fx = (cx - min_x) / bucket_size_x if bucket_size_x > 0 else 0
+                fy = (cy - min_y) / bucket_size_z if bucket_size_z > 0 else 0
+                home_bx = max(0, min(buckets_per_side - 1, int(math.floor(fx))))
+                home_by = max(0, min(buckets_per_side - 1, int(math.floor(fy))))
                 
                 # Check if face extends beyond its home bucket
                 tri_min_x = min(v0.x, v1.x, v2.x)
@@ -1939,10 +1939,10 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 tri_min_y = min(v0.y, v1.y, v2.y)
                 tri_max_y = max(v0.y, v1.y, v2.y)
                 
-                bucket_left = min_x + home_bx * bucket_size
-                bucket_right = bucket_left + bucket_size
-                bucket_bottom = min_y + home_by * bucket_size
-                bucket_top = bucket_bottom + bucket_size
+                bucket_left = min_x + home_bx * bucket_size_x
+                bucket_right = bucket_left + bucket_size_x
+                bucket_bottom = min_y + home_by * bucket_size_z
+                bucket_top = bucket_bottom + bucket_size_z
                 
                 sticks_out = (tri_min_x < bucket_left or tri_max_x > bucket_right or
                               tri_min_y < bucket_bottom or tri_max_y > bucket_top)
@@ -2023,10 +2023,10 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                         bucket_stickout_x = 0.0
                         bucket_stickout_z = 0.0
                         
-                        bucket_left = min_x + bx * bucket_size
-                        bucket_right = bucket_left + bucket_size
-                        bucket_bottom = min_y + bz * bucket_size
-                        bucket_top = bucket_bottom + bucket_size
+                        bucket_left = min_x + bx * bucket_size_x
+                        bucket_right = bucket_left + bucket_size_x
+                        bucket_bottom = min_y + bz * bucket_size_z
+                        bucket_top = bucket_bottom + bucket_size_z
                         
                         for face_idx in sticking_faces:
                             sv0, sv1, sv2, _ = all_triangles[face_idx]
@@ -2053,7 +2053,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                         }
             
             # Create bucket grid mesh for Blender display (deduplicated vertices)
-            layer_suffix = f"_L{visibility_layer}" if visibility_layer != 0 else ""
+            # layer_suffix already set above based on hash_type (render_region/baron/visibility_layer)
             grid_mesh = bpy.data.meshes.new(f"CustomBucketGrid{layer_suffix}_Mesh")
             
             # Use deduplicated vertices with global indices for clean Blender display
@@ -2073,8 +2073,10 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             bg_collection["visibility_layer"] = visibility_layer
             bg_collection["hash_type"] = hash_type  # Store hash type for reference
             
-            # Use path_hash determined earlier (from render_region, baron, or visibility_layer mapping)
-            path_hash_str = f"{path_hash:08X}"
+            # Use identifiers determined earlier (from render_region, baron, or visibility_layer mapping)
+            # For display: use whichever is non-zero (path_hash or v18_hash)
+            display_hash = path_hash if path_hash != 0 else v18_hash
+            path_hash_str = f"{display_hash:08X}"
             
             # Create bucket grid object with proper naming (matches import structure)
             grid_name = f"BucketGrid_{path_hash_str}"
@@ -2114,8 +2116,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             grid_obj["bounds_min_z"] = min_y  # Note: Blender Y → mapgeo Z
             grid_obj["bounds_max_x"] = max_x
             grid_obj["bounds_max_z"] = max_y
-            grid_obj["bucket_size_x"] = bucket_size
-            grid_obj["bucket_size_z"] = bucket_size
+            grid_obj["bucket_size_x"] = bucket_size_x
+            grid_obj["bucket_size_z"] = bucket_size_z
             grid_obj["buckets_per_side"] = buckets_per_side
             grid_obj["visibility_layer"] = visibility_layer
             grid_obj["stickout_x"] = global_max_stickout_x
@@ -2133,12 +2135,12 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 'min_z': min_y,  # Note: Blender Y → mapgeo Z
                 'max_x': max_x,
                 'max_z': max_y,
-                'bucket_size_x': bucket_size,
-                'bucket_size_z': bucket_size,
+                'bucket_size_x': bucket_size_x,
+                'bucket_size_z': bucket_size_z,
                 'buckets_per_side': buckets_per_side,
                 'is_disabled': False,
                 'flags': 0,
-                'unknown_v18_float': "00000000",  # Stored as hex string
+                'unknown_v18_float': f"{v18_hash:08X}",  # Stored as hex string
                 'max_stickout_x': global_max_stickout_x,
                 'max_stickout_z': global_max_stickout_z,
                 'vertices': [(v.x, v.z, v.y) for v in final_vertices],  # Blender→mapgeo coord swap
@@ -2623,7 +2625,8 @@ class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
             root_collection.children.link(collection)
         
         collection["is_bucket_grid_collection"] = True
-        collection["is_custom_bucket_grid"] = True
+        # NOT custom — these are imported originals used as reference by the exporter
+        # (is_custom_bucket_grid intentionally NOT set)
         collection["bucket_grid_count"] = len(mapgeo_data.bucket_grids)
         
         # Import bucket grids with full geometry
@@ -2789,7 +2792,7 @@ class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
                 "buckets_per_side": grid.buckets_per_side,
                 "is_disabled": grid.is_disabled,
                 "flags": grid.flags,
-                "unknown_v18_float": grid.unknown_v18_float,
+                "unknown_v18_float": f"{struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]:08X}",
                 "max_stickout_x": grid.max_stickout_x,
                 "max_stickout_z": grid.max_stickout_z,
                 "vertices": [(v[0], v[1], v[2]) for v in grid.vertices] if grid.vertices else [],

@@ -7,6 +7,7 @@ Texture edits propagate to the viewport in real-time.
 import bpy
 import json
 import os
+import re
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import (
     StringProperty, IntProperty, FloatProperty, BoolProperty,
@@ -161,6 +162,9 @@ _BLEND_FACTORS = {
 
 _SHADER_TEMPLATES = {}
 _SHADER_TEMPLATE_ITEMS = []
+_SHADER_DEFAULT_TEXTURES_BY_PATH = None
+_SHADER_DEFAULT_TEXTURES_SOURCE = None
+_RIOT_SHADERS_PY_DEFAULT = r"C:\Riot Games\League of Legends\Game\DATA\FINAL\Shaders\Shaders.wad\data\shaders\shaders.py"
 
 try:
     _tpl_path = Path(__file__).parent / "shader_templates_data.json"
@@ -218,6 +222,57 @@ class MAPGEO_MaterialEditorProperties(PropertyGroup):
 # ============================================================================
 # Helpers
 # ============================================================================
+
+def _get_riot_shaders_py_path():
+    return _RIOT_SHADERS_PY_DEFAULT if os.path.exists(_RIOT_SHADERS_PY_DEFAULT) else ""
+
+
+def _load_shader_default_textures():
+    global _SHADER_DEFAULT_TEXTURES_BY_PATH
+    global _SHADER_DEFAULT_TEXTURES_SOURCE
+
+    source_path = _get_riot_shaders_py_path()
+    if not source_path:
+        _SHADER_DEFAULT_TEXTURES_BY_PATH = {}
+        _SHADER_DEFAULT_TEXTURES_SOURCE = ""
+        return _SHADER_DEFAULT_TEXTURES_BY_PATH
+
+    if _SHADER_DEFAULT_TEXTURES_BY_PATH is not None and _SHADER_DEFAULT_TEXTURES_SOURCE == source_path:
+        return _SHADER_DEFAULT_TEXTURES_BY_PATH
+
+    try:
+        with open(source_path, "r", encoding="utf-8", errors="ignore") as handle:
+            content = handle.read()
+    except Exception:
+        _SHADER_DEFAULT_TEXTURES_BY_PATH = {}
+        _SHADER_DEFAULT_TEXTURES_SOURCE = source_path
+        return _SHADER_DEFAULT_TEXTURES_BY_PATH
+
+    entries = {}
+    entry_pattern = re.compile(
+        r'"(Shaders/StaticMesh/[^"]+)"\s*=\s*CustomShaderDef\s*\{(.*?)\n\s*objectPath\s*:\s*string\s*=\s*"\1"',
+        re.DOTALL,
+    )
+    tex_block_pattern = re.compile(r'ShaderTexture\s*\{(.*?)\}', re.DOTALL)
+    name_pattern = re.compile(r'name\s*:\s*string\s*=\s*"([^"]+)"')
+    path_pattern = re.compile(r'defaultTexturePath\s*:\s*string\s*=\s*"([^"]+)"')
+
+    for shader_path, body in entry_pattern.findall(content):
+        sampler_map = {}
+        for tex_block in tex_block_pattern.findall(body):
+            name_match = name_pattern.search(tex_block)
+            path_match = path_pattern.search(tex_block)
+            if not name_match or not path_match:
+                continue
+            sampler_name = name_match.group(1)
+            texture_path = path_match.group(1)
+            sampler_map[sampler_name.lower()] = texture_path
+        if sampler_map:
+            entries[shader_path] = sampler_map
+
+    _SHADER_DEFAULT_TEXTURES_BY_PATH = entries
+    _SHADER_DEFAULT_TEXTURES_SOURCE = source_path
+    return _SHADER_DEFAULT_TEXTURES_BY_PATH
 
 def _is_color_param(name: str) -> bool:
     """Heuristic: does *name* look like it stores a colour?"""
@@ -2199,6 +2254,111 @@ class MAPGEO_OT_assign_material_to_mesh(Operator):
         return {'FINISHED'}
 
 
+def _normalize_shader_key(shader_name: str) -> str:
+    return "".join(ch for ch in shader_name.lower() if ch.isalnum())
+
+
+def _resolve_template_path_for_staticmesh(shader_name: str):
+    expected_path = f"Shaders/StaticMesh/{shader_name}"
+    if expected_path in _SHADER_TEMPLATES:
+        return expected_path
+
+    target_lower = shader_name.lower()
+    target_norm = _normalize_shader_key(shader_name)
+
+    for path, tpl in _SHADER_TEMPLATES.items():
+        short = tpl.get("short_name", path.rsplit("/", 1)[-1])
+        leaf = path.rsplit("/", 1)[-1]
+
+        if short.lower() == target_lower or leaf.lower() == target_lower:
+            return path
+
+        if _normalize_shader_key(short) == target_norm or _normalize_shader_key(leaf) == target_norm:
+            return path
+
+    return None
+
+
+def _apply_template_to_material(mat, shader_template: str, threshold: int, use_shader_defaults: bool = True):
+    tpl = _SHADER_TEMPLATES.get(shader_template)
+    if not tpl:
+        return False
+
+    mat["league_material_name"] = mat.name
+    mat["league_material_type"] = "StaticMaterialDef"
+
+    default_texture_map = {}
+    if use_shader_defaults:
+        default_texture_map = _load_shader_default_textures().get(shader_template, {})
+
+    samplers = []
+    for s in tpl.get("samplers", []):
+        if s.get("frequency", 0) >= threshold:
+            sampler_name = s["name"]
+            samplers.append({
+                "textureName": sampler_name,
+                "texturePath": default_texture_map.get(sampler_name.lower(), ""),
+                "addressU": s.get("addressU", 1),
+                "addressV": s.get("addressV", 1),
+                "addressW": s.get("addressW", 1),
+            })
+    mat["samplers"] = json.dumps(samplers)
+
+    params = []
+    for p in tpl.get("parameters", []):
+        if p.get("frequency", 0) >= threshold:
+            params.append({
+                "name": p["name"],
+                "value": p.get("value", [0, 0, 0, 0]),
+            })
+    mat["parameters"] = json.dumps(params)
+
+    switches = []
+    for s in tpl.get("switches", []):
+        if s.get("frequency", 0) >= threshold:
+            switches.append({
+                "name": s["name"],
+                "on": s.get("on", False),
+            })
+    mat["switches"] = json.dumps(switches)
+
+    mat["shader_macros"] = json.dumps(tpl.get("macros", {}))
+
+    blend = tpl.get("blend", {})
+    technique = {
+        "name": "normal",
+        "passes": [{
+            "shader": shader_template,
+            "blendEnable": blend.get("blendEnable", False),
+            "srcColorBlendFactor": blend.get("srcColorBlendFactor", 1),
+            "dstColorBlendFactor": blend.get("dstColorBlendFactor", 0),
+            "srcAlphaBlendFactor": blend.get("srcAlphaBlendFactor", 1),
+            "dstAlphaBlendFactor": blend.get("dstAlphaBlendFactor", 0),
+        }],
+    }
+    mat["techniques"] = json.dumps([technique])
+
+    children = tpl.get("child_techniques", [])
+    if children:
+        child_list = []
+        for cn in children:
+            child_list.append({
+                "name": cn,
+                "parentName": "normal",
+                "shaderMacros": {"ENV_TRANSITION": "1"} if cn == "env_transition" else {},
+            })
+        mat["child_techniques"] = json.dumps(child_list)
+    else:
+        mat["child_techniques"] = json.dumps([])
+
+    _, category = _classify_shader(shader_template)
+    mat["shader_name"] = shader_template.rsplit("/", 1)[-1]
+    mat["shader_category"] = category
+    if use_shader_defaults and _SHADER_DEFAULT_TEXTURES_SOURCE:
+        mat["shader_defaults_source"] = _SHADER_DEFAULT_TEXTURES_SOURCE
+    return True
+
+
 class MAPGEO_OT_create_material_from_template(Operator):
     """Create a new League material from a shader template (91 shaders, extracted from 9,509 game materials)"""
     bl_idname = "mapgeo.create_material_from_template"
@@ -2216,12 +2376,18 @@ class MAPGEO_OT_create_material_from_template(Operator):
         default=False,
         description="Also include parameters/switches that appear in <10% of materials using this shader",
     )
+    use_shader_defaults: BoolProperty(
+        name="Use Riot Default Textures",
+        default=True,
+        description="Auto-fill sampler texture paths from Shaders.wad data/shaders/shaders.py",
+    )
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "shader_template")
         layout.prop(self, "new_name")
         layout.prop(self, "include_low_freq")
+        layout.prop(self, "use_shader_defaults")
 
         # Show template preview
         tpl = _SHADER_TEMPLATES.get(self.shader_template)
@@ -2278,88 +2444,280 @@ class MAPGEO_OT_create_material_from_template(Operator):
             return {'CANCELLED'}
 
         threshold = 0 if self.include_low_freq else 10
-
-        # Create new material
-        mat = bpy.data.materials.new(name=self.new_name)
-        mat.use_nodes = True
         short_name = tpl.get("short_name", self.shader_template.rsplit("/", 1)[-1])
 
-        # League metadata
-        mat["league_material_name"] = self.new_name
-        mat["league_material_type"] = "StaticMaterialDef"
-
-        # Samplers
-        samplers = []
-        for s in tpl.get("samplers", []):
-            if s.get("frequency", 0) >= threshold:
-                samplers.append({
-                    "textureName": s["name"],
-                    "texturePath": "",
-                    "addressU": s.get("addressU", 1),
-                    "addressV": s.get("addressV", 1),
-                    "addressW": s.get("addressW", 1),
-                })
-        mat["samplers"] = json.dumps(samplers)
-
-        # Parameters
-        params = []
-        for p in tpl.get("parameters", []):
-            if p.get("frequency", 0) >= threshold:
-                params.append({
-                    "name": p["name"],
-                    "value": p.get("value", [0, 0, 0, 0]),
-                })
-        mat["parameters"] = json.dumps(params)
-
-        # Switches
-        switches = []
-        for s in tpl.get("switches", []):
-            if s.get("frequency", 0) >= threshold:
-                switches.append({
-                    "name": s["name"],
-                    "on": s.get("on", False),
-                })
-        mat["switches"] = json.dumps(switches)
-
-        # Macros
-        mat["shader_macros"] = json.dumps(tpl.get("macros", {}))
-
-        # Techniques
-        blend = tpl.get("blend", {})
-        technique = {
-            "name": "normal",
-            "passes": [{
-                "shader": self.shader_template,
-                "blendEnable": blend.get("blendEnable", False),
-                "srcColorBlendFactor": blend.get("srcColorBlendFactor", 1),
-                "dstColorBlendFactor": blend.get("dstColorBlendFactor", 0),
-                "srcAlphaBlendFactor": blend.get("srcAlphaBlendFactor", 1),
-                "dstAlphaBlendFactor": blend.get("dstAlphaBlendFactor", 0),
-            }],
-        }
-        mat["techniques"] = json.dumps([technique])
+        mat = bpy.data.materials.new(name=self.new_name)
+        mat.use_nodes = True
+        _apply_template_to_material(mat, self.shader_template, threshold, self.use_shader_defaults)
         _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
-
-        # Child techniques
-        children = tpl.get("child_techniques", [])
-        if children:
-            child_list = []
-            for cn in children:
-                child_list.append({
-                    "name": cn,
-                    "parentName": "normal",
-                    "shaderMacros": {"ENV_TRANSITION": "1"} if cn == "env_transition" else {},
-                })
-            mat["child_techniques"] = json.dumps(child_list)
-        else:
-            mat["child_techniques"] = json.dumps([])
-
         _tag_redraw(context)
+
+        samplers = json.loads(mat.get("samplers", "[]"))
+        params = json.loads(mat.get("parameters", "[]"))
+        switches = json.loads(mat.get("switches", "[]"))
         self.report(
             {'INFO'},
             f"Created '{mat.name}' from {short_name} template "
             f"({len(samplers)} samplers, {len(params)} params, {len(switches)} switches)",
         )
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_create_staticmesh_shader_previews(Operator):
+    """Create preview meshes and assign StaticMesh shader materials"""
+    bl_idname = "mapgeo.create_staticmesh_shader_previews"
+    bl_label = "Create StaticMesh Shader Previews"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name_prefix: StringProperty(
+        name="Name Prefix",
+        default="SM_",
+        description="Material name prefix for template-generated materials",
+    )
+    include_low_freq: BoolProperty(
+        name="Include Rare Properties",
+        default=False,
+        description="Also include low-frequency template params/switches",
+    )
+    rebuild_materials: BoolProperty(
+        name="Rebuild Materials",
+        default=False,
+        description="Re-apply templates to existing preview materials",
+    )
+    use_shader_defaults: BoolProperty(
+        name="Use Riot Default Textures",
+        default=True,
+        description="Auto-fill sampler texture paths from Shaders.wad data/shaders/shaders.py",
+    )
+    add_shader_labels: BoolProperty(
+        name="Add Shader Labels",
+        default=True,
+        description="Create a text label for each preview mesh",
+    )
+    labels_as_mesh: BoolProperty(
+        name="Convert Labels to Mesh",
+        default=False,
+        description="Convert text labels to mesh objects (exportable to mapgeo)",
+    )
+    label_size: FloatProperty(
+        name="Label Size",
+        default=0.25,
+        min=0.01,
+        description="Size of shader name labels",
+    )
+    label_offset_y: FloatProperty(
+        name="Label Y Offset",
+        default=1.05,
+        min=0.0,
+        description="Distance in front of each preview plane",
+    )
+    label_offset_z: FloatProperty(
+        name="Label Z Offset",
+        default=0.02,
+        min=0.0,
+        description="Height offset for labels",
+    )
+    collection_name: StringProperty(
+        name="Collection",
+        default="StaticMesh_Shader_Previews",
+        description="Collection to store preview meshes",
+    )
+    grid_columns: IntProperty(
+        name="Columns",
+        default=8,
+        min=1,
+        max=64,
+        description="Number of columns in the preview grid",
+    )
+    spacing: FloatProperty(
+        name="Spacing",
+        default=5.0,
+        min=0.1,
+        description="Spacing between preview meshes",
+    )
+    plane_size: FloatProperty(
+        name="Plane Size",
+        default=1.5,
+        min=0.1,
+        description="Size of each preview plane",
+    )
+    rebuild_collection: BoolProperty(
+        name="Rebuild Collection",
+        default=True,
+        description="Delete existing preview collection contents before creating",
+    )
+
+    def execute(self, context):
+        json_path = os.path.join(os.path.dirname(__file__), "staticmesh_shader_list.json")
+        if not os.path.exists(json_path):
+            self.report({'ERROR'}, f"Missing shader list: {json_path}")
+            return {'CANCELLED'}
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                shader_names = json.load(handle)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to read shader list: {exc}")
+            return {'CANCELLED'}
+
+        behavior_order = {
+            "water": 0,
+            "water_river": 0,
+            "water_radial": 0,
+            "water_flow": 0,
+            "water_ocean": 0,
+            "water_rain": 0,
+            "glass": 1,
+            "glass_diffuse": 1,
+            "glass_blend": 1,
+            "planar_reflection": 1,
+            "emissive_basic": 2,
+            "glow": 2,
+            "glow_sign": 2,
+            "glow_mask": 2,
+            "glow_decal": 2,
+            "emissive_decal": 2,
+            "hologram": 3,
+            "faelights": 3,
+            "gradient_color": 3,
+            "flipbook_emissive": 3,
+            "twist_emissive": 3,
+            "terrain_4tex": 4,
+            "vertex_deform": 4,
+            "foliage": 5,
+            "scrolling": 5,
+            "scrolling_emissive": 5,
+            "transition": 5,
+            "parallax": 6,
+            "sparkle_parallax": 6,
+            "cloth": 6,
+            "alpha_test": 7,
+            "alpha_test_double": 7,
+            "standard": 9,
+        }
+
+        shader_entries = []
+        for shader_name in shader_names:
+            template_path = _resolve_template_path_for_staticmesh(shader_name)
+            classify_path = template_path if template_path else f"Shaders/StaticMesh/{shader_name}"
+            _, category = _classify_shader(classify_path)
+            rank = behavior_order.get(category, 99)
+            shader_entries.append((rank, category, shader_name, template_path))
+
+        shader_entries.sort(key=lambda item: (item[0], item[1], item[2].lower()))
+
+        root_collection = context.scene.collection
+        preview_collection = bpy.data.collections.get(self.collection_name)
+        if preview_collection is None:
+            preview_collection = bpy.data.collections.new(self.collection_name)
+            root_collection.children.link(preview_collection)
+        elif self.rebuild_collection:
+            for obj in list(preview_collection.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        created = 0
+        labels_created = 0
+        skipped = 0
+
+        label_material = None
+        if self.add_shader_labels and self.labels_as_mesh:
+            label_material = bpy.data.materials.get("SM_ShaderLabel")
+            if label_material is None:
+                label_material = bpy.data.materials.new(name="SM_ShaderLabel")
+                label_material.use_nodes = True
+                label_nodes = label_material.node_tree.nodes
+                label_links = label_material.node_tree.links
+                label_nodes.clear()
+                emission = label_nodes.new("ShaderNodeEmission")
+                emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+                emission.inputs["Strength"].default_value = 2.0
+                out = label_nodes.new("ShaderNodeOutputMaterial")
+                label_links.new(emission.outputs["Emission"], out.inputs["Surface"])
+        for _, category, shader_name, template_path in shader_entries:
+            if not template_path:
+                skipped += 1
+                continue
+
+            mat_name = f"{self.name_prefix}{shader_name}"
+            mat = bpy.data.materials.get(mat_name)
+            if mat is None:
+                mat = bpy.data.materials.new(name=mat_name)
+
+            if mat is None:
+                skipped += 1
+                continue
+
+            preview_index = created
+            if self.rebuild_materials or "techniques" not in mat:
+                threshold = 0 if self.include_low_freq else 10
+                _apply_template_to_material(mat, template_path, threshold, self.use_shader_defaults)
+                _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
+
+            col = preview_index % self.grid_columns
+            row = preview_index // self.grid_columns
+            x = col * self.spacing
+            y = -row * self.spacing
+
+            mesh = bpy.data.meshes.new(f"SM_Preview_{shader_name}")
+            half = self.plane_size * 0.5
+            verts = [
+                (-half, -half, 0.0),
+                (half, -half, 0.0),
+                (half, half, 0.0),
+                (-half, half, 0.0),
+            ]
+            faces = [(0, 1, 2, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+
+            obj = bpy.data.objects.new(f"SM_Preview_{shader_name}", mesh)
+            obj.location = (x, y, 0.0)
+            preview_collection.objects.link(obj)
+
+            if obj.data.materials:
+                obj.data.materials[0] = mat
+            else:
+                obj.data.materials.append(mat)
+
+            obj["preview_shader_name"] = shader_name
+            obj["preview_shader_category"] = category
+
+            if self.add_shader_labels:
+                curve = bpy.data.curves.new(f"SM_LabelCurve_{shader_name}", type='FONT')
+                curve.body = shader_name
+                curve.size = self.label_size
+                curve.align_x = 'CENTER'
+                curve.align_y = 'CENTER'
+
+                label_obj = bpy.data.objects.new(f"SM_Label_{shader_name}", curve)
+                label_obj.location = (x, y - self.label_offset_y, self.label_offset_z)
+                preview_collection.objects.link(label_obj)
+
+                if self.labels_as_mesh:
+                    for scene_obj in context.view_layer.objects:
+                        scene_obj.select_set(False)
+                    label_obj.select_set(True)
+                    context.view_layer.objects.active = label_obj
+                    try:
+                        bpy.ops.object.convert(target='MESH')
+                    except Exception:
+                        pass
+                    converted_obj = context.view_layer.objects.active
+                    if converted_obj and converted_obj.type == 'MESH':
+                        converted_obj["preview_shader_name"] = shader_name
+                        if label_material:
+                            if converted_obj.data.materials:
+                                converted_obj.data.materials[0] = label_material
+                            else:
+                                converted_obj.data.materials.append(label_material)
+                        labels_created += 1
+                else:
+                    labels_created += 1
+
+            created += 1
+
+        _tag_redraw(context)
+        self.report({'INFO'}, f"Created {created} preview meshes + {labels_created} labels ({skipped} shaders skipped)")
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -3630,6 +3988,14 @@ class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
             text="Create from Shader Template", icon='PRESET_NEW',
         )
 
+        box = layout.box()
+        box.label(text="Shader Library", icon='SHADING_RENDERED')
+        col = box.column(align=True)
+        col.operator(
+            "mapgeo.create_staticmesh_shader_previews",
+            text="Create Shader Preview Meshes (Templates)", icon='MESH_GRID',
+        )
+
         # Duplicate existing
         if bpy.data.materials:
             box = layout.box()
@@ -3693,6 +4059,7 @@ material_editor_classes = (
     MAPGEO_OT_import_materials_file,
     MAPGEO_OT_assign_material_to_mesh,
     MAPGEO_OT_create_material_from_template,
+    MAPGEO_OT_create_staticmesh_shader_previews,
     MAPGEO_OT_duplicate_material,
     MAPGEO_OT_export_materials_to_file,
     MAPGEO_OT_export_materials_merge_file,

@@ -43,6 +43,10 @@ desktop.ini
 test_output/
 temp/
 
+# Local-only work folders (never push)
+Research/
+TestCode/
+
 # Test and debug scripts
 _*.py
 !__init__.py

@@ -25,6 +25,12 @@ _imported_bucket_grids_cache = {}
 # Module-level cache for imported sampler defs (persists in Blender session)
 _imported_sampler_defs_cache = []
 
+# Module-level cache for vertex buffer descriptions (preserves multi-stream layout)
+_imported_vb_descriptions_cache = []
+
+# Per-mesh vertex declaration info: list of {"decl_id": int, "decl_count": int, "stream_elements": [[elem_names], ...]}
+_imported_mesh_vb_layout_cache = []
+
 # Blender version check for performance optimizations
 _BLENDER_VERSION = bpy.app.version
 
@@ -235,6 +241,38 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             ]
             if _imported_sampler_defs_cache:
                 log.info("Import", f"Cached {len(_imported_sampler_defs_cache)} sampler defs for export")
+            
+            # Cache vertex buffer descriptions for export round-trip
+            global _imported_vb_descriptions_cache
+            _imported_vb_descriptions_cache = []
+            for desc in mapgeo.vertex_buffer_descriptions:
+                desc_data = {
+                    "usage": desc.usage,
+                    "elements": [{"name": e.name, "format": e.format, "offset": e.offset} for e in desc.elements]
+                }
+                _imported_vb_descriptions_cache.append(desc_data)
+            log.info("Import", f"Cached {len(_imported_vb_descriptions_cache)} vertex buffer descriptions")
+            
+            # Cache per-mesh vertex buffer layout for export round-trip
+            global _imported_mesh_vb_layout_cache
+            _imported_mesh_vb_layout_cache = []
+            for mesh_data in mapgeo.meshes:
+                layout = {
+                    "decl_id": mesh_data.vertex_declaration_id,
+                    "decl_count": mesh_data.vertex_declaration_count,
+                }
+                # Store which element names belong to each stream
+                stream_elements = []
+                for stream_idx in range(mesh_data.vertex_declaration_count):
+                    desc_id = mesh_data.vertex_declaration_id + stream_idx
+                    if desc_id < len(mapgeo.vertex_buffer_descriptions):
+                        desc = mapgeo.vertex_buffer_descriptions[desc_id]
+                        stream_elements.append([e.name for e in desc.elements])
+                    else:
+                        stream_elements.append([])
+                layout["stream_elements"] = stream_elements
+                _imported_mesh_vb_layout_cache.append(layout)
+            log.info("Import", f"Cached vertex buffer layout for {len(_imported_mesh_vb_layout_cache)} meshes")
             
             # Import into Blender
             imported_materials = self.import_mapgeo(context, mapgeo)
@@ -693,6 +731,20 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 obj["layer_transition_behavior"] = mesh_data.layer_transition_behavior
                 obj["render_flags"] = mesh_data.render_flags
                 obj["disable_backface_culling"] = int(mesh_data.disable_backface_culling)
+                
+                # Vertex buffer layout for round-trip export (preserve multi-stream)
+                obj["vertex_declaration_id"] = mesh_data.vertex_declaration_id
+                obj["vertex_declaration_count"] = mesh_data.vertex_declaration_count
+                # Store per-stream element names as JSON
+                stream_elements = []
+                for stream_idx in range(mesh_data.vertex_declaration_count):
+                    desc_id = mesh_data.vertex_declaration_id + stream_idx
+                    if desc_id < len(mapgeo.vertex_buffer_descriptions):
+                        desc = mapgeo.vertex_buffer_descriptions[desc_id]
+                        stream_elements.append([e.name for e in desc.elements])
+                    else:
+                        stream_elements.append([])
+                obj["vb_stream_elements"] = json.dumps(stream_elements)
                 
                 # Lightmap data - store scale/bias for all channels for round-trip
                 if mesh_data.baked_light:

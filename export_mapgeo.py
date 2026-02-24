@@ -96,7 +96,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         items=[
             ('NONE', "None", "Do not export bucket grids"),
             ('ORIGINAL', "Original (Recommended)", "Use Riot's original imported bucket grids"),
-            ('CUSTOM', "Custom (Experimental - May crash game)", "Use custom-created bucket grids (UNTESTED - may break!)"),
+            ('CUSTOM', "Custom", "Use custom-created bucket grids from the scene"),
         ],
         default='ORIGINAL'
     )
@@ -181,7 +181,11 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 self.collect_imported_bucket_grids(context, mapgeo)
             elif self.bucket_grid_mode == 'CUSTOM':
                 self.collect_custom_bucket_grids(context, mapgeo)
-                self.report({'WARNING'}, "Exporting CUSTOM bucket grids - UNTESTED, may crash the game!")
+
+            # Align mesh hash fields with exported bucket grids.
+            # This fixes cases where render-region hashes end up in
+            # visibility_controller_path_hash (or vice versa).
+            self._realign_mesh_hash_fields_to_bucket_grids(mapgeo)
             
             # Write to file
             parser = mapgeo_parser.MapgeoParser()
@@ -196,12 +200,61 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             import traceback
             traceback.print_exc()
             return {'CANCELLED'}
+
+    def _realign_mesh_hash_fields_to_bucket_grids(self, mapgeo: mapgeo_parser.MapgeoFile):
+        """Realign mesh hash fields to match exported bucket-grid identifier domains.
+
+        Riot format uses two hash domains:
+        - BucketGrid.path_hash  <-> Mesh.visibility_controller_path_hash
+        - BucketGrid.v18 hash   <-> Mesh.unknown_version18_int
+
+        If a mesh hash is in the wrong domain, the game can fail lookups during map load.
+        """
+        grid_path_hashes = set()
+        grid_v18_hashes = set()
+
+        for grid in mapgeo.bucket_grids:
+            if grid.path_hash:
+                grid_path_hashes.add(grid.path_hash)
+            v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
+            if v18_uint:
+                grid_v18_hashes.add(v18_uint)
+
+        moved_to_v18 = 0
+        moved_to_path = 0
+
+        for mesh in mapgeo.meshes:
+            path_hash = getattr(mesh, 'visibility_controller_path_hash', 0) or 0
+            rr_hash = getattr(mesh, 'unknown_version18_int', 0) or 0
+
+            # Path hash is not present in path-grid domain, but exists in v18-grid domain.
+            # Move it into unknown_version18_int.
+            if path_hash and path_hash not in grid_path_hashes and path_hash in grid_v18_hashes:
+                if rr_hash == 0:
+                    mesh.unknown_version18_int = path_hash
+                mesh.visibility_controller_path_hash = 0
+                moved_to_v18 += 1
+                continue
+
+            # Render-region hash is not present in v18-grid domain, but exists in path-grid domain.
+            # Move it into visibility_controller_path_hash.
+            if rr_hash and rr_hash not in grid_v18_hashes and rr_hash in grid_path_hashes:
+                if path_hash == 0:
+                    mesh.visibility_controller_path_hash = rr_hash
+                mesh.unknown_version18_int = 0
+                moved_to_path += 1
+
+        if moved_to_v18 or moved_to_path:
+            print(f"Realigned mesh hash fields: moved_to_v18={moved_to_v18}, moved_to_path={moved_to_path}")
     
     def create_mapgeo(self, context, objects) -> mapgeo_parser.MapgeoFile:
         """Create mapgeo data structure from Blender objects"""
         
         mapgeo = mapgeo_parser.MapgeoFile()
         mapgeo.version = self.export_version
+        
+        # Check if we have cached VB descriptions from import (for structure preservation)
+        have_vb_cache = bool(import_mapgeo._imported_vb_descriptions_cache)
         
         # Process each object
         for obj_idx, obj in enumerate(objects):
@@ -229,24 +282,59 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 # Update mesh (calculates normals, etc.)
                 mesh.update()
                 
-                # Create vertex buffer
-                vertex_buffer = self.create_vertex_buffer(mesh, obj)
-                vertex_buffer_id = len(mapgeo.vertex_buffers)
-                mapgeo.vertex_buffers.append(vertex_buffer)
+                # Get stream layout from cached import data
+                decl_count = obj.get("vertex_declaration_count", 1)
+                decl_id = obj.get("vertex_declaration_id", -1)
+                stream_elements_json = obj.get("vb_stream_elements", "")
                 
-                # Create index buffer
-                index_buffer = self.create_index_buffer(mesh)
-                index_buffer_id = len(mapgeo.index_buffers)
-                mapgeo.index_buffers.append(index_buffer)
+                # Try to parse stream elements
+                stream_elements = None
+                if stream_elements_json and have_vb_cache and decl_count > 1:
+                    try:
+                        stream_elements = json.loads(stream_elements_json)
+                    except (json.JSONDecodeError, TypeError):
+                        stream_elements = None
                 
-                # Create mesh entry
-                mesh_entry = self.create_mesh_entry(mesh, obj, vertex_buffer_id, index_buffer_id)
+                if stream_elements and len(stream_elements) == decl_count and decl_count > 1:
+                    # Multi-stream: create separate vertex buffers per stream
+                    vertex_buffers = self.create_multi_stream_vertex_buffers(mesh, obj, stream_elements)
+                    first_vb_id = len(mapgeo.vertex_buffers)
+                    vb_ids = []
+                    for vb in vertex_buffers:
+                        vb_ids.append(len(mapgeo.vertex_buffers))
+                        mapgeo.vertex_buffers.append(vb)
+                    
+                    # Create index buffer
+                    index_buffer = self.create_index_buffer(mesh)
+                    index_buffer_id = len(mapgeo.index_buffers)
+                    mapgeo.index_buffers.append(index_buffer)
+                    
+                    # Create mesh entry with multi-stream layout
+                    mesh_entry = self.create_mesh_entry(mesh, obj, first_vb_id, index_buffer_id)
+                    mesh_entry.vertex_buffer_ids = vb_ids
+                    mesh_entry.vertex_declaration_count = decl_count
+                    # vertex_declaration_id will be set later during description assignment
+                    mesh_entry.vertex_declaration_id = decl_id  # Use original decl_id for now
+                else:
+                    # Single-stream: create one vertex buffer (original behavior)
+                    vertex_buffer = self.create_vertex_buffer(mesh, obj)
+                    vertex_buffer_id = len(mapgeo.vertex_buffers)
+                    mapgeo.vertex_buffers.append(vertex_buffer)
+                    
+                    # Create index buffer
+                    index_buffer = self.create_index_buffer(mesh)
+                    index_buffer_id = len(mapgeo.index_buffers)
+                    mapgeo.index_buffers.append(index_buffer)
+                    
+                    # Create mesh entry
+                    mesh_entry = self.create_mesh_entry(mesh, obj, vertex_buffer_id, index_buffer_id)
                 
                 # Validate vertex count consistency (prevent crashes from buffer overruns)
-                if mesh_entry.vertex_count != vertex_buffer.vertex_count:
-                    print(f"ERROR: Vertex count mismatch for {obj.name}: mesh_entry claims {mesh_entry.vertex_count} but vertex_buffer has {vertex_buffer.vertex_count}")
+                first_vb = mapgeo.vertex_buffers[mesh_entry.vertex_buffer_ids[0]] if mesh_entry.vertex_buffer_ids else None
+                if first_vb and mesh_entry.vertex_count != first_vb.vertex_count:
+                    print(f"ERROR: Vertex count mismatch for {obj.name}: mesh_entry claims {mesh_entry.vertex_count} but vertex_buffer has {first_vb.vertex_count}")
                     print(f"  Correcting mesh_entry to match vertex_buffer")
-                    mesh_entry.vertex_count = vertex_buffer.vertex_count
+                    mesh_entry.vertex_count = first_vb.vertex_count
                 
                 mapgeo.meshes.append(mesh_entry)
                 
@@ -276,37 +364,243 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             mapgeo.sampler_defs.append(mapgeo_parser.SamplerDef(index=1, name="BAKED_DIFFUSE_TEXTURE_ALPHA"))
             print("No sampler defs cache found, using default sampler defs")
         
-        # Deduplicate vertex buffer descriptions
-        # Each VB has its own description, but many are identical;
-        # collect unique descriptions and remap vertex_declaration_id on meshes
-        unique_descs = []
-        desc_key_to_idx = {}  # maps desc_key -> index in unique_descs
-        vb_to_desc_idx = {}   # maps vertex_buffer_id -> index in unique_descs
-        
-        for vb_idx, vb in enumerate(mapgeo.vertex_buffers):
-            if vb.description is None:
-                continue
-            # Build a hashable key from the description's elements
-            desc_key = (vb.description.usage, tuple(
-                (e.name, e.format) for e in vb.description.elements
-            ))
-            if desc_key not in desc_key_to_idx:
-                desc_key_to_idx[desc_key] = len(unique_descs)
-                unique_descs.append(vb.description)
-            vb_to_desc_idx[vb_idx] = desc_key_to_idx[desc_key]
-        
-        # Store deduplicated descriptions on the mapgeo object
-        mapgeo.vertex_buffer_descriptions = unique_descs
-        print(f"Deduplicated VB descriptions: {len(mapgeo.vertex_buffers)} -> {len(unique_descs)}")
-        
-        # Update mesh vertex_declaration_id to point to deduplicated description index
-        for mesh_entry in mapgeo.meshes:
-            vb_id = mesh_entry.vertex_buffer_id
-            if vb_id in vb_to_desc_idx:
-                mesh_entry.vertex_declaration_id = vb_to_desc_idx[vb_id]
-            # vertex_declaration_count stays 1
+        # Restore vertex buffer descriptions from import cache or deduplicate
+        if have_vb_cache:
+            # Use the ORIGINAL descriptions from import - preserves exact game structure
+            mapgeo.vertex_buffer_descriptions = []
+            for desc_data in import_mapgeo._imported_vb_descriptions_cache:
+                elements = []
+                offset = 0
+                for elem_data in desc_data["elements"]:
+                    elem = mapgeo_parser.VertexElement(
+                        name=elem_data["name"],
+                        format=elem_data["format"],
+                        offset=offset
+                    )
+                    elements.append(elem)
+                    # Calculate offset for next element
+                    fmt_sizes = {0: 4, 1: 8, 2: 12, 3: 16, 4: 4, 5: 4, 6: 4, 7: 4, 8: 6, 9: 8, 10: 2, 11: 3, 12: 4}
+                    offset += fmt_sizes.get(elem_data["format"], 4)
+                desc = mapgeo_parser.VertexBufferDescription(
+                    usage=desc_data["usage"],
+                    elements=elements
+                )
+                mapgeo.vertex_buffer_descriptions.append(desc)
+            print(f"Restored {len(mapgeo.vertex_buffer_descriptions)} VB descriptions from import cache")
+            
+            # For multi-stream meshes, vertex_declaration_id was already set to the original value.
+            # For single-stream meshes, we need to find the right description.
+            # Build description lookup by element names
+            desc_lookup = {}
+            for desc_idx, desc in enumerate(mapgeo.vertex_buffer_descriptions):
+                key = tuple(e.name for e in desc.elements)
+                desc_lookup[key] = desc_idx
+            
+            for mesh_entry in mapgeo.meshes:
+                if mesh_entry.vertex_declaration_count > 1:
+                    # Multi-stream: vertex_declaration_id already set from import cache
+                    # Verify it's valid
+                    if mesh_entry.vertex_declaration_id + mesh_entry.vertex_declaration_count <= len(mapgeo.vertex_buffer_descriptions):
+                        pass  # Valid
+                    else:
+                        print(f"WARNING: Invalid multi-stream decl_id {mesh_entry.vertex_declaration_id} + count {mesh_entry.vertex_declaration_count}")
+                else:
+                    # Single-stream: find matching description
+                    vb_id = mesh_entry.vertex_buffer_ids[0] if mesh_entry.vertex_buffer_ids else 0
+                    if vb_id < len(mapgeo.vertex_buffers):
+                        vb = mapgeo.vertex_buffers[vb_id]
+                        if vb.description:
+                            key = tuple(e.name for e in vb.description.elements)
+                            if key in desc_lookup:
+                                mesh_entry.vertex_declaration_id = desc_lookup[key]
+                            else:
+                                # Description not in cache - add it
+                                new_idx = len(mapgeo.vertex_buffer_descriptions)
+                                mapgeo.vertex_buffer_descriptions.append(vb.description)
+                                desc_lookup[key] = new_idx
+                                mesh_entry.vertex_declaration_id = new_idx
+                                print(f"Added new VB description {new_idx} for uncached format: {key}")
+        else:
+            # No cache: deduplicate descriptions (original behavior)
+            unique_descs = []
+            desc_key_to_idx = {}
+            vb_to_desc_idx = {}
+            
+            for vb_idx, vb in enumerate(mapgeo.vertex_buffers):
+                if vb.description is None:
+                    continue
+                desc_key = (vb.description.usage, tuple(
+                    (e.name, e.format) for e in vb.description.elements
+                ))
+                if desc_key not in desc_key_to_idx:
+                    desc_key_to_idx[desc_key] = len(unique_descs)
+                    unique_descs.append(vb.description)
+                vb_to_desc_idx[vb_idx] = desc_key_to_idx[desc_key]
+            
+            mapgeo.vertex_buffer_descriptions = unique_descs
+            print(f"Deduplicated VB descriptions: {len(mapgeo.vertex_buffers)} -> {len(unique_descs)}")
+            
+            for mesh_entry in mapgeo.meshes:
+                vb_id = mesh_entry.vertex_buffer_ids[0] if mesh_entry.vertex_buffer_ids else 0
+                if vb_id in vb_to_desc_idx:
+                    mesh_entry.vertex_declaration_id = vb_to_desc_idx[vb_id]
         
         return mapgeo
+    
+    def create_multi_stream_vertex_buffers(self, mesh, obj, stream_elements) -> list:
+        """Create multiple vertex buffers for multi-stream vertex layouts.
+        
+        Args:
+            mesh: Blender mesh data
+            obj: Blender object (for custom properties)
+            stream_elements: List of lists, e.g. [[0,2], [7]] where numbers are VertexElementName values.
+                             Each inner list defines which elements go into that stream's vertex buffer.
+        
+        Returns:
+            List of VertexBuffer objects, one per stream.
+        """
+        # Get element format from cached descriptions
+        decl_id = obj.get("vertex_declaration_id", 0)
+        
+        # Build per-element format lookup from cached descriptions
+        elem_format_by_stream = []
+        for stream_idx, elem_names in enumerate(stream_elements):
+            desc_idx = decl_id + stream_idx
+            elem_formats = {}
+            if desc_idx < len(import_mapgeo._imported_vb_descriptions_cache):
+                cached_desc = import_mapgeo._imported_vb_descriptions_cache[desc_idx]
+                for ed in cached_desc["elements"]:
+                    elem_formats[ed["name"]] = ed["format"]
+            else:
+                # Fallback: use default formats
+                default_formats = {
+                    0: 2,   # POSITION -> XYZ_FLOAT32
+                    2: 2,   # NORMAL -> XYZ_FLOAT32
+                    4: 4,   # PRIMARY_COLOR -> BGRA_PACKED8888
+                    7: 1,   # TEXCOORD0 -> XY_FLOAT32
+                    12: 2,  # TEXCOORD5 -> XYZ_FLOAT32
+                    14: 1,  # TEXCOORD7 -> XY_FLOAT32
+                }
+                for en in elem_names:
+                    elem_formats[en] = default_formats.get(en, 2)
+            elem_format_by_stream.append(elem_formats)
+        
+        # Prepare shared data that elements may need
+        vertex_count = len(mesh.vertices)
+        uv_layer = mesh.uv_layers.active if mesh.uv_layers else None
+        lightmap_uv_layer = mesh.uv_layers.get("LightmapUV")
+        tc5_attr = mesh.attributes.get("TEXCOORD5")
+        raw_normals_attr = mesh.attributes.get("raw_normals")
+        
+        color_attr = None
+        if self.export_vertex_colors:
+            if mesh.color_attributes and len(mesh.color_attributes) > 0:
+                color_attr = mesh.color_attributes.active_color
+            elif mesh.vertex_colors:
+                color_attr = mesh.vertex_colors.active
+        
+        # Build vert_to_loops map (for UV and color lookups)
+        vert_to_loops = {}
+        for poly in mesh.polygons:
+            for loop_idx in poly.loop_indices:
+                loop = mesh.loops[loop_idx]
+                vert_idx = loop.vertex_index
+                if vert_idx not in vert_to_loops:
+                    vert_to_loops[vert_idx] = []
+                vert_to_loops[vert_idx].append(loop_idx)
+        
+        # Create one VB per stream
+        result_vbs = []
+        for stream_idx, elem_names in enumerate(stream_elements):
+            elem_formats = elem_format_by_stream[stream_idx]
+            
+            # Build elements list for this stream's description
+            elements = []
+            offset = 0
+            for en in elem_names:
+                fmt = elem_formats.get(en, 2)  # default XYZ_FLOAT32
+                elem = mapgeo_parser.VertexElement(name=en, format=fmt, offset=offset)
+                elements.append(elem)
+                offset += mapgeo_parser.VertexElement.get_format_size(fmt)
+            
+            desc = mapgeo_parser.VertexBufferDescription(
+                usage=0,  # Static
+                elements=elements
+            )
+            vertex_size = desc.get_vertex_size()
+            vertex_data = bytearray(vertex_size * vertex_count)
+            
+            # Write vertex data for this stream
+            for vert_idx, vert in enumerate(mesh.vertices):
+                buf_offset = vert_idx * vertex_size
+                current_offset = 0
+                
+                for en in elem_names:
+                    fmt = elem_formats.get(en, 2)
+                    elem_size = mapgeo_parser.VertexElement.get_format_size(fmt)
+                    write_pos = buf_offset + current_offset
+                    
+                    if en == 0:  # POSITION
+                        local_pos = vert.co
+                        struct.pack_into('<fff', vertex_data, write_pos,
+                                       local_pos.x, local_pos.z, local_pos.y)
+                    
+                    elif en == 2:  # NORMAL
+                        if raw_normals_attr and vert_idx < len(raw_normals_attr.data):
+                            rn = raw_normals_attr.data[vert_idx].vector
+                            struct.pack_into('<fff', vertex_data, write_pos,
+                                           rn.x, rn.z, rn.y)
+                        else:
+                            n = vert.normal
+                            struct.pack_into('<fff', vertex_data, write_pos,
+                                           n.x, n.z, n.y)
+                    
+                    elif en == 4:  # PRIMARY_COLOR
+                        if color_attr and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
+                            loop_idx = vert_to_loops[vert_idx][0]
+                            color = color_attr.data[loop_idx].color
+                            r = int(color[0] * 255)
+                            g = int(color[1] * 255)
+                            b = int(color[2] * 255)
+                            a = int(color[3] * 255) if len(color) > 3 else 255
+                            struct.pack_into('<BBBB', vertex_data, write_pos, b, g, r, a)
+                        else:
+                            struct.pack_into('<BBBB', vertex_data, write_pos, 255, 255, 255, 255)
+                    
+                    elif en == 7:  # TEXCOORD0
+                        if uv_layer and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
+                            loop_idx = vert_to_loops[vert_idx][0]
+                            uv = uv_layer.data[loop_idx].uv
+                            struct.pack_into('<ff', vertex_data, write_pos, uv[0], 1.0 - uv[1])
+                        else:
+                            struct.pack_into('<ff', vertex_data, write_pos, 0.0, 0.0)
+                    
+                    elif en == 12:  # TEXCOORD5
+                        if tc5_attr and vert_idx < len(tc5_attr.data):
+                            vec = tc5_attr.data[vert_idx].vector
+                            struct.pack_into('<fff', vertex_data, write_pos,
+                                           vec[0], vec[2], vec[1])
+                        else:
+                            struct.pack_into('<fff', vertex_data, write_pos, 0.0, 0.0, 0.0)
+                    
+                    elif en == 14:  # TEXCOORD7
+                        if lightmap_uv_layer and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
+                            loop_idx = vert_to_loops[vert_idx][0]
+                            uv = lightmap_uv_layer.data[loop_idx].uv
+                            struct.pack_into('<ff', vertex_data, write_pos, uv[0], 1.0 - uv[1])
+                        else:
+                            struct.pack_into('<ff', vertex_data, write_pos, 0.0, 0.0)
+                    
+                    current_offset += elem_size
+            
+            vb = mapgeo_parser.VertexBuffer(
+                description=desc,
+                data=bytes(vertex_data),
+                vertex_count=vertex_count
+            )
+            result_vbs.append(vb)
+        
+        return result_vbs
     
     def create_vertex_buffer(self, mesh, obj) -> mapgeo_parser.VertexBuffer:
         """Create vertex buffer from mesh"""
@@ -513,9 +807,14 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 print(f"Warning: Non-triangle face found (vertices: {len(poly.vertices)})")
                 continue
             
-            for vert_idx in poly.vertices:
-                struct.pack_into('<H', index_data, idx * 2, vert_idx)
-                idx += 1
+            # Reverse winding order: Blender faces were reversed on import
+            # (i0, i2, i1) to compensate for Y/Z coordinate swap handedness.
+            # Export must reverse again to restore original mapgeo winding.
+            v0, v1, v2 = poly.vertices
+            struct.pack_into('<H', index_data, idx * 2, v0)
+            struct.pack_into('<H', index_data, (idx + 1) * 2, v2)
+            struct.pack_into('<H', index_data, (idx + 2) * 2, v1)
+            idx += 3
         
         return mapgeo_parser.IndexBuffer(
             data=bytes(index_data),
@@ -735,72 +1034,21 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         return result
     
     def collect_custom_bucket_grids(self, context, mapgeo: mapgeo_parser.MapgeoFile):
-        """Collect bucket grids by merging imported originals with custom replacements.
+        """Collect bucket grids for export.
         
         Strategy:
-        1. Load ALL imported grids from the original bucket_data_json as the base
-        2. Load custom grids from custom bucket grid collections
-        3. Match custom grids to imported grids by identifier (checking BOTH
-           path_hash and unknown_v18_float fields)
-        4. For matches: use custom geometry but preserve original metadata
-           (hash/v18 field assignment, flags, buckets_per_side from original doc)
-        5. For unmatched imported grids: include as-is (preserves master terrain grid etc.)
-        6. For unmatched custom grids: include as new grids
+        1. Load custom grids from custom bucket grid collections
+        2. If custom grids exist, export them directly (they contain YOUR geometry)
+        3. If no custom grids, fall back to imported grids from reference collection
         
-        This ensures:
-        - Correct hash / unknown_v18_float field placement (game uses both for lookups)
-        - Correct flags and face_visibility_flags
-        - Original grid count is preserved when possible
+        Custom grids are created by the "Create Custom Bucket Grid" operator
+        which already sets the correct hash field placement:
+        - render_region hash → v18 field (path_hash=0)
+        - baron/visibility hash → path_hash field (v18=0)
         """
         scene_col_names = {c.name for c in self._get_all_collections(context)}
         
-        # ── Step 1: Load imported (original) grids as reference ──
-        imported_grids = []  # List of reconstructed BucketGrid from original import
-        imported_grid_ids = {}  # identifier (uint32) → index in imported_grids
-        
-        for col in bpy.data.collections:
-            # Find the IMPORTED bucket grid collection (NOT custom)
-            if (col.get("is_bucket_grid_collection") 
-                and not col.get("is_custom_bucket_grid")
-                and col.get("bucket_data_json")
-                and col.name in scene_col_names):
-                try:
-                    bucket_data_json = col.get("bucket_data_json", "[]")
-                    grids_data = json.loads(bucket_data_json)
-                    print(f"Loaded {len(grids_data)} imported grid(s) from '{col.name}' as reference")
-                    
-                    for grid_data in grids_data:
-                        grid = self._reconstruct_grid_from_json(grid_data)
-                        if grid is None:
-                            continue
-                        
-                        # Determine identifier: non-zero path_hash OR non-zero v18
-                        grid_id = grid.path_hash
-                        if grid_id == 0:
-                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
-                            v18_uint = struct.unpack('<I', v18_bytes)[0]
-                            grid_id = v18_uint  # May be 0 for master grid
-                        
-                        idx = len(imported_grids)
-                        imported_grids.append(grid)
-                        if grid_id != 0:
-                            imported_grid_ids[grid_id] = idx
-                        else:
-                            # Master grid (both hash and v18 are 0)
-                            imported_grid_ids[0] = idx
-                        
-                        v18_bytes = struct.pack('<f', grid.unknown_v18_float)
-                        v18_uint = struct.unpack('<I', v18_bytes)[0]
-                        print(f"  Imported grid: hash={grid.path_hash:08X} v18={v18_uint:08X} "
-                              f"flags={grid.flags} fvf={len(grid.face_visibility_flags)} "
-                              f"bps={grid.buckets_per_side} verts={len(grid.vertices)}")
-                except (json.JSONDecodeError, TypeError) as e:
-                    print(f"  ERROR parsing imported bucket_data_json: {e}")
-        
-        if not imported_grids:
-            print("WARNING: No imported grids found as reference. Custom grids will export without metadata merging.")
-        
-        # ── Step 2: Load custom grids ──
+        # ── Step 1: Load custom grids ──
         custom_grids = []  # List of (identifier, BucketGrid)
         
         for col in bpy.data.collections:
@@ -811,162 +1059,142 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     bucket_data_json = col.get("bucket_data_json", "[]")
                     grids_data = json.loads(bucket_data_json)
                     
+                    # Detect render_region collections (hash_type property or _RR in name)
+                    col_hash_type = col.get("hash_type", "")
+                    is_render_region_col = (col_hash_type == 'render_region' 
+                                            or '_RR' in col.name)
+                    
                     for grid_data in grids_data:
                         grid = self._reconstruct_grid_from_json(grid_data)
                         if grid is None:
                             continue
-                        # Custom grids store their identifier in path_hash
-                        custom_grids.append((grid.path_hash, grid))
-                        print(f"  Custom grid: hash={grid.path_hash:08X} "
-                              f"bps={grid.buckets_per_side} verts={len(grid.vertices)} idx={len(grid.indices)}")
+                        
+                        # Fix field placement for render_region grids.
+                        # Riot format: render_region hash → v18 field (path_hash=0).
+                        # Old custom grids may have stored the hash in path_hash instead.
+                        if is_render_region_col and grid.path_hash != 0 and grid.unknown_v18_float == 0.0:
+                            # Move hash from path_hash to v18
+                            grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
+                            grid.path_hash = 0
+                        
+                        # Determine identifier: path_hash if non-zero, else v18
+                        cid = grid.path_hash
+                        if cid == 0:
+                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
+                            cid_v18 = struct.unpack('<I', v18_bytes)[0]
+                            if cid_v18 != 0:
+                                cid = cid_v18
+                        
+                        custom_grids.append((cid, grid))
+                        
+                        v18_bytes = struct.pack('<f', grid.unknown_v18_float)
+                        v18_uint = struct.unpack('<I', v18_bytes)[0]
+                        print(f"  Custom grid: hash={cid:08X} "
+                              f"(path_hash={grid.path_hash:08X} v18={v18_uint:08X}) "
+                              f"flags={grid.flags} bps={grid.buckets_per_side} "
+                              f"verts={len(grid.vertices)} idx={len(grid.indices)}")
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"  ERROR parsing custom bucket_data_json: {e}")
         
-        if not custom_grids:
-            print("No custom bucket grid collections found")
-            # Still export imported grids as fallback
-            for grid in imported_grids:
-                mapgeo.bucket_grids.append(grid)
-            print(f"Exported {len(imported_grids)} imported grids (no custom replacements)")
+        if custom_grids:
+            # Ensure a valid master grid exists.
+            # League expects one grid with path_hash=0 and v18=0 that has
+            # flags bit 0 set and face_visibility_flags for every face.
+            master_grid = None
+            for cid, cgrid in custom_grids:
+                v18_uint = struct.unpack('<I', struct.pack('<f', cgrid.unknown_v18_float))[0]
+                if cgrid.path_hash == 0 and v18_uint == 0:
+                    master_grid = cgrid
+                    break
+
+            if master_grid is None and custom_grids:
+                # No explicit zero-id grid: synthesize master from largest custom grid
+                # so the engine always has a valid master visibility grid.
+                _, source_grid = max(custom_grids, key=lambda item: len(item[1].indices))
+                master_grid = mapgeo_parser.BucketGrid()
+                master_grid.path_hash = 0
+                master_grid.unknown_v18_float = 0.0
+                master_grid.min_x = source_grid.min_x
+                master_grid.min_z = source_grid.min_z
+                master_grid.max_x = source_grid.max_x
+                master_grid.max_z = source_grid.max_z
+                master_grid.bucket_size_x = source_grid.bucket_size_x
+                master_grid.bucket_size_z = source_grid.bucket_size_z
+                master_grid.buckets_per_side = source_grid.buckets_per_side
+                master_grid.is_disabled = False
+                master_grid.flags = 1
+                master_grid.max_stickout_x = source_grid.max_stickout_x
+                master_grid.max_stickout_z = source_grid.max_stickout_z
+                master_grid.vertices = list(source_grid.vertices)
+                master_grid.indices = list(source_grid.indices)
+                master_grid.buckets = [list(row) for row in source_grid.buckets]
+                master_face_count = len(master_grid.indices) // 3
+                master_grid.face_visibility_flags = [255] * master_face_count
+                print(f"  SYNTHESIZED master grid from largest custom grid: "
+                      f"bps={master_grid.buckets_per_side} "
+                      f"verts={len(master_grid.vertices)} idx={len(master_grid.indices)} "
+                      f"fvf={len(master_grid.face_visibility_flags)}")
+            elif master_grid is not None:
+                # Enforce required master-grid metadata
+                master_grid.flags |= 1
+                master_face_count = len(master_grid.indices) // 3
+                if len(master_grid.face_visibility_flags) != master_face_count:
+                    master_grid.face_visibility_flags = [255] * master_face_count
+                print(f"  ENFORCED master grid metadata: "
+                      f"bps={master_grid.buckets_per_side} "
+                      f"verts={len(master_grid.vertices)} idx={len(master_grid.indices)} "
+                      f"fvf={len(master_grid.face_visibility_flags)}")
+
+            # Export custom grids directly — they contain your scene's geometry.
+            # Keep master grid first for Riot-style ordering.
+            exported_count = 0
+            exported_ids = set()
+            if master_grid is not None:
+                mapgeo.bucket_grids.append(master_grid)
+                exported_ids.add(id(master_grid))
+                exported_count += 1
+
+            for cid, cgrid in custom_grids:
+                if id(cgrid) in exported_ids:
+                    continue
+                mapgeo.bucket_grids.append(cgrid)
+                exported_count += 1
+            
+            print(f"Total bucket grids exported: {exported_count} (custom)")
             return
         
-        print(f"Found {len(custom_grids)} custom grid(s), {len(imported_grids)} imported grid(s)")
+        # ── Step 2: No custom grids — fall back to imported grids ──
+        imported_grids = []
         
-        # ── Step 3: Merge - imported grids as base, custom grids as overrides ──
-        matched_imported = set()   # Indices of imported grids that got replaced
-        matched_custom = set()     # Indices of custom grids that replaced an import
+        for col in bpy.data.collections:
+            if (col.get("is_bucket_grid_collection") 
+                and not col.get("is_custom_bucket_grid")
+                and col.get("bucket_data_json")
+                and col.name in scene_col_names):
+                try:
+                    bucket_data_json = col.get("bucket_data_json", "[]")
+                    grids_data = json.loads(bucket_data_json)
+                    print(f"No custom grids — using {len(grids_data)} imported grid(s) from '{col.name}' as fallback")
+                    
+                    for grid_data in grids_data:
+                        grid = self._reconstruct_grid_from_json(grid_data)
+                        if grid is not None:
+                            imported_grids.append(grid)
+                            
+                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
+                            v18_uint = struct.unpack('<I', v18_bytes)[0]
+                            print(f"  Imported grid: hash={grid.path_hash:08X} v18={v18_uint:08X} "
+                                  f"flags={grid.flags} bps={grid.buckets_per_side} "
+                                  f"verts={len(grid.vertices)}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"  ERROR parsing imported bucket_data_json: {e}")
         
-        # Build custom grid lookup: identifier → list of (custom_idx, grid)
-        custom_by_id = {}
-        for ci, (cid, cgrid) in enumerate(custom_grids):
-            if cid not in custom_by_id:
-                custom_by_id[cid] = []
-            custom_by_id[cid].append((ci, cgrid))
-        
-        total_grids = 0
-        
-        # Process each imported grid in order (preserves original grid ordering)
-        for ii, igrid in enumerate(imported_grids):
-            # Determine identifier from original
-            orig_id = igrid.path_hash
-            if orig_id == 0:
-                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
-                orig_id = struct.unpack('<I', v18_bytes)[0]
-            
-            # Master grid (both hash=0 and v18=0, flags=1) contains ALL scene
-            # geometry with per-face visibility flags.  The custom grid system
-            # can't replicate this because it splits by layer → keep original.
-            is_master_grid = (igrid.path_hash == 0 
-                              and struct.unpack('<I', struct.pack('<f', igrid.unknown_v18_float))[0] == 0
-                              and igrid.flags & 1)
-            
-            if is_master_grid:
-                mapgeo.bucket_grids.append(igrid)
-                matched_imported.add(ii)
-                total_grids += 1
-                # Also consume the custom hash=0 grid so it isn't added as extra
-                for ci, cgrid in custom_by_id.get(0, []):
-                    if ci not in matched_custom:
-                        matched_custom.add(ci)
-                        print(f"  KEPT original master grid: hash=00000000 v18=00000000 "
-                              f"flags={igrid.flags} bps={igrid.buckets_per_side} "
-                              f"verts={len(igrid.vertices)} idx={len(igrid.indices)} "
-                              f"fvf={len(igrid.face_visibility_flags)} "
-                              f"(custom hash=00000000 grid discarded)")
-                        break
-                else:
-                    print(f"  KEPT original master grid: hash=00000000 v18=00000000 "
-                          f"flags={igrid.flags} bps={igrid.buckets_per_side} "
-                          f"verts={len(igrid.vertices)} idx={len(igrid.indices)} "
-                          f"fvf={len(igrid.face_visibility_flags)}")
-                continue
-            
-            # Look for matching custom grid
-            matching = custom_by_id.get(orig_id, [])
-            # Use the first unmatched custom grid for this identifier
-            custom_match = None
-            custom_match_idx = None
-            for ci, cgrid in matching:
-                if ci not in matched_custom:
-                    custom_match = cgrid
-                    custom_match_idx = ci
-                    break
-            
-            if custom_match is not None:
-                # ── MERGE: custom geometry + original metadata ──
-                merged = mapgeo_parser.BucketGrid()
-                
-                # PRESERVE original field assignment (critical for game lookups)
-                merged.path_hash = igrid.path_hash
-                merged.unknown_v18_float = igrid.unknown_v18_float
-                
-                # Use custom geometry bounds
-                merged.min_x = custom_match.min_x
-                merged.min_z = custom_match.min_z
-                merged.max_x = custom_match.max_x
-                merged.max_z = custom_match.max_z
-                merged.max_stickout_x = custom_match.max_stickout_x
-                merged.max_stickout_z = custom_match.max_stickout_z
-                merged.bucket_size_x = custom_match.bucket_size_x
-                merged.bucket_size_z = custom_match.bucket_size_z
-                merged.buckets_per_side = custom_match.buckets_per_side
-                merged.is_disabled = custom_match.is_disabled
-                
-                # PRESERVE original flags
-                merged.flags = igrid.flags
-                
-                # Custom geometry
-                merged.vertices = custom_match.vertices
-                merged.indices = custom_match.indices
-                merged.buckets = custom_match.buckets
-                
-                # Generate face_visibility_flags if original had them
-                if igrid.flags & 1:
-                    face_count = len(merged.indices) // 3
-                    # Default all faces to 255 (always visible)
-                    merged.face_visibility_flags = [255] * face_count
-                    print(f"  Generated {face_count} face_visibility_flags (all=255) for grid hash={igrid.path_hash:08X}")
-                else:
-                    merged.face_visibility_flags = []
-                
-                mapgeo.bucket_grids.append(merged)
-                matched_imported.add(ii)
-                matched_custom.add(custom_match_idx)
-                total_grids += 1
-                
-                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
-                v18_uint = struct.unpack('<I', v18_bytes)[0]
-                print(f"  MERGED grid: hash={merged.path_hash:08X} v18={v18_uint:08X} "
-                      f"flags={merged.flags} bps={merged.buckets_per_side} "
-                      f"verts={len(merged.vertices)} idx={len(merged.indices)} "
-                      f"(custom replaced imported)")
-            else:
-                # ── No custom replacement: use imported grid as-is ──
-                mapgeo.bucket_grids.append(igrid)
-                matched_imported.add(ii)
-                total_grids += 1
-                
-                v18_bytes = struct.pack('<f', igrid.unknown_v18_float)
-                v18_uint = struct.unpack('<I', v18_bytes)[0]
-                print(f"  KEPT imported grid: hash={igrid.path_hash:08X} v18={v18_uint:08X} "
-                      f"flags={igrid.flags} bps={igrid.buckets_per_side} "
-                      f"verts={len(igrid.vertices)} idx={len(igrid.indices)}")
-        
-        # Skip extra custom grids that didn't match any imported grid.
-        # The game expects exactly the grids from the original file — adding
-        # unrecognised grids with unknown hash/v18 placement causes crashes.
-        skipped = 0
-        for ci, (cid, cgrid) in enumerate(custom_grids):
-            if ci not in matched_custom:
-                skipped += 1
-                print(f"  SKIPPED extra custom grid: hash={cid:08X} "
-                      f"bps={cgrid.buckets_per_side} "
-                      f"verts={len(cgrid.vertices)} idx={len(cgrid.indices)} "
-                      f"(no matching imported grid — would create unknown entry)")
-        
-        print(f"Total bucket grids exported: {total_grids} "
-              f"(merged={len(matched_custom)}, kept={len(imported_grids) - len(matched_custom)}, "
-              f"skipped={skipped})")
+        if imported_grids:
+            for grid in imported_grids:
+                mapgeo.bucket_grids.append(grid)
+            print(f"Total bucket grids exported: {len(imported_grids)} (imported fallback)")
+        else:
+            print("WARNING: No bucket grids found (no custom or imported grids)")
     
     def _reconstruct_grid_from_json(self, grid_data):
         """Reconstruct a BucketGrid object from stored JSON data."""
