@@ -22,6 +22,14 @@ except ImportError:
     Material = None
     MaterialsExporter = None
 
+try:
+    from .particles_materials import update_other_entries_with_particles
+except ImportError:
+    try:
+        from particles_materials import update_other_entries_with_particles
+    except ImportError:
+        update_other_entries_with_particles = None
+
 def export_blender_materials_to_league(output_filepath: str, materials_list: Optional[List[bpy.types.Material]] = None) -> int:
     """
     Export Blender materials back to League .materials.py format
@@ -53,6 +61,8 @@ def export_blender_materials_to_league(output_filepath: str, materials_list: Opt
     
     # Retrieve preserved other_entries and entry_order
     other_entries, entry_order = _retrieve_other_entries()
+    if update_other_entries_with_particles:
+        other_entries, entry_order = update_other_entries_with_particles(other_entries, entry_order)
     
     # Export to file with preserved entries in original order
     if league_materials:
@@ -93,6 +103,9 @@ def export_blender_materials_merge(source_filepath: str, output_filepath: str,
     parser.parse()
     other_entries = parser.other_entries
     entry_order = parser.entry_order
+
+    if update_other_entries_with_particles:
+        other_entries, entry_order = update_other_entries_with_particles(other_entries, entry_order)
     
     print(f"Source file: {len(parser.materials)} materials, {len(other_entries)} other entries")
     
@@ -221,56 +234,82 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
     return league_mat
 
 def _retrieve_other_entries() -> tuple:
-    """Retrieve preserved non-material entries and entry order from Blender Text data block
-    
+    """Retrieve preserved non-material entries and entry order.
+
+    Supports two storage formats:
+      - **filepath** (current): text block contains ``# FORMAT: filepath`` followed
+        by the source .materials.py path.  The file is re-parsed on the fly (~0.3 s).
+      - **legacy (pickle/base64)**: text block contains ``# DATA:`` followed by a
+        base64-encoded pickle blob.  Kept for backwards compatibility with .blend
+        files saved before this optimisation.
+
     Returns:
         Tuple of (other_entries dict, entry_order list) or (None, None) if not found
     """
-    import pickle
-    import base64
-    
     text_name = "league_other_entries"
-    
+
     if text_name not in bpy.data.texts:
         return None, None
-    
+
     try:
         text_block = bpy.data.texts[text_name]
         lines = text_block.as_string().split('\n')
-        
-        # Find DATA line and extract base64 string
-        data_found = False
-        serialized = ""
+
+        # Detect format
+        fmt = None
+        payload = ""
         for line in lines:
-            if line.strip() == "# DATA:":
-                data_found = True
+            stripped = line.strip()
+            if stripped == "# FORMAT: filepath":
+                fmt = "filepath"
                 continue
-            if data_found and not line.startswith("#"):
-                serialized = line.strip()
+            if stripped == "# DATA:":
+                fmt = "legacy"
+                continue
+            if fmt and not stripped.startswith("#") and stripped:
+                payload = stripped
                 break
-        
-        if not serialized:
+
+        if not payload:
             print("Warning: No data found in other_entries text block")
             return None, None
-        
-        # Deserialize
-        store_data = pickle.loads(base64.b64decode(serialized))
-        
-        # Handle both old format (list) and new format (dict with entry_order)
+
+        # ── New path-based format ──
+        if fmt == "filepath":
+            import os
+            source_path = payload
+            if not os.path.isfile(source_path):
+                print(f"Warning: Source materials file not found: {source_path}")
+                return None, None
+            try:
+                from .materials_parser import MaterialsParser
+            except ImportError:
+                from materials_parser import MaterialsParser
+            import time as _t
+            _t0 = _t.perf_counter()
+            parser = MaterialsParser(source_path)
+            parser.parse()
+            elapsed = _t.perf_counter() - _t0
+            print(f"Re-parsed {len(parser.other_entries)} other entries + {len(parser.entry_order)} order from {os.path.basename(source_path)} in {elapsed:.2f}s")
+            return parser.other_entries, parser.entry_order
+
+        # ── Legacy pickle/base64 format ──
+        import pickle
+        import base64
+        store_data = pickle.loads(base64.b64decode(payload))
+
         if isinstance(store_data, dict) and 'other_entries' in store_data:
             other_entries = store_data['other_entries']
             entry_order = store_data.get('entry_order', None)
-            print(f"Retrieved {len(other_entries)} other entries + {len(entry_order) if entry_order else 0} order entries from Blender text block")
+            print(f"Retrieved {len(other_entries)} other entries + {len(entry_order) if entry_order else 0} order entries from Blender text block (legacy)")
             return other_entries, entry_order
         else:
-            # Legacy format: store_data is the old list of tuples
-            print(f"Retrieved {len(store_data)} other entries (legacy format) from Blender text block")
-            # Convert old list format to new dict format
+            print(f"Retrieved {len(store_data)} other entries (legacy list format) from Blender text block")
             other_entries = {}
             for name, etype, content in store_data:
                 other_entries[name] = (etype, content)
             return other_entries, None
-        
+
     except Exception as e:
         print(f"Warning: Failed to retrieve other_entries: {e}")
         return None, None

@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 6),
+    "version": (0, 2, 7),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -78,9 +78,10 @@ def update_environment_visibility(self, context):
     visible_count = 0
     hidden_count = 0
     
-    # Update visibility for all mesh objects (League engine logic)
+    # Update visibility for all mesh + particle objects (League engine logic)
     for obj in context.scene.objects:
-        if obj.type == 'MESH':
+        is_particle_obj = bool(obj.get("is_particle_system", False))
+        if obj.type == 'MESH' or is_particle_obj:
             should_be_visible = False
             
             has_baron_hash = "baron_hash" in obj and obj["baron_hash"] != "00000000"
@@ -561,6 +562,8 @@ classes = (
     ui_panel.MAPGEO_OT_import_bucket_grid_from_mapgeo,
     ui_panel.MAPGEO_OT_cleanup_unused_materials,
     ui_panel.MAPGEO_OT_import_external_mesh,
+    ui_panel.MAPGEO_OT_import_particles_map,
+    ui_panel.MAPGEO_OT_export_particles_map,
     ui_panel.MAPGEO_OT_create_lightgrid,
     ui_panel.MAPGEO_OT_bake_lightgrid,
     ui_panel.MAPGEO_OT_import_lightgrid,

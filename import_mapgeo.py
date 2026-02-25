@@ -201,6 +201,12 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         description="Import bucket grid scene graph data for spatial partitioning visualization",
         default=True,
     )
+
+    import_particles: BoolProperty(
+        name="Import Particles",
+        description="Import MapParticle entries from linked materials.py",
+        default=True,
+    )
     
     merge_by_layer: BoolProperty(
         name="Group by Layer",
@@ -275,19 +281,55 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             log.info("Import", f"Cached vertex buffer layout for {len(_imported_mesh_vb_layout_cache)} meshes")
             
             # Import into Blender
+            import time as _time
+            _t0 = _time.perf_counter()
             imported_materials = self.import_mapgeo(context, mapgeo)
+            print(f"[TIMING] import_mapgeo: {_time.perf_counter() - _t0:.2f}s")
 
-            # Post-import refresh: rebuild League material previews from stored
-            # samplers/parameters/techniques for consistent final state.
+            # Preserve source materials.py path for round-trip export
+            # (entries are re-parsed on demand at export time — instant at import)
+            _t1 = _time.perf_counter()
             try:
-                from . import material_editor_ui as mat_ui
-                refreshed = mat_ui.refresh_league_materials(imported_materials)
-                if refreshed:
-                    log.info("Material", f"Refreshed {refreshed} League materials after import")
+                resolved_materials = _resolve_materials_path(settings, self.filepath)
+                if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                    from . import import_materials_blender
+                    import_materials_blender._store_other_entries(
+                        {}, [],          # not used by the new path-based storage
+                        resolved_materials,
+                    )
             except Exception as e:
-                log.warning("Material", f"Post-import material refresh skipped: {e}")
+                log.warning("Material", f"Failed to preserve materials.py path: {e}")
+            print(f"[TIMING] preserve_other_entries: {_time.perf_counter() - _t1:.2f}s")
+
+            # Auto-import particles from materials.py when available
+            _t2 = _time.perf_counter()
+            if self.import_particles:
+                try:
+                    resolved_materials = _resolve_materials_path(settings, self.filepath)
+                    if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                        from . import particles_materials
+                        log.info("Particles", "Importing particles from linked materials.py")
+                        imported_particles = particles_materials.import_particles_from_materials_py(
+                            context,
+                            resolved_materials,
+                            log=log,
+                        )
+                        if imported_particles:
+                            log.info("Particles", f"Imported {imported_particles} particle(s)")
+                except Exception as e:
+                    log.warning("Particles", f"Particle import skipped: {e}")
+            print(f"[TIMING] particle_import: {_time.perf_counter() - _t2:.2f}s")
+
+            # NOTE: We intentionally skip refresh_league_materials() here.
+            # material_loader.create_blender_material() already builds full
+            # shader-specific node trees (glass, water, hologram, glow, etc.)
+            # with textures loaded.  Calling refresh_league_materials() would
+            # clear every node tree and rebuild it from scratch — including
+            # re-resolving and re-loading all textures — which doubles import
+            # time and makes the import appear hung on large maps.
             
             # Update visibility based on current dragon/baron layer filters
+            _t3 = _time.perf_counter()
             try:
                 import sys
                 addon_module = sys.modules.get(__package__)
@@ -298,6 +340,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     log.warning("Import", "update_environment_visibility not found")
             except Exception as e:
                 log.warning("Import", f"Could not update visibility: {e}")
+            print(f"[TIMING] update_visibility: {_time.perf_counter() - _t3:.2f}s")
             
             # Set viewport clipping for large maps
             for area in context.screen.areas:
@@ -307,6 +350,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                             space.clip_start = 10.01
                             space.clip_end = 1e+07
             
+            print(f"[TIMING] TOTAL post-mesh: {_time.perf_counter() - _t0:.2f}s")
             log.end_session()
             # Build a concise status line for the user
             s = log.stats
@@ -851,6 +895,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 continue        
         
         log.info("Import", f"Successfully imported {imported_count}/{len(mapgeo.meshes)} meshes")
+        print(f"[TIMING] mesh_loop done: {imported_count} meshes")
         
         # Layer statistics
         layer_stats = []
@@ -863,8 +908,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             log.info("Import", f"Layer distribution: {', '.join(layer_stats)}")
         
         # Import bucket grids
+        import time as _time
+        _tb = _time.perf_counter()
         if self.import_bucket_grid and mapgeo.bucket_grids:
             self.import_bucket_grids(context, collection, collection_name, mapgeo)
+        print(f"[TIMING] bucket_grids: {_time.perf_counter() - _tb:.2f}s")
         
         # Store bucket grid raw data on the collection for export
         if mapgeo.bucket_grids:
@@ -879,12 +927,16 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             collection["planar_reflector_count"] = len(mapgeo.planar_reflectors)
         
         # Create scene lighting from map settings (Sun, World ambient)
+        _tl = _time.perf_counter()
         if self.import_lightmaps and map_settings:
             self.create_scene_lighting(context, collection, map_settings)
+        print(f"[TIMING] lighting: {_time.perf_counter() - _tl:.2f}s")
         
         # Finalize texture packing (batch operation for performance)
+        _tp = _time.perf_counter()
         if material_loader and hasattr(material_loader, 'tex_converter'):
             material_loader.tex_converter.pack_all_images()
+        print(f"[TIMING] pack_all_images: {_time.perf_counter() - _tp:.2f}s")
 
         # Return imported materials so caller can run post-import refresh/update.
         return list(materials.values())
@@ -1818,7 +1870,7 @@ def get_blender_transform(matrix_list):
     return conversion @ mat_league @ conversion.inverted()
 
 
-def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=""):
+def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix="", import_particles=True):
     """
     Import meshes from a mapgeo file with full pipeline (materials, UVs, normals,
     vertex colors, lightmaps, baron hashes, custom properties, layer collections).
@@ -1935,6 +1987,17 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
             
             baron_parser_inst = baron_hash_parser.MaterialsBinParser(resolved_materials)
+
+            # Preserve non-material entries for materials.py round-trip
+            if resolved_materials.lower().endswith(".materials.py"):
+                try:
+                    from . import import_materials_blender
+                    import_materials_blender._store_other_entries(
+                        {}, [],
+                        resolved_materials,
+                    )
+                except Exception:
+                    pass
     
     # ─── Import matching meshes ───
     imported_count = 0
@@ -2247,6 +2310,15 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             addon_module.update_environment_visibility(settings, context)
     except Exception:
         pass
+
+    # Auto-import particles from materials.py when available
+    if import_particles:
+        try:
+            if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                from . import particles_materials
+                particles_materials.import_particles_from_materials_py(context, resolved_materials, log=log)
+        except Exception:
+            pass
     
     return imported_count, None
 

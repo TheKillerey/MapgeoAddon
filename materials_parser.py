@@ -133,10 +133,11 @@ class MaterialsParser:
     def parse(self) -> Dict[str, Material]:
         """Parse all materials from file"""
         # Extract ALL entries from file (in original file order)
+        # Returns (name, type, inner_content, full_text) tuples
         all_entries = self._extract_all_entries()
         
         # Separate materials from other entries, preserving order
-        for entry_name, entry_type, entry_content in all_entries:
+        for entry_name, entry_type, entry_content, full_text in all_entries:
             self.entry_order.append((entry_name, entry_type))
             
             if entry_type == "StaticMaterialDef":
@@ -148,13 +149,18 @@ class MaterialsParser:
                     print(f"Warning: Failed to parse material {entry_name}: {e}")
             else:
                 # Store all other entries as-is (VFX, MapPlaceableContainer, etc.)
-                raw_text = self._get_full_entry_text(entry_name, entry_type)
-                self.other_entries[entry_name] = (entry_type, raw_text)
+                # full_text is captured in the first pass — no re-scan needed
+                self.other_entries[entry_name] = (entry_type, full_text)
         
         return self.materials
 
-    def _extract_all_entries(self) -> List[Tuple[str, str, str]]:
-        """Extract all entries from the file (name, type, content_without_wrapper)"""
+    def _extract_all_entries(self) -> List[Tuple[str, str, str, str]]:
+        """Extract all entries from the file.
+
+        Returns list of (name, type, inner_content, full_text) tuples.
+        full_text includes the header line + braces — captured here in a
+        single pass so callers never need to re-scan the file.
+        """
         entries = []
         # Match any top-level entry (4-space indent) with quoted name or unquoted hex hash
         # Quoted:   "name" = TypeName {
@@ -182,9 +188,11 @@ class MaterialsParser:
                 print(f"Warning: Unclosed entry block for {entry_name} ({entry_type})")
                 continue
 
-            # Extract content between braces (without the outer braces)
+            # Inner content (without outer braces) — used for material parsing
             entry_content = self.content[brace_start + 1:end_idx]
-            entries.append((entry_name, entry_type, entry_content))
+            # Full text (header + braces) — used for round-trip preservation
+            full_text = self.content[match.start():end_idx + 1]
+            entries.append((entry_name, entry_type, entry_content, full_text))
 
         return entries
     

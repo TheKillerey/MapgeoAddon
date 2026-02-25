@@ -11,6 +11,7 @@ import re
 from bpy.types import Panel, UIList
 
 from .texture_utils import TexConverter, resolve_texture_path
+from . import particles_materials
 
 
 def _material_items(self, context):
@@ -83,6 +84,19 @@ def _update_material_diffuse_node(mat, texture_path, assets_folder, custom_asset
     diffuse_node.image = img
     print(f"[Texture] Updated diffuse node with: {img.name}")
     return True
+
+
+def _find_material_case_insensitive(material_name):
+    if not material_name:
+        return None
+    exact = bpy.data.materials.get(material_name)
+    if exact:
+        return exact
+    needle = material_name.lower()
+    for mat in bpy.data.materials:
+        if mat.name.lower() == needle:
+            return mat
+    return None
 
 
 def _strip_no_baked_light_macros(material):
@@ -481,7 +495,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.6"
+        addon_version = "0.2.7"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -1042,6 +1056,17 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
         col = box.column(align=True)
         col.operator("mapgeo.import_external_mesh", text="Import Mesh (glTF/FBX/OBJ)", icon='IMPORT')
         box.label(text="No materials - manual setup required", icon='INFO')
+
+        # Particle system import/export
+        layout.separator()
+        box = layout.box()
+        box.label(text="Particles (MapParticle/VFX)", icon='PARTICLES')
+
+        col = box.column(align=True)
+        col.operator("mapgeo.import_particles_map", text="Import Particles (materials.py)", icon='IMPORT')
+        col.operator("mapgeo.export_particles_map", text="Export Particles (Map Data)", icon='EXPORT')
+        box.label(text="Creates dedicated _Particles collection", icon='INFO')
+        box.label(text="Parses MapParticle + 0x1f1f50f2 entries", icon='INFO')
         
         # Cleanup utilities
         layout.separator()
@@ -2940,6 +2965,141 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+def _parse_materials_py_map_particles(materials_py_path):
+    return particles_materials.parse_materials_py_map_particles(materials_py_path)
+
+
+def _extract_particle_location_from_transform(transform_values):
+    return particles_materials.extract_particle_location_from_transform(transform_values)
+
+
+def _build_particle_snippet(entry_hash, entry_kind, location, scale, system_link, name_kind, name_value):
+    return particles_materials.build_particle_snippet(
+        entry_hash,
+        entry_kind,
+        location,
+        scale,
+        system_link,
+        name_kind,
+        name_value,
+    )
+
+
+class MAPGEO_OT_import_particles_map(bpy.types.Operator):
+    """Import VFX definitions + MapParticle entries from a materials.py file"""
+    bl_idname = "mapgeo.import_particles_map"
+    bl_label = "Import Particles (materials.py)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.materials.py", options={'HIDDEN'})
+
+    cube_size: bpy.props.FloatProperty(
+        name="Preview Size",
+        default=0.5,
+        min=0.01,
+        description="Size of imported particle preview cubes"
+    )
+
+    def execute(self, context):
+        if not self.filepath or not os.path.exists(self.filepath):
+            self.report({'ERROR'}, "Select a valid .materials.py file")
+            return {'CANCELLED'}
+
+        imported_count = particles_materials.import_particles_from_materials_py(
+            context,
+            self.filepath,
+            cube_size=self.cube_size,
+        )
+        if not imported_count:
+            self.report({'WARNING'}, "No VFX or MapParticle entries found")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Imported {imported_count} particle object(s) from {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_export_particles_map(bpy.types.Operator):
+    """Export imported map particles as JSON + materials.py snippet"""
+    bl_idname = "mapgeo.export_particles_map"
+    bl_label = "Export Particles (Map Data)"
+    bl_options = {'REGISTER'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    selected_only: bpy.props.BoolProperty(name="Selected Only", default=False)
+    write_material_map: bpy.props.BoolProperty(name="Write particles_materials_map.json", default=True)
+    write_materials_snippet: bpy.props.BoolProperty(
+        name="Write materials.py snippet",
+        default=True,
+        description="Write copy-paste block for MapParticle entries"
+    )
+
+    def execute(self, context):
+        if not self.filepath:
+            self.report({'ERROR'}, "Select an output .json path")
+            return {'CANCELLED'}
+
+        output_folder = os.path.dirname(self.filepath)
+        if not output_folder:
+            self.report({'ERROR'}, "Invalid output path")
+            return {'CANCELLED'}
+        os.makedirs(output_folder, exist_ok=True)
+
+        particle_objects = particles_materials.collect_particle_objects(context, selected_only=self.selected_only)
+        if not particle_objects:
+            self.report({'WARNING'}, "No particle objects found to export")
+            return {'CANCELLED'}
+
+        export_entries = particles_materials.build_particle_export_entries(particle_objects)
+        material_map = particles_materials.build_particle_material_map(particle_objects) if self.write_material_map else {}
+        snippet_blocks = []
+        if self.write_materials_snippet:
+            for entry in export_entries:
+                snippet_blocks.append(
+                    _build_particle_snippet(
+                        entry["entry_hash"],
+                        entry["entry_kind"],
+                        entry["location"],
+                        entry["scale"],
+                        entry["system"],
+                        entry["name_kind"],
+                        entry["name_value"],
+                    )
+                )
+
+        with open(self.filepath, 'w', encoding='utf-8') as handle:
+            json.dump({"particles": export_entries}, handle, indent=2)
+
+        if self.write_material_map and material_map:
+            map_path = os.path.join(output_folder, "particles_materials_map.json")
+            try:
+                with open(map_path, 'w', encoding='utf-8') as handle:
+                    json.dump(material_map, handle, indent=2)
+            except Exception:
+                pass
+
+        if self.write_materials_snippet and snippet_blocks:
+            snippet_path = os.path.join(output_folder, "particles_materials_snippet.txt")
+            try:
+                with open(snippet_path, 'w', encoding='utf-8') as handle:
+                    handle.write("\n\n".join(snippet_blocks))
+            except Exception:
+                pass
+
+        self.report({'INFO'}, f"Exported {len(export_entries)} particle entries")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 # ─── LightGrid Import/Export ───
 
 class MAPGEO_OT_create_lightgrid(bpy.types.Operator):
@@ -3959,6 +4119,8 @@ classes = (
     MAPGEO_OT_import_bucket_grid_from_mapgeo,
     MAPGEO_OT_cleanup_unused_materials,
     MAPGEO_OT_import_external_mesh,
+    MAPGEO_OT_import_particles_map,
+    MAPGEO_OT_export_particles_map,
     MAPGEO_OT_create_lightgrid,
     MAPGEO_OT_bake_lightgrid,
     MAPGEO_OT_import_lightgrid,

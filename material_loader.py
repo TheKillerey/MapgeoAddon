@@ -621,6 +621,25 @@ class MaterialLoader:
             if tex_name == name:
                 return sampler.get('texturePath', '')
         return ''
+
+    def _is_placeholder_texture_path(self, tex_path: str) -> bool:
+        """Return True for engine placeholder/default textures that should count as unassigned."""
+        if not tex_path:
+            return True
+        p = tex_path.replace('\\', '/').lower().strip()
+        if not p:
+            return True
+
+        placeholder_tokens = (
+            'bc_testtexture',
+            'atlast_test',
+            '/shared/materials/white',
+            '/shared/materials/black',
+            '/shared/materials/default',
+            '/shared/materials/blank',
+            '/shared/materials/null',
+        )
+        return any(tok in p for tok in placeholder_tokens)
     
     def _get_sampler_data(self, mat_data: dict, name: str) -> dict:
         """Get full sampler dict by name, including address modes"""
@@ -633,6 +652,32 @@ class MaterialLoader:
     def _sampler_needs_clip(self, sampler: dict) -> bool:
         """Check if a sampler has addressU=1 and addressV=1 (Clamp mode)"""
         return sampler.get('addressU', 0) == 1 and sampler.get('addressV', 0) == 1
+
+    def _get_primary_pass_blend_state(self, mat_data: dict) -> dict:
+        """Return blend state/factors from the primary pass.
+
+        Prefers top-level normalized fields; falls back to techniques[0].passes[0].
+        """
+        state = {
+            'blendEnable': bool(mat_data.get('blendEnable', False)),
+            'srcColorBlendFactor': mat_data.get('srcColorBlendFactor', 1),
+            'dstColorBlendFactor': mat_data.get('dstColorBlendFactor', 0),
+            'srcAlphaBlendFactor': mat_data.get('srcAlphaBlendFactor', 1),
+            'dstAlphaBlendFactor': mat_data.get('dstAlphaBlendFactor', 0),
+        }
+
+        techniques = mat_data.get('techniques', [])
+        if techniques and isinstance(techniques, list):
+            passes = techniques[0].get('passes', [])
+            if passes and isinstance(passes, list):
+                p0 = passes[0]
+                state['blendEnable'] = bool(p0.get('blendEnable', state['blendEnable']))
+                state['srcColorBlendFactor'] = int(p0.get('srcColorBlendFactor', state['srcColorBlendFactor']))
+                state['dstColorBlendFactor'] = int(p0.get('dstColorBlendFactor', state['dstColorBlendFactor']))
+                state['srcAlphaBlendFactor'] = int(p0.get('srcAlphaBlendFactor', state['srcAlphaBlendFactor']))
+                state['dstAlphaBlendFactor'] = int(p0.get('dstAlphaBlendFactor', state['dstAlphaBlendFactor']))
+
+        return state
     
     def _find_grass_tint_texture(self) -> str:
         """
@@ -1293,6 +1338,36 @@ class MaterialLoader:
             bl_mat.show_transparent_back = False
         else:
             bl_mat.surface_render_method = 'DITHERED'
+
+        # Transparency Overlap is strictly controlled by pass blend factors:
+        # Src Color = DST_ALPHA (6)
+        # Dst Color = INV_DST_ALPHA (7)
+        # Src Alpha = DST_ALPHA (6)
+        # Dst Alpha = INV_DST_ALPHA (7)
+        if hasattr(bl_mat, 'use_transparency_overlap'):
+            blend_state = self._get_primary_pass_blend_state(mat_data)
+            overlap_on = (
+                blend_state['blendEnable'] and
+                blend_state['srcColorBlendFactor'] == 6 and
+                blend_state['dstColorBlendFactor'] == 7 and
+                blend_state['srcAlphaBlendFactor'] == 6 and
+                blend_state['dstAlphaBlendFactor'] == 7
+            )
+            # Explicit shader override
+            if shader_name == 'VertexDeform':
+                overlap_on = False
+            bl_mat.use_transparency_overlap = overlap_on
+
+        # EEVEE: disable material shadow casting globally
+        try:
+            if hasattr(bl_mat, 'shadow_method'):
+                bl_mat.shadow_method = 'NONE'
+        except Exception:
+            pass
+        if hasattr(bl_mat, 'use_shadows'):
+            bl_mat.use_shadows = False
+        if hasattr(bl_mat, 'use_cast_shadows'):
+            bl_mat.use_cast_shadows = False
         
         # Cache and return
         self.materials_cache[cache_key] = bl_mat
@@ -2099,12 +2174,31 @@ class MaterialLoader:
         # Emission color support (EMISSION_EmissionColor, EmissionColor, FLOW_Color, etc.)
         # Only apply if an emissive texture sampler is actually present — the game
         # ignores EmissionColor when there is no emission texture assigned.
-        has_emission_tex = bool(
-            self._get_sampler_path(mat_data, 'Emissive_Texture') or
-            self._get_sampler_path(mat_data, 'EmissionTex') or
-            self._get_sampler_path(mat_data, 'Emission_Tex') or
-            self._get_sampler_path(mat_data, 'EmissiveTexture') or
-            self._get_sampler_path(mat_data, 'EmissionMaskTex'))
+        emission_paths = [
+            self._get_sampler_path(mat_data, 'Emissive_Texture'),
+            self._get_sampler_path(mat_data, 'EmissionTex'),
+            self._get_sampler_path(mat_data, 'Emission_Tex'),
+            self._get_sampler_path(mat_data, 'EmissiveTexture'),
+            self._get_sampler_path(mat_data, 'EmissionMaskTex'),
+        ]
+
+        has_emission_tex = any((p and not self._is_placeholder_texture_path(p)) for p in emission_paths)
+
+        has_primary_emission_tex = any(
+            (p and not self._is_placeholder_texture_path(p))
+            for p in emission_paths[:4]
+        )
+
+        # SRX_DynamicEffect / DefaultEnv_Flat: when Emission_Tex is not assigned,
+        # keep emission disabled instead of defaulting to 1.0.
+        force_zero_emission_without_tex = (
+            shader_name in ('SRX_DynamicEffect', 'DefaultEnv_Flat') and
+            not has_primary_emission_tex
+        )
+
+        if force_zero_emission_without_tex:
+            bsdf_node.inputs['Emission Strength'].default_value = 0.0
+
         if has_emission_tex:
             emission_color = (self._get_param(mat_data, 'EMISSION_EmissionColor') or
                               self._get_param(mat_data, 'EmissionColor') or
@@ -2117,7 +2211,7 @@ class MaterialLoader:
                     em_intensity = self._get_param(mat_data, 'Emissive_Intensity')
                     if em_intensity:
                         bsdf_node.inputs['Emission Strength'].default_value = max(0.0, float(em_intensity[0]))
-                    else:
+                    elif not force_zero_emission_without_tex:
                         bsdf_node.inputs['Emission Strength'].default_value = 1.0
         
         # Starting_Color / Color fallback for base color (when no texture)
