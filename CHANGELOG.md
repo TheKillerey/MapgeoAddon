@@ -9,8 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
-## [0.2.9] - 2025-07-25
-
+## [0.2.9]
 ### 🦴 Phase 4 — SKN/SKL Skinned Mesh & Skeleton Import
 - **SKN Parser** — Full SimpleSkin binary parser supporting versions 0, 2, and 4
   - Magic `0x00112233` detection, vertex types: Basic (52B), Color (56B), Tangent (72B)
@@ -52,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.8] - 2025-07-24
+## [0.2.8]
 
 ### 🌐 CommunityDragon Hash Integration
 - **Community Hashes Module** (`community_hashes.py`) — Download, cache, and parse CommunityDragon hash dictionaries
@@ -72,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.7] - 2025-07-20
+## [0.2.7]
 
 ### 📦 Phase 1 — CFGBin / Inibin Editor
 - **CFGBin Reader** (`cfgbin_reader.py`) — Full binary parser for League .cfgbin and .inibin files
@@ -120,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.6] - 2025-02-23
+## [0.2.6]
 
 ### 🪣 Bucket Grid Export Overhaul
 - **Merge-based export pipeline** — CUSTOM bucket grid export now follows a 3-step Load Imported → Load Custom → Merge workflow, preserving original grid ordering and metadata
@@ -161,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.5] - 2025-02-21
+## [0.2.5]
 
 ### 🔍 Centralized Debug System
 - **New Debug Module** (`debug_system.py`) — Unified logging and diagnostics
@@ -183,8 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.4] - 2025-02-20
-
+## [0.2.4]
 ### 🧹 Repository Cleanup
 - Removed C# implementations, standalone docs, research materials, diagnostic tools
 - Repository now contains only Blender addon essentials
@@ -192,7 +190,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.3] - 2025-02-20
+## [0.2.3]
 
 ### ✨ League Tools: Troybin Particle Editor
 - **Troybin Parser** — Full read/write for .troybin particle files (Inibin v2)
@@ -204,7 +202,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.1] - 2025-02-16
+## [0.2.1]
 
 ### ✨ LightGrid System
 - Full binary parser for lightgrid.dat (version 3)
@@ -218,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.0] - 2025-02-15
+## [0.2.0]
 
 ### ✨ Shader Template System
 - 91 shader templates from 9,509 materials with per-shader samplers, parameters, switches, macros
@@ -237,7 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.1] - 2025-02-14
+## [0.1.1]
 
 ### 🛠 Fixes
 - Quality bitmask correctness (0-31 bitmask instead of single enum)
@@ -249,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.1.0] - 2025-02-13
+## [0.1.0] 
 
 ### 🎉 Stable Release — Full Export Support
 - Complete export operator for .mapgeo (versions 13-18)
@@ -260,7 +258,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.9] - 2025-02-12
+## [0.0.9]
 
 ### ✨ Lightmap Support
 - Per-mesh baked lightmap textures with scale+bias UV transform
@@ -270,7 +268,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.8] - 2025-02-12
+## [0.0.8] 
 
 ### 🐛 ParentMode Visibility Fix
 - Corrected ParentMode 1 (Visible) vs 3 (Not Visible) interpretation
@@ -282,7 +280,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.7] - 2025-02-12
+## [0.0.7]
 
 ### ✨ Python Materials Format
 - `.materials.py` file support alongside `.materials.bin.json`
@@ -298,7 +296,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.5] - 2025-02-11
+## [0.0.5]
 
 ### ✨ Baron State Viewport Filtering
 - 4 baron state filters (Base, Cup, Tunnel, Upgraded)
@@ -306,7 +304,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.4] - 2025-02-11
+## [0.0.4]
 
 ### ✨ Baron Hash Decoding
 - Automatic decoding from materials.bin.json
@@ -315,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.3] - 2025-02-11
+## [0.0.3]
 
 ### ✨ Baron Hash Documentation & Collection Organization
 - Multi-layer collection support
@@ -323,13 +321,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.0.2] - 2025-02-11
+## [0.0.2]
 - Bush/Baron Hash/Render Region assignment panels
 - Enhanced environment visibility filters
 
 ---
 
-## [1.0.0] - 2025-02-11
+## [0.0.1]
 
 ### 🎉 Initial Release
 - Full .mapgeo import for versions 13-18
