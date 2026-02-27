@@ -708,6 +708,11 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         warning_box.label(text="⚠️ NOT used in official maps!", icon='ERROR')
         warning_box.label(text="For custom/modded maps only")
         
+        # Info about new light manager
+        info_box = box.box()
+        info_box.label(text="💡 Use Light Manager for full control", icon='INFO')
+        info_box.label(text="See panel below for all light types")
+        
         col = box.column(align=True)
         col.operator("mapgeo.add_point_light", text="Add Point Light to Selected", icon='LIGHT_POINT')
         col.operator("mapgeo.remove_point_light_from_selected", text="Remove from Selected", icon='X')
@@ -768,6 +773,17 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
             debug_info = col.box()
             debug_info.scale_y = 0.7
             debug_info.label(text="⚠ May slow down import", icon='INFO')
+        
+        # Execution mode
+        col.separator()
+        exec_row = col.row()
+        exec_row.prop(settings, "execution_mode", text="Execution")
+        exec_info = col.box()
+        exec_info.scale_y = 0.7
+        if settings.execution_mode == 'FOREGROUND':
+            exec_info.label(text="Direct execution (UI freezes)", icon='INFO')
+        else:
+            exec_info.label(text="Shows progress (UI responsive)", icon='INFO')
         
         # Materials and Assets
         layout.separator()
@@ -831,6 +847,17 @@ class VIEW3D_PT_mapgeo_export_panel(Panel):
         col = box.column(align=True)
         col.prop(settings, "export_version", text="Version")
         col.prop(settings, "optimize_meshes", text="Optimize Meshes")
+        
+        # Execution mode
+        col.separator()
+        exec_row = col.row()
+        exec_row.prop(settings, "execution_mode", text="Execution")
+        exec_info = col.box()
+        exec_info.scale_y = 0.7
+        if settings.execution_mode == 'FOREGROUND':
+            exec_info.label(text="Direct execution (UI freezes)", icon='INFO')
+        else:
+            exec_info.label(text="Shows progress (UI responsive)", icon='INFO')
         
         layout.separator()
         

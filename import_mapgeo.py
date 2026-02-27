@@ -38,15 +38,95 @@ _BLENDER_VERSION = bpy.app.version
 def _optimized_mesh_update(mesh):
     """
     Version-aware mesh update with performance optimizations.
-    Blender 5.1.0 has significantly slower mesh.update() - use optimized path.
+    Always validate to clean degenerate geometry that would crash
+    normals_split_custom_set_from_vertices at the C level.
     """
+    mesh.validate(verbose=False, clean_customdata=False)
     if _BLENDER_VERSION >= (5, 1, 0):
-        # Blender 5.1+: Skip expensive validation and edge calculation during batch import
-        mesh.validate(verbose=False, clean_customdata=False)
         mesh.update(calc_edges=False)
     else:
-        # Blender 5.0 and earlier: Standard update
         mesh.update()
+
+
+def _safe_set_vertex_normals(bl_mesh, normals, label="mesh"):
+    """
+    Safely apply per-vertex custom normals, guarding against the C-level
+    crash in normals_split_custom_set_from_vertices that a Python try/except
+    cannot catch (EXCEPTION_ACCESS_VIOLATION).
+
+    The crash occurs inside Blender's C code when internal mesh topology
+    (loops/polygons) is inconsistent — e.g. after from_pydata + validate
+    removed degenerate geometry.  We must prevent the call entirely in
+    those cases.
+
+    Validations performed:
+    1. Mesh must have polygons and loops (otherwise C code dereferences null).
+    2. Every loop's vertex_index must be in range (prevents out-of-bounds).
+    3. Normal count must match the Blender mesh vertex count.
+    4. Every component must be finite (no NaN / Inf).
+    5. No zero-length normal vectors.
+    """
+    import math
+
+    # ── Topology checks ──────────────────────────────────────────────
+    bl_vert_count = len(bl_mesh.vertices)
+    if bl_vert_count == 0:
+        return False
+
+    n_polys = len(bl_mesh.polygons)
+    n_loops = len(bl_mesh.loops)
+    if n_polys == 0 or n_loops == 0:
+        print(f"[Mapgeo] Skipping normals for {label}: "
+              f"no polygons/loops ({n_polys} polys, {n_loops} loops)")
+        return False
+
+    # Validate that *every* loop references a valid vertex.
+    # A single out-of-range index causes the C-level crash.
+    # Reading loop data in bulk is much faster than per-loop access.
+    loop_vert_indices = [0] * n_loops
+    bl_mesh.loops.foreach_get("vertex_index", loop_vert_indices)
+    max_vi = max(loop_vert_indices)
+    min_vi = min(loop_vert_indices)
+    if max_vi >= bl_vert_count or min_vi < 0:
+        print(f"[Mapgeo] Skipping normals for {label}: "
+              f"loop vertex_index out of range "
+              f"(min={min_vi}, max={max_vi}, verts={bl_vert_count})")
+        return False
+
+    # ── Normal count check ───────────────────────────────────────────
+    if len(normals) != bl_vert_count:
+        print(f"[Mapgeo] Skipping normals for {label}: "
+              f"count mismatch (normals={len(normals)}, "
+              f"bl_verts={bl_vert_count})")
+        return False
+
+    # ── Sanitise normal values ───────────────────────────────────────
+    sanitised = []
+    fallback = (0.0, 0.0, 1.0)  # safe default pointing up
+    bad_count = 0
+    for n in normals:
+        nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+        if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
+            sanitised.append(fallback)
+            bad_count += 1
+            continue
+        length_sq = nx * nx + ny * ny + nz * nz
+        if length_sq < 1e-12:
+            sanitised.append(fallback)
+            bad_count += 1
+            continue
+        sanitised.append((nx, ny, nz))
+
+    if bad_count > 0:
+        print(f"[Mapgeo] {label}: sanitised {bad_count}/{len(normals)} "
+              f"bad normals (NaN/Inf/zero-length)")
+
+    try:
+        bl_mesh.normals_split_custom_set_from_vertices(sanitised)
+        return True
+    except Exception as e:
+        print(f"[Mapgeo] Warning: Failed to set custom normals for {label}: {e}")
+        return False
 
 
 def _extract_visibility_controller_layers(materials_path: str) -> dict:
@@ -222,6 +302,11 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         max=1000.0,
     )
     
+    # Modal execution state for background mode
+    _timer = None
+    _background_task = None
+    _background_step = 0
+    
     def execute(self, context):
         """Execute the import"""
         log = get_debug_log()
@@ -231,13 +316,26 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         settings = context.scene.mapgeo_settings
         log.enabled = settings.debug_logging
         
+        # Check execution mode for progress display
+        show_progress = (settings.execution_mode == 'BACKGROUND')
+        
         try:
+            if show_progress:
+                context.window_manager.progress_begin(0, 100)
+                context.window_manager.progress_update(5)
+            
             # Update settings
             settings.last_import_path = self.filepath
+            
+            if show_progress:
+                context.window_manager.progress_update(10)
             
             # Parse the mapgeo file
             parser = mapgeo_parser.MapgeoParser()
             mapgeo = parser.read(self.filepath)
+            
+            if show_progress:
+                context.window_manager.progress_update(20)
             
             # Cache sampler defs for export round-trip
             global _imported_sampler_defs_cache
@@ -280,11 +378,17 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 _imported_mesh_vb_layout_cache.append(layout)
             log.info("Import", f"Cached vertex buffer layout for {len(_imported_mesh_vb_layout_cache)} meshes")
             
+            if show_progress:
+                context.window_manager.progress_update(30)
+            
             # Import into Blender
             import time as _time
             _t0 = _time.perf_counter()
-            imported_materials = self.import_mapgeo(context, mapgeo)
+            imported_materials = self.import_mapgeo(context, mapgeo, show_progress=show_progress)
             print(f"[TIMING] import_mapgeo: {_time.perf_counter() - _t0:.2f}s")
+
+            if show_progress:
+                context.window_manager.progress_update(70)
 
             # Preserve source materials.py path for round-trip export
             # (entries are re-parsed on demand at export time — instant at import)
@@ -320,6 +424,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     log.warning("Particles", f"Particle import skipped: {e}")
             print(f"[TIMING] particle_import: {_time.perf_counter() - _t2:.2f}s")
 
+            if show_progress:
+                context.window_manager.progress_update(80)
+
             # NOTE: We intentionally skip refresh_league_materials() here.
             # material_loader.create_blender_material() already builds full
             # shader-specific node trees (glass, water, hologram, glow, etc.)
@@ -342,13 +449,20 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 log.warning("Import", f"Could not update visibility: {e}")
             print(f"[TIMING] update_visibility: {_time.perf_counter() - _t3:.2f}s")
             
+            if show_progress:
+                context.window_manager.progress_update(90)
+            
             # Set viewport clipping for large maps
             for area in context.screen.areas:
                 if area.type == 'VIEW_3D':
                     for space in area.spaces:
                         if space.type == 'VIEW_3D':
-                            space.clip_start = 10.01
-                            space.clip_end = 1e+07
+                            space.clip_start = 10
+                            space.clip_end = 10000000
+            
+            if show_progress:
+                context.window_manager.progress_update(100)
+                context.window_manager.progress_end()
             
             print(f"[TIMING] TOTAL post-mesh: {_time.perf_counter() - _t0:.2f}s")
             log.end_session()
@@ -362,13 +476,201 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             return {'FINISHED'}
         
         except Exception as e:
+            if show_progress:
+                context.window_manager.progress_end()
             log.end_session()
             self.report({'ERROR'}, f"Failed to import mapgeo: {str(e)}")
             import traceback
             traceback.print_exc()
             return {'CANCELLED'}
     
-    def import_mapgeo(self, context, mapgeo: mapgeo_parser.MapgeoFile):
+    def invoke(self, context, event):
+        """Handle operator invocation - check execution mode"""
+        settings = context.scene.mapgeo_settings
+        
+        # Always start with file browser
+        context.window_manager.fileselect_add(self)
+        
+        # Check if background mode will be used
+        if settings.execution_mode == 'BACKGROUND':
+            # Will switch to modal after file selection
+            return {'RUNNING_MODAL'}
+        else:
+            # Standard foreground execution after file selection
+            return {'RUNNING_MODAL'}
+    
+    def modal(self, context, event):
+        """Handle modal execution for background processing"""
+        settings = context.scene.mapgeo_settings
+        
+        # If we have an active background task, process it
+        if self._background_task:
+            if event.type == 'TIMER':
+                # Process one step of the background task
+                try:
+                    progress = next(self._background_task)
+                    # Update progress indicator
+                    context.area.header_text_set(f"Importing: {int(progress)}%")
+                    return {'RUNNING_MODAL'}
+                except StopIteration:
+                    # Task complete
+                    if self._timer:
+                        context.window_manager.event_timer_remove(self._timer)
+                        self._timer = None
+                    context.area.header_text_set(None)
+                    self._background_task = None
+                    return {'FINISHED'}
+                except Exception as e:
+                    # Task failed
+                    if self._timer:
+                        context.window_manager.event_timer_remove(self._timer)
+                        self._timer = None
+                    context.area.header_text_set(None)
+                    self._background_task = None
+                    self.report({'ERROR'}, f"Import failed: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        
+        # File browser is still open or just closed
+        if not self.filepath:
+            return {'RUNNING_MODAL'}
+        
+        # File selected - check execution mode
+        if settings.execution_mode == 'BACKGROUND':
+            # Start background processing with timer
+            self._timer = context.window_manager.event_timer_add(0.001, window=context.window)
+            self._background_task = self._execute_background(context)
+            return {'RUNNING_MODAL'}
+        else:
+            # Execute immediately in foreground
+            return self.execute(context)
+    
+    def _execute_background(self, context):
+        """Generator function that yields progress for background execution"""
+        log = get_debug_log()
+        log.begin_session()
+        
+        settings = context.scene.mapgeo_settings
+        log.enabled = settings.debug_logging
+        
+        try:
+            yield 5
+            
+            # Update settings
+            settings.last_import_path = self.filepath
+            
+            yield 10
+            
+            # Parse the mapgeo file
+            parser = mapgeo_parser.MapgeoParser()
+            mapgeo = parser.read(self.filepath)
+            
+            yield 20
+            
+            # Cache sampler defs, vertex buffer descriptions, etc.
+            global _imported_sampler_defs_cache, _imported_vb_descriptions_cache, _imported_mesh_vb_layout_cache
+            
+            _imported_sampler_defs_cache = [
+                {"index": sd.index, "name": sd.name}
+                for sd in mapgeo.sampler_defs
+            ]
+            
+            _imported_vb_descriptions_cache = []
+            for desc in mapgeo.vertex_buffer_descriptions:
+                desc_data = {
+                    "usage": desc.usage,
+                    "elements": [{"name": e.name, "format": e.format, "offset": e.offset} for e in desc.elements]
+                }
+                _imported_vb_descriptions_cache.append(desc_data)
+            
+            _imported_mesh_vb_layout_cache = []
+            for mesh_data in mapgeo.meshes:
+                layout = {
+                    "decl_id": mesh_data.vertex_declaration_id,
+                    "decl_count": mesh_data.vertex_declaration_count,
+                }
+                stream_elements = []
+                for stream_idx in range(mesh_data.vertex_declaration_count):
+                    desc_id = mesh_data.vertex_declaration_id + stream_idx
+                    if desc_id < len(mapgeo.vertex_buffer_descriptions):
+                        desc = mapgeo.vertex_buffer_descriptions[desc_id]
+                        stream_elements.append([e.name for e in desc.elements])
+                    else:
+                        stream_elements.append([])
+                layout["stream_elements"] = stream_elements
+                _imported_mesh_vb_layout_cache.append(layout)
+            
+            yield 30
+            
+            # Import meshes (this is the heavy part - yield periodically)
+            imported_materials = self.import_mapgeo(context, mapgeo, show_progress=False, yield_func=lambda p: None)
+            
+            yield 70
+            
+            # Preserve materials.py path
+            try:
+                resolved_materials = _resolve_materials_path(settings, self.filepath)
+                if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                    from . import import_materials_blender
+                    import_materials_blender._store_other_entries({}, [], resolved_materials)
+            except Exception as e:
+                log.warning("Material", f"Failed to preserve materials.py path: {e}")
+            
+            # Import particles
+            if self.import_particles:
+                try:
+                    resolved_materials = _resolve_materials_path(settings, self.filepath)
+                    if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                        from . import particles_materials
+                        imported_particles = particles_materials.import_particles_from_materials_py(
+                            context, resolved_materials, log=log
+                        )
+                except Exception as e:
+                    log.warning("Particles", f"Particle import skipped: {e}")
+            
+            yield 80
+            
+            # Update visibility
+            try:
+                import sys
+                addon_module = sys.modules.get(__package__)
+                if addon_module and hasattr(addon_module, 'update_environment_visibility'):
+                    addon_module.update_environment_visibility(settings, context)
+            except Exception as e:
+                log.warning("Import", f"Could not update visibility: {e}")
+            
+            yield 90
+            
+            # Set viewport clipping
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.clip_start = 10
+                            space.clip_end = 10000000
+            
+            yield 95
+            
+            log.end_session()
+            s = log.stats
+            status = f"Imported {os.path.basename(self.filepath)}: {s.meshes_imported} meshes, {s.textures_loaded} textures"
+            issues = log.error_count + log.warning_count
+            if issues:
+                status += f" ({issues} issues — see Debug Log)"
+            self.report({'INFO'}, status)
+            
+            yield 100
+            
+        except Exception as e:
+            log.end_session()
+            self.report({'ERROR'}, f"Failed to import mapgeo: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def import_mapgeo(self, context, mapgeo: mapgeo_parser.MapgeoFile, show_progress=False):
         """Import mapgeo data into Blender"""
         log = get_debug_log()
         
@@ -561,7 +863,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Apply normals - Blender 5.0+ automatically uses custom normals when set
                 if self.import_normals and normals:
-                    bl_mesh.normals_split_custom_set_from_vertices(normals)
+                    _safe_set_vertex_normals(bl_mesh, normals, f"mesh_{mesh_idx:03d}")
                 
                 # Create UV layers
                 uv_channels_created = 0
@@ -1347,31 +1649,48 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         fog_start_end = map_settings.get('fog_start_end')
         
         if fog_enabled and fog_color and fog_start_end:
-            # fogStartAndEnd values are signed distances (negative = active range)
-            fog_start = abs(fog_start_end[0])
-            fog_end = abs(fog_start_end[1])
+            # fogStartAndEnd: vec2 = { Start, End }
+            # Start = top of fog box (higher Z position where fog begins)
+            # End = bottom of fog box (lower Z position, how deep fog extends)
+            # Values are typically negative, use absolute values
+            fog_start_top = abs(fog_start_end[0])    # Index 0 = Start (top Z)
+            fog_end_bottom = abs(fog_start_end[1])   # Index 1 = End (bottom Z, depth)
             
-            if fog_end > fog_start and fog_end > 0:
-                fog_density = 3.0 / fog_end
+            # Fog depth is the vertical range
+            fog_depth = abs(fog_end_bottom - fog_start_top)
+            
+            if fog_depth > 0:
+                # Determine the Z position range
+                # Top of fog (higher Z)
+                fog_top_z = max(fog_start_top, fog_end_bottom)
+                # Bottom of fog (lower Z)
+                fog_bottom_z = min(fog_start_top, fog_end_bottom)
                 
                 # Create a large cube mesh to hold the fog volume
-                # Size it to cover the entire map with generous padding
-                fog_size = fog_end * 2.0  # Large enough to encompass the map
+                # Horizontal size should be large enough to cover the map
+                fog_horizontal_size = max(fog_depth * 3.0, 20000.0)
                 
+                # Create a box with specific dimensions
                 import bmesh
                 fog_mesh = bpy.data.meshes.new("MapFog_Mesh")
                 bm = bmesh.new()
-                bmesh.ops.create_cube(bm, size=fog_size)
+                # Create cube with horizontal extent and vertical depth
+                bmesh.ops.create_cube(bm, size=1.0)
+                bmesh.ops.scale(bm, vec=(fog_horizontal_size, fog_horizontal_size, fog_depth), verts=bm.verts)
                 bm.to_mesh(fog_mesh)
                 bm.free()
                 
                 fog_obj = bpy.data.objects.new("MapFog", fog_mesh)
                 lighting_col.objects.link(fog_obj)
                 
-                # Center the fog volume over the map (approximate center)
-                # League maps are roughly centered around origin, offset Y (Blender) for height
-                fog_obj.location = (0, 0, fog_size * 0.25)  # Slightly above ground
+                # Position the fog box so its top is at fog_top_z and bottom at fog_bottom_z
+                # Cube center should be at the midpoint between top and bottom
+                fog_center_z = (fog_top_z + fog_bottom_z) / 2.0
+                fog_obj.location = (0, 0, fog_center_z)
                 fog_obj.display_type = 'BOUNDS'  # Show as wireframe box in viewport
+                
+                # Calculate fog density based on depth
+                fog_density = 3.0 / max(fog_depth, 100.0)
                 
                 # Create volume scatter material
                 fog_mat = bpy.data.materials.new(name="MapFog_Volume")
@@ -1398,22 +1717,24 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Store fog properties on the fog object
                 fog_obj["fog_color"] = list(fog_color)
                 fog_obj["fog_density"] = fog_density
-                fog_obj["fog_start"] = fog_start
-                fog_obj["fog_end"] = fog_end
+                fog_obj["fog_start_top"] = fog_top_z
+                fog_obj["fog_end_bottom"] = fog_bottom_z
+                fog_obj["fog_depth"] = fog_depth
                 
                 fog_alt_color = map_settings.get('fog_alternate_color')
                 if fog_alt_color:
                     fog_obj["fog_alternate_color"] = list(fog_alt_color)
                 
-                # Configure EEVEE volumetrics
+                # Configure EEVEE volumetrics (camera distance, not Z-axis)
+                # Use reasonable camera-distance values for volumetric rendering
                 eevee = context.scene.eevee
-                eevee.volumetric_start = max(1.0, fog_start * 0.1)
-                eevee.volumetric_end = fog_end * 1.5
+                eevee.volumetric_start = 0.1
+                eevee.volumetric_end = max(fog_horizontal_size * 2.0, 50000.0)
                 
                 log.info("MapSettings", f"Created Fog volume: color=({fog_color[0]:.3f}, {fog_color[1]:.3f}, {fog_color[2]:.3f}), "
-                      f"density={fog_density:.6f}, range=[{fog_start:.0f}, {fog_end:.0f}]")
+                      f"density={fog_density:.6f}, Z range=[{fog_top_z:.0f} (top) to {fog_bottom_z:.0f} (bottom)], depth={fog_depth:.0f}")
             else:
-                log.info("MapSettings", f"Fog skipped: invalid range [{fog_start_end[0]}, {fog_start_end[1]}]")
+                log.info("MapSettings", f"Fog skipped: zero depth (Start={fog_start_top:.0f}, End={fog_end_bottom:.0f})")
         elif not fog_enabled:
             log.info("MapSettings", "Fog disabled in map settings")
         
@@ -2065,8 +2386,8 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             _optimized_mesh_update(bl_mesh)
             
             # Normals
-            if normals and len(normals) == len(vertices):
-                bl_mesh.normals_split_custom_set_from_vertices(normals)
+            if normals:
+                _safe_set_vertex_normals(bl_mesh, normals, mesh_name)
             
             # All UV channels
             uv_channels_created = 0

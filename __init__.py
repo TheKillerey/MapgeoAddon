@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 7),
+    "version": (0, 2, 9),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -36,6 +36,13 @@ from . import (
     ui_panel,
     material_editor_ui,
     troybin_ui,
+    cfgbin_editor_ui,
+    community_hashes,
+    propertybin_editor_ui,
+    sco_scb_import,
+    skn_skl_import,
+    light_management,
+    legacy_map_ui,
     utils,
 )
 
@@ -339,6 +346,17 @@ class MapgeoSettings(PropertyGroup):
         default=False
     )
     
+    # Execution Mode
+    execution_mode: EnumProperty(
+        name="Execution Mode",
+        description="How import/export operations are executed",
+        items=[
+            ('FOREGROUND', "Foreground", "Execute directly in Blender (UI will freeze during operation)"),
+            ('BACKGROUND', "Background", "Execute with progress updates (UI remains responsive)"),
+        ],
+        default='FOREGROUND'
+    )
+    
     # Export Settings
     export_version: IntProperty(
         name="Mapgeo Version",
@@ -406,6 +424,56 @@ class MapgeoSettings(PropertyGroup):
         description="Path to the LEVELS folder (e.g. levels/map11/info/) for grass tint and other map-level textures",
         default="",
         subtype='DIR_PATH'
+    )
+
+    legacy_map_folder: StringProperty(
+        name="Legacy Map Folder",
+        description="Path to legacy LEVELS/Map folder (e.g. K:/LeagueSandbox/League_Sandbox_Client/LEVELS/Map1)",
+        default=r"K:\LeagueSandbox\League_Sandbox_Client\LEVELS\Map1",
+        subtype='DIR_PATH'
+    )
+
+    legacy_shader_hlsl_folder: StringProperty(
+        name="Legacy HLSL Folder",
+        description="Path to legacy shader HLSL root (HeightBlending + Environment expected)",
+        default=r"K:\LeagueSandbox\League_Sandbox_Client\DATA\Shaders\HLSL",
+        subtype='DIR_PATH'
+    )
+
+    legacy_import_materials: BoolProperty(
+        name="Legacy Import Materials",
+        description="Import materials when loading legacy map bundle",
+        default=True
+    )
+
+    legacy_import_textures: BoolProperty(
+        name="Legacy Load Textures",
+        description="Try to load textures when importing legacy materials",
+        default=True
+    )
+
+    legacy_collect_dat_report: BoolProperty(
+        name="Legacy DAT Report",
+        description="Collect .dat/.nvr/.mat file inventory into Blender text report",
+        default=True
+    )
+
+    legacy_import_legacy_lights: BoolProperty(
+        name="Legacy Lights DAT",
+        description="Import legacy LightDat/LightEnvironment .dat files",
+        default=True
+    )
+
+    legacy_import_legacy_particles: BoolProperty(
+        name="Legacy Particles DAT",
+        description="Import legacy particles.dat files as particle empties",
+        default=True
+    )
+
+    legacy_import_terrain_inibin: BoolProperty(
+        name="Legacy Terrain Inibin",
+        description="Import terrain.inibin (sun direction, sun color, ambient, fog)",
+        default=True
     )
     
     use_linked_materials: BoolProperty(
@@ -613,7 +681,43 @@ def register():
     try:
         troybin_ui.register()
     except Exception as e:
-        print(f"[League Tools] Registration failed: {e}")
+        print(f"[League Tools] Troybin registration failed: {e}")
+
+    # Register cfgbin editor UI
+    try:
+        cfgbin_editor_ui.register()
+    except Exception as e:
+        print(f"[League Tools] CFGBin editor registration failed: {e}")
+
+    # Register PropertyBin editor UI
+    try:
+        propertybin_editor_ui.register()
+    except Exception as e:
+        print(f"[League Tools] PropertyBin editor registration failed: {e}")
+
+    # Register SCO/SCB mesh tools
+    try:
+        sco_scb_import.register()
+    except Exception as e:
+        print(f"[League Tools] SCO/SCB registration failed: {e}")
+
+    # Register SKN/SKL skinned mesh tools
+    try:
+        skn_skl_import.register()
+    except Exception as e:
+        print(f"[League Tools] SKN/SKL registration failed: {e}")
+    
+    # Register light management
+    try:
+        light_management.register()
+    except Exception as e:
+        print(f"[Light Management] Registration failed: {e}")
+
+    # Register legacy map UI
+    try:
+        legacy_map_ui.register()
+    except Exception as e:
+        print(f"[Legacy Map] Registration failed: {e}")
     
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -623,6 +727,42 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister legacy map UI
+    try:
+        legacy_map_ui.unregister()
+    except Exception as e:
+        print(f"[Legacy Map] Unregister failed: {e}")
+
+    # Unregister light management
+    try:
+        light_management.unregister()
+    except Exception as e:
+        print(f"[Light Management] Unregister failed: {e}")
+    
+    # Unregister SKN/SKL skinned mesh tools
+    try:
+        skn_skl_import.unregister()
+    except Exception as e:
+        print(f"[League Tools] SKN/SKL unregister failed: {e}")
+
+    # Unregister SCO/SCB mesh tools
+    try:
+        sco_scb_import.unregister()
+    except Exception as e:
+        print(f"[League Tools] SCO/SCB unregister failed: {e}")
+
+    # Unregister PropertyBin editor UI
+    try:
+        propertybin_editor_ui.unregister()
+    except Exception as e:
+        print(f"[League Tools] PropertyBin editor unregister failed: {e}")
+
+    # Unregister cfgbin editor UI
+    try:
+        cfgbin_editor_ui.unregister()
+    except Exception as e:
+        print(f"[League Tools] CFGBin editor unregister failed: {e}")
+
     # Unregister troybin UI
     try:
         troybin_ui.unregister()

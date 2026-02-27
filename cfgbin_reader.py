@@ -175,6 +175,108 @@ def parse_cfgbin(path: Path):
     }
 
 
+def write_cfgbin(sets: dict, output_path: Path):
+    """Write an inibin v2 binary file from a dict of sets.
+
+    ``sets`` should have the same shape as ``parse_cfgbin()["sets"]``:
+
+        {
+            "Int32List": [(hash, value), ...],
+            "Float32List": [(hash, value), ...],
+            ...
+        }
+
+    Only non-empty sets are written.  The order of INIBIN_FLAGS is used for
+    the canonical set ordering.
+    """
+    import io
+
+    # --- Build string table first (needed for StringList offsets) ----------
+    string_table = bytearray()
+    string_offsets: dict[int, int] = {}  # id(entry) → offset into string_table
+
+    if "StringList" in sets and sets["StringList"]:
+        for _hash, value in sets["StringList"]:
+            offset = len(string_table)
+            string_offsets[id((_hash, value))] = offset
+            string_table.extend(value.encode("ascii", errors="replace"))
+            string_table.append(0)  # null terminator
+
+    # Because we can't use id() of tuples reliably across rebuild, store
+    # offsets by index instead.
+    string_offset_by_idx: list[int] = []
+    if "StringList" in sets and sets["StringList"]:
+        cur = 0
+        for _hash, value in sets["StringList"]:
+            string_offset_by_idx.append(cur)
+            encoded = value.encode("ascii", errors="replace")
+            cur += len(encoded) + 1  # +1 for null terminator
+
+    # --- Compute flags and build set body bytes ---------------------------
+    flags = 0
+    body = bytearray()
+
+    for set_name, set_flag in INIBIN_FLAGS:
+        entries = sets.get(set_name, [])
+        if not entries:
+            continue
+        flags |= set_flag
+        count = len(entries)
+        body.extend(struct.pack("<H", count))
+        # Hashes
+        for hash_val, _value in entries:
+            body.extend(struct.pack("<I", hash_val))
+        # Values
+        if set_name == "BitList":
+            packed = 0
+            for i, (_h, v) in enumerate(entries):
+                bit = 1 if v else 0
+                packed |= (bit << (i % 8))
+                if (i % 8) == 7 or i == count - 1:
+                    body.extend(struct.pack("<B", packed))
+                    packed = 0
+        elif set_name == "Int32List":
+            for _h, v in entries:
+                body.extend(struct.pack("<i", int(v)))
+        elif set_name == "Float32List":
+            for _h, v in entries:
+                body.extend(struct.pack("<f", float(v)))
+        elif set_name == "FixedPointFloatList":
+            for _h, v in entries:
+                body.extend(struct.pack("<B", max(0, min(255, int(round(float(v) / 0.1))))))
+        elif set_name == "Int16List":
+            for _h, v in entries:
+                body.extend(struct.pack("<h", int(v)))
+        elif set_name == "Int8List":
+            for _h, v in entries:
+                body.extend(struct.pack("<B", max(0, min(255, int(v)))))
+        elif set_name.startswith("FixedPointFloatListVec"):
+            for _h, vec in entries:
+                for comp in vec:
+                    body.extend(struct.pack("<B", max(0, min(255, int(comp)))))
+        elif set_name.startswith("Float32ListVec"):
+            for _h, vec in entries:
+                for comp in vec:
+                    body.extend(struct.pack("<f", float(comp)))
+        elif set_name == "StringList":
+            for idx, (_h, _v) in enumerate(entries):
+                body.extend(struct.pack("<H", string_offset_by_idx[idx]))
+        else:
+            raise ValueError(f"Unsupported set for writing: {set_name}")
+
+    # --- Assemble file: header + body + string_table ----------------------
+    string_data_length = len(string_table)
+    header = bytearray()
+    header.extend(struct.pack("<B", 2))             # version
+    header.extend(struct.pack("<H", string_data_length))
+    header.extend(struct.pack("<H", flags))
+
+    with open(output_path, "wb") as f:
+        f.write(header)
+        f.write(body)
+        f.write(string_table)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read League cfgbin (Inibin v2) files")
     parser.add_argument("file", help="Path to .cfgbin file")

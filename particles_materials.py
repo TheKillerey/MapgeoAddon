@@ -213,6 +213,56 @@ def extract_particle_scale_from_transform(transform_values):
     return (sx, sz, sy)
 
 
+def extract_particle_rotation_from_transform(transform_values):
+    """Extract rotation from mtx44 matrix (upper 3x3, normalized).
+    
+    The mtx44 is stored in column-major order:
+    - Columns 0,1,2: X, Y, Z basis vectors (with scale embedded)
+    - Column 3: Translation
+    
+    Returns Euler angles (XYZ) with Y/Z swap for Blender coordinate system.
+    """
+    if not transform_values or len(transform_values) < 11:
+        return (0.0, 0.0, 0.0)
+    
+    from mathutils import Matrix, Vector
+    
+    # Extract the 3x3 rotation+scale part (column-major to row-major for Blender)
+    # Game matrix columns (column-major):
+    # [0,1,2,3] = X axis column
+    # [4,5,6,7] = Y axis column
+    # [8,9,10,11] = Z axis column
+    
+    # Convert to Blender's row-major 3x3 matrix with Y/Z swap
+    mat = Matrix((
+        (transform_values[0], transform_values[4], transform_values[8]),   # Row 0: X components
+        (transform_values[2], transform_values[6], transform_values[10]),  # Row 1: Z components (swapped with Y)
+        (transform_values[1], transform_values[5], transform_values[9])    # Row 2: Y components (swapped with Z)
+    ))
+    
+    # Decompose to remove scale and get pure rotation
+    try:
+        # Get scale magnitudes from column vectors
+        scale_x = Vector((mat[0][0], mat[1][0], mat[2][0])).length
+        scale_y = Vector((mat[0][1], mat[1][1], mat[2][1])).length
+        scale_z = Vector((mat[0][2], mat[1][2], mat[2][2])).length
+        
+        # Normalize to get pure rotation matrix (avoid division by zero)
+        if scale_x > 0.0001 and scale_y > 0.0001 and scale_z > 0.0001:
+            rot_mat = Matrix((
+                (mat[0][0]/scale_x, mat[0][1]/scale_y, mat[0][2]/scale_z),
+                (mat[1][0]/scale_x, mat[1][1]/scale_y, mat[1][2]/scale_z),
+                (mat[2][0]/scale_x, mat[2][1]/scale_y, mat[2][2]/scale_z)
+            ))
+            # Convert to Euler angles
+            euler = rot_mat.to_euler('XYZ')
+            return (euler.x, euler.y, euler.z)
+    except:
+        pass
+    
+    return (0.0, 0.0, 0.0)
+
+
 # ===================================================================
 # IMPORT
 # ===================================================================
@@ -337,7 +387,7 @@ def import_particles_from_materials_py(
 
                 # Empty objects are much faster than mesh objects for bulk import
                 obj = bpy.data.objects.new(obj_name, None)
-                obj.empty_display_type = 'CUBE'
+                obj.empty_display_type = 'SPHERE'
                 obj.empty_display_size = cube_size
                 obj.location = extract_particle_location_from_transform(
                     item.get('transform_values', [])
@@ -346,6 +396,9 @@ def import_particles_from_materials_py(
                     item.get('transform_values', [])
                 )
                 obj.scale = (50.0, 50.0, 50.0)
+                obj.rotation_euler = extract_particle_rotation_from_transform(
+                    item.get('transform_values', [])
+                )
 
                 sub_col.objects.link(obj)
 

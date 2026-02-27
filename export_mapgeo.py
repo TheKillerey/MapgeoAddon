@@ -31,6 +31,11 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         options={'HIDDEN'},
     )
     
+    # Modal execution state for background mode
+    _timer = None
+    _background_task = None
+    _background_step = 0
+    
     # Export options
     export_version: IntProperty(
         name="Mapgeo Version",
@@ -118,11 +123,21 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
     
     def execute(self, context):
         """Execute the export"""
+        # Check execution mode for progress display
+        settings = context.scene.mapgeo_settings
+        show_progress = (settings.execution_mode == 'BACKGROUND')
+        
         try:
+            if show_progress:
+                context.window_manager.progress_begin(0, 100)
+                context.window_manager.progress_update(5)
+            
             # Update settings
-            settings = context.scene.mapgeo_settings
             settings.last_export_path = self.filepath
             settings.export_version = self.export_version
+            
+            if show_progress:
+                context.window_manager.progress_update(10)
             
             # Get objects to export (exclude bucket grid objects)
             if self.export_selected_only:
@@ -135,6 +150,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             # Also exclude objects in bucket grid collections
             objects = [obj for obj in objects if not any(col.get("is_bucket_grid_collection") for col in obj.users_collection)]
+            
+            if show_progress:
+                context.window_manager.progress_update(20)
             
             # Find meshes from root collection by name
             root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
@@ -173,8 +191,14 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             if not objects:
                 self.report({'WARNING'}, "No mesh objects to export (excluding bucket grids)")
             
+            if show_progress:
+                context.window_manager.progress_update(30)
+            
             # Create mapgeo data
             mapgeo = self.create_mapgeo(context, objects)
+            
+            if show_progress:
+                context.window_manager.progress_update(60)
             
             # Handle bucket grids
             if self.bucket_grid_mode == 'ORIGINAL':
@@ -182,24 +206,180 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             elif self.bucket_grid_mode == 'CUSTOM':
                 self.collect_custom_bucket_grids(context, mapgeo)
 
+            if show_progress:
+                context.window_manager.progress_update(75)
+
             # Align mesh hash fields with exported bucket grids.
             # This fixes cases where render-region hashes end up in
             # visibility_controller_path_hash (or vice versa).
             self._realign_mesh_hash_fields_to_bucket_grids(mapgeo)
             
+            if show_progress:
+                context.window_manager.progress_update(85)
+            
             # Write to file
             parser = mapgeo_parser.MapgeoParser()
             parser.write(self.filepath, mapgeo)
+            
+            if show_progress:
+                context.window_manager.progress_update(100)
+                context.window_manager.progress_end()
             
             self.report({'INFO'}, f"Successfully exported to {os.path.basename(self.filepath)} "
                         f"({len(objects)} meshes, {len(mapgeo.bucket_grids)} bucket grids)")
             return {'FINISHED'}
         
         except Exception as e:
+            if show_progress:
+                context.window_manager.progress_end()
             self.report({'ERROR'}, f"Failed to export mapgeo: {str(e)}")
             import traceback
             traceback.print_exc()
             return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        """Handle operator invocation - check execution mode"""
+        settings = context.scene.mapgeo_settings
+        
+        # Always start with file browser
+        context.window_manager.fileselect_add(self)
+        
+        # Check if background mode will be used
+        if settings.execution_mode == 'BACKGROUND':
+            # Will switch to modal after file selection
+            return {'RUNNING_MODAL'}
+        else:
+            # Standard foreground execution after file selection
+            return {'RUNNING_MODAL'}
+    
+    def modal(self, context, event):
+        """Handle modal execution for background processing"""
+        settings = context.scene.mapgeo_settings
+        
+        # If we have an active background task, process it
+        if self._background_task:
+            if event.type == 'TIMER':
+                # Process one step of the background task
+                try:
+                    progress = next(self._background_task)
+                    # Update progress indicator
+                    context.area.header_text_set(f"Exporting: {int(progress)}%")
+                    return {'RUNNING_MODAL'}
+                except StopIteration:
+                    # Task complete
+                    if self._timer:
+                        context.window_manager.event_timer_remove(self._timer)
+                        self._timer = None
+                    context.area.header_text_set(None)
+                    self._background_task = None
+                    return {'FINISHED'}
+                except Exception as e:
+                    # Task failed
+                    if self._timer:
+                        context.window_manager.event_timer_remove(self._timer)
+                        self._timer = None
+                    context.area.header_text_set(None)
+                    self._background_task = None
+                    self.report({'ERROR'}, f"Export failed: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+        
+        # File browser is still open or just closed
+        if not self.filepath:
+            return {'RUNNING_MODAL'}
+        
+        # File selected - check execution mode
+        if settings.execution_mode == 'BACKGROUND':
+            # Start background processing with timer
+            self._timer = context.window_manager.event_timer_add(0.001, window=context.window)
+            self._background_task = self._execute_background(context)
+            return {'RUNNING_MODAL'}
+        else:
+            # Execute immediately in foreground
+            return self.execute(context)
+    
+    def _execute_background(self, context):
+        """Generator function that yields progress for background execution"""
+        settings = context.scene.mapgeo_settings
+        
+        try:
+            yield 5
+            
+            # Update settings
+            settings.last_export_path = self.filepath
+            settings.export_version = self.export_version
+            
+            yield 10
+            
+            # Get objects to export
+            if self.export_selected_only:
+                objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            else:
+                objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
+            
+            # Filter out bucket grid related objects
+            objects = [obj for obj in objects if not obj.get("is_bucket_grid") and not obj.get("is_bucket_grid_bounds")]
+            objects = [obj for obj in objects if not any(col.get("is_bucket_grid_collection") for col in obj.users_collection)]
+            
+            yield 20
+            
+            # Find meshes from root collection
+            root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
+            
+            def collect_collection_meshes(collection, output):
+                for col_obj in collection.objects:
+                    if col_obj.type == 'MESH':
+                        output.add(col_obj)
+                for child in collection.children:
+                    collect_collection_meshes(child, output)
+            
+            root_collection = bpy.data.collections.get(root_name)
+            if root_collection:
+                collected_meshes = set()
+                collect_collection_meshes(root_collection, collected_meshes)
+                objects = [obj for obj in objects if obj in collected_meshes]
+            
+            if not objects:
+                self.report({'WARNING'}, "No mesh objects to export (excluding bucket grids)")
+            
+            yield 30
+            
+            # Create mapgeo data (heavy part)
+            mapgeo = self.create_mapgeo(context, objects)
+            
+            yield 60
+            
+            # Handle bucket grids
+            if self.bucket_grid_mode == 'ORIGINAL':
+                self.collect_imported_bucket_grids(context, mapgeo)
+            elif self.bucket_grid_mode == 'CUSTOM':
+                self.collect_custom_bucket_grids(context, mapgeo)
+            
+            yield 75
+            
+            # Realign mesh hash fields
+            self._realign_mesh_hash_fields_to_bucket_grids(mapgeo)
+            
+            yield 85
+            
+            # Write to file
+            parser = mapgeo_parser.MapgeoParser()
+            parser.write(self.filepath, mapgeo)
+            
+            yield 95
+            
+            self.report({'INFO'}, f"Successfully exported to {os.path.basename(self.filepath)} "
+                        f"({len(objects)} meshes, {len(mapgeo.bucket_grids)} bucket grids)")
+            
+            yield 100
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export mapgeo: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def _realign_mesh_hash_fields_to_bucket_grids(self, mapgeo: mapgeo_parser.MapgeoFile):
         """Realign mesh hash fields to match exported bucket-grid identifier domains.
