@@ -12,7 +12,7 @@ from enum import IntEnum, IntFlag
 
 # Constants
 MAPGEO_MAGIC = b'OEGM'
-SUPPORTED_VERSIONS = [13, 14, 15, 16, 17, 18]
+SUPPORTED_VERSIONS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 
 class VertexElementName(IntEnum):
     """Vertex element semantic names - C# enum values are sequential, StreamIndex comments are just D3D mappings"""
@@ -215,6 +215,12 @@ class Mesh:
     # Baked paint UV transform (version >= 17)
     baked_paint_scale: Tuple[float, float] = (1.0, 1.0)
     baked_paint_bias: Tuple[float, float] = (0.0, 0.0)
+    
+    # Spherical harmonics (version < 9): 9 Vector3 coefficients
+    spherical_harmonics: List[Tuple[float, float, float]] = field(default_factory=list)
+    
+    # Point light position (version < 7 with separate point lights)
+    point_light: Optional[Tuple[float, float, float]] = None
 
 @dataclass
 class TextureOverride:
@@ -281,6 +287,7 @@ class MapgeoFile:
     sampler_defs: List[SamplerDef] = field(default_factory=list)
     bucket_grids: List[BucketGrid] = field(default_factory=list)
     planar_reflectors: List[PlanarReflector] = field(default_factory=list)
+    use_separate_point_lights: bool = False
 
 
 class MapgeoParser:
@@ -308,6 +315,12 @@ class MapgeoParser:
             raise ValueError(f"Unsupported mapgeo version: {version}")
         
         mapgeo.version = version
+        
+        # Version < 7: extra flag in header
+        use_separate_point_lights = False
+        if version < 7:
+            use_separate_point_lights = struct.unpack('<B', stream.read(1))[0] != 0
+            mapgeo.use_separate_point_lights = use_separate_point_lights
         
         # Read sampler definitions (version >= 17 has new format with index + name)
         if version >= 17:
@@ -473,10 +486,16 @@ class MapgeoParser:
                 else:
                     mesh.render_flags = struct.unpack('<H', stream.read(2))[0]
             
+            # Point light (version < 7 with separate point lights)
+            if use_separate_point_lights and version < 7:
+                mesh.point_light = struct.unpack('<3f', stream.read(12))
+            
             # Spherical harmonics and baked light for version < 9
             if version < 9:
-                # Skip 9 Vector3s (spherical harmonics)
-                stream.read(9 * 12)  # 9 * (3 floats * 4 bytes)
+                # Read 9 Vector3s (spherical harmonics)
+                for _ in range(9):
+                    sh = struct.unpack('<3f', stream.read(12))
+                    mesh.spherical_harmonics.append(sh)
                 # Read baked light channel
                 mesh.baked_light = self._read_light_channel(stream)
                 # Early return for version < 9
@@ -648,6 +667,10 @@ class MapgeoParser:
         stream.write(MAPGEO_MAGIC)
         stream.write(struct.pack('<I', mapgeo.version))
         
+        # Version < 7: write separate point lights flag
+        if mapgeo.version < 7:
+            stream.write(struct.pack('<B', 1 if mapgeo.use_separate_point_lights else 0))
+        
         # Write sampler definitions
         if mapgeo.version >= 17:
             stream.write(struct.pack('<I', len(mapgeo.sampler_defs)))
@@ -802,10 +825,21 @@ class MapgeoParser:
                 else:
                     stream.write(struct.pack('<H', mesh.render_flags))
             
+            # Point light (version < 7 with separate point lights)
+            if mapgeo.use_separate_point_lights and mapgeo.version < 7:
+                if mesh.point_light:
+                    stream.write(struct.pack('<3f', *mesh.point_light))
+                else:
+                    stream.write(struct.pack('<3f', 0.0, 0.0, 0.0))
+            
             # Light channels
             if mapgeo.version < 9:
-                # Spherical harmonics (9 zero vec3s)
-                stream.write(b'\x00' * (9 * 12))
+                # Write spherical harmonics (9 vec3s)
+                if mesh.spherical_harmonics:
+                    for sh in mesh.spherical_harmonics:
+                        stream.write(struct.pack('<3f', *sh))
+                else:
+                    stream.write(b'\x00' * (9 * 12))
                 self._write_light_channel(stream, mesh.baked_light)
             else:
                 self._write_light_channel(stream, mesh.baked_light)

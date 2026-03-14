@@ -64,16 +64,12 @@ def _pick_best_materials(material_files, mapgeo_file):
             if f.stem.lower().startswith(base):
                 return f
 
-    py_files = [f for f in material_files if f.name.lower().endswith(".materials.py")]
-    if py_files:
-        return sorted(py_files, key=lambda p: (len(str(p)), p.name.lower()))[0]
-
     return sorted(material_files, key=lambda p: (len(str(p)), p.name.lower()))[0]
 
 
 def _build_legacy_report(map_folder: Path):
     mapgeo_files = _safe_rglob(map_folder, "*.mapgeo")
-    material_files = _safe_rglob(map_folder, "*.materials.py") + _safe_rglob(map_folder, "*.materials.bin.json")
+    material_files = _safe_rglob(map_folder, "*.materials.bin")
     nvr_files = _safe_rglob(map_folder, "*.nvr")
     mat_files = _safe_rglob(map_folder, "*.mat")
     dat_files = _safe_rglob(map_folder, "*.dat")
@@ -648,7 +644,7 @@ class MAPGEO_OT_scan_legacy_map(bpy.types.Operator):
             f"Folder: {map_folder}",
             "",
             f".mapgeo: {len(report['mapgeo_files'])}",
-            f".materials(.py/.bin.json): {len(report['material_files'])}",
+            f".materials(.py/.bin): {len(report['material_files'])}",
             f".nvr: {len(report['nvr_files'])}",
             f".mat: {len(report['mat_files'])}",
             f".dat: {len(report['dat_files'])}",
@@ -699,7 +695,7 @@ class MAPGEO_OT_import_legacy_map_bundle(bpy.types.Operator):
             settings.levels_folder = str(map_folder.parent)
 
         if materials_file:
-            settings.materials_json_path = str(materials_file)
+            settings.materials_file_path = str(materials_file)
 
         imported_map = False
         imported_materials = 0

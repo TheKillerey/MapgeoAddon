@@ -14,6 +14,16 @@ from .texture_utils import TexConverter, resolve_texture_path
 from . import particles_materials
 
 
+def _operator_exists(op_idname: str) -> bool:
+    """Return True if a Blender operator idname is currently registered."""
+    try:
+        cat, opname = op_idname.split('.', 1)
+        ops_cat = getattr(bpy.ops, cat, None)
+        return ops_cat is not None and hasattr(ops_cat, opname)
+    except Exception:
+        return False
+
+
 def _material_items(self, context):
     items = [("", "(No Material)", "Leave material unchanged")]
     for mat in bpy.data.materials:
@@ -495,7 +505,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.2.7"
+        addon_version = "0.3.0"
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
@@ -808,13 +818,13 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         
         col.separator()
         col.prop(settings, "levels_folder", text="Levels Folder")
-        col.prop(settings, "materials_json_path", text="Materials (.json/.py)")
-        col.prop(settings, "map_py_path", text="Map File (.py/.json)")
+        col.prop(settings, "materials_file_path", text="Materials (.bin/.py)")
+        col.prop(settings, "map_py_path", text="Map File (.py/.bin)")
 
         col.separator()
         col.operator("mapgeo.import_materials_file", text="Import Materials File", icon='IMPORT')
         
-        if (settings.assets_folder or settings.custom_assets_folder) and settings.materials_json_path:
+        if (settings.assets_folder or settings.custom_assets_folder) and settings.materials_file_path:
             box.label(text="✓ Materials enabled", icon='CHECKMARK')
             if settings.map_py_path:
                 box.label(text="✓ Map file set (grass tint)", icon='CHECKMARK')
@@ -824,8 +834,8 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         # Supported formats help
         box.separator()
         box.label(text="Supported:", icon='FILE')
-        box.label(text="  .materials.bin.json / .materials.py")
-        box.label(text="  map*.py / map*.json (grass tint)")
+        box.label(text="  .materials.bin")
+        box.label(text="  map*.py / map*.bin (grass tint)")
 
 
 class VIEW3D_PT_mapgeo_export_panel(Panel):
@@ -957,7 +967,7 @@ class VIEW3D_PT_mapgeo_properties_panel(Panel):
                 info_box.label(text="• Cup (bit 1)")
                 info_box.label(text="• Tunnel (bit 2)")
                 info_box.label(text="• Upgraded (bit 3)")
-                info_box.label(text="Load materials.bin.json to decode")
+                info_box.label(text="Load .materials.bin to decode")
             
             layout.separator()
         
@@ -1090,8 +1100,18 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
         box.label(text="Particles (MapParticle/VFX)", icon='PARTICLES')
 
         col = box.column(align=True)
-        col.operator("mapgeo.import_particles_map", text="Import Particles (materials.py)", icon='IMPORT')
+        col.operator("mapgeo.import_particles_map", text="Import Particles", icon='IMPORT')
         col.operator("mapgeo.export_particles_map", text="Export Particles (Map Data)", icon='EXPORT')
+        col.separator()
+        if _operator_exists("mapgeo.edit_selected_mapparticle"):
+            col.operator("mapgeo.edit_selected_mapparticle", text="Edit Selected MapParticle", icon='EMPTY_AXIS')
+        else:
+            col.label(text="Particle editor unavailable (reload addon)", icon='ERROR')
+
+        if _operator_exists("mapgeo.edit_selected_vfx_definition"):
+            col.operator("mapgeo.edit_selected_vfx_definition", text="Edit Selected VFX Definition", icon='MOD_PARTICLES')
+        else:
+            col.label(text="VFX editor unavailable (reload addon)", icon='ERROR')
         box.label(text="Creates dedicated _Particles collection", icon='INFO')
         box.label(text="Parses MapParticle + 0x1f1f50f2 entries", icon='INFO')
         
@@ -1113,6 +1133,7 @@ class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
     bl_idname = "VIEW3D_PT_mapgeo_lightgrid_panel"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
     bl_order = 3
+    bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
         layout = self.layout
@@ -1462,7 +1483,7 @@ class MAPGEO_OT_assign_baron_hash(bpy.types.Operator):
         
         # Try to decode baron hash from materials file
         settings = context.scene.mapgeo_settings
-        materials_path = settings.materials_json_path if hasattr(settings, 'materials_json_path') else ""
+        materials_path = settings.materials_file_path if hasattr(settings, 'materials_file_path') else ""
         
         baron_parser = None
         controller = None
@@ -3013,13 +3034,13 @@ def _build_particle_snippet(entry_hash, entry_kind, location, scale, system_link
 
 
 class MAPGEO_OT_import_particles_map(bpy.types.Operator):
-    """Import VFX definitions + MapParticle entries from a materials.py file"""
+    """Import VFX definitions + MapParticle entries from a materials file"""
     bl_idname = "mapgeo.import_particles_map"
-    bl_label = "Import Particles (materials.py)"
+    bl_label = "Import Particles"
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
-    filter_glob: bpy.props.StringProperty(default="*.materials.py", options={'HIDDEN'})
+    filter_glob: bpy.props.StringProperty(default="*.materials.bin", options={'HIDDEN'})
 
     cube_size: bpy.props.FloatProperty(
         name="Preview Size",
@@ -3030,10 +3051,10 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
 
     def execute(self, context):
         if not self.filepath or not os.path.exists(self.filepath):
-            self.report({'ERROR'}, "Select a valid .materials.py file")
+            self.report({'ERROR'}, "Select a valid materials file (.py or .bin)")
             return {'CANCELLED'}
 
-        imported_count = particles_materials.import_particles_from_materials_py(
+        imported_count = particles_materials.import_particles_from_materials(
             context,
             self.filepath,
             cube_size=self.cube_size,
@@ -3125,6 +3146,119 @@ class MAPGEO_OT_export_particles_map(bpy.types.Operator):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_edit_selected_mapparticle(bpy.types.Operator):
+    """Edit selected MapParticle custom properties"""
+    bl_idname = "mapgeo.edit_selected_mapparticle"
+    bl_label = "Edit Selected MapParticle"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    apply_to_selected: bpy.props.BoolProperty(name="Apply to all selected particles", default=True)
+    particle_system: bpy.props.StringProperty(name="System Link", default="")
+    particle_name_kind: bpy.props.EnumProperty(
+        name="Name Kind",
+        items=[('string', "string", "Name stored as string"), ('hash', "hash", "Name stored as hash")],
+        default='string',
+    )
+    particle_name_value: bpy.props.StringProperty(name="Name Value", default="")
+    particle_visibility_flags: bpy.props.IntProperty(name="Visibility Flags", default=0, min=0, max=255)
+    particle_visibility_controller: bpy.props.StringProperty(name="Visibility Controller", default="")
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        if not obj or not obj.get("is_particle_system", False):
+            self.report({'ERROR'}, "Select a MapParticle object first")
+            return {'CANCELLED'}
+
+        self.particle_system = str(obj.get("particle_system", "") or "")
+        self.particle_name_kind = str(obj.get("particle_name_kind", "string") or "string")
+        self.particle_name_value = str(obj.get("particle_name_value", "") or "")
+        self.particle_visibility_flags = int(obj.get("particle_visibility_flags", obj.get("visibility_layer", 0)) or 0)
+        self.particle_visibility_controller = str(obj.get("particle_visibility_controller", obj.get("baron_hash", "")) or "")
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def execute(self, context):
+        targets = [context.active_object]
+        if self.apply_to_selected:
+            targets = [o for o in context.selected_objects if o.get("is_particle_system", False)] or targets
+
+        updated = 0
+        for obj in targets:
+            if not obj or not obj.get("is_particle_system", False):
+                continue
+            obj["particle_system"] = self.particle_system
+            obj["particle_name_kind"] = self.particle_name_kind
+            obj["particle_name_value"] = self.particle_name_value
+            obj["particle_visibility_flags"] = int(self.particle_visibility_flags)
+            obj["visibility_layer"] = int(self.particle_visibility_flags)
+
+            ctrl = (self.particle_visibility_controller or "").strip()
+            if ctrl:
+                if ctrl.startswith("0x"):
+                    ctrl = ctrl[2:]
+                ctrl = ctrl.upper()
+                obj["particle_visibility_controller"] = ctrl
+                obj["baron_hash"] = ctrl
+            else:
+                if "particle_visibility_controller" in obj:
+                    del obj["particle_visibility_controller"]
+            updated += 1
+
+        self.report({'INFO'}, f"Updated {updated} MapParticle object(s)")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_edit_selected_vfx_definition(bpy.types.Operator):
+    """Edit selected VFX definition custom properties"""
+    bl_idname = "mapgeo.edit_selected_vfx_definition"
+    bl_label = "Edit Selected VFX Definition"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    vfx_name: bpy.props.StringProperty(name="VFX Name", default="")
+    vfx_fields_json: bpy.props.StringProperty(
+        name="VFX Fields JSON",
+        description="Bin-style fields JSON used when saving back to .prey.vfx",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        if not obj or not obj.get("is_vfx_definition", False):
+            self.report({'ERROR'}, "Select a VFX definition object first")
+            return {'CANCELLED'}
+
+        self.vfx_name = str(obj.get("vfx_name", "") or "")
+        self.vfx_fields_json = str(obj.get("vfx_fields_json", "") or "")
+        return context.window_manager.invoke_props_dialog(self, width=700)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "vfx_name")
+        layout.prop(self, "vfx_fields_json")
+        layout.label(text="Tip: paste full fields JSON for bin-sourced VFX defs", icon='INFO')
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or not obj.get("is_vfx_definition", False):
+            self.report({'ERROR'}, "No VFX definition selected")
+            return {'CANCELLED'}
+
+        if self.vfx_fields_json:
+            try:
+                parsed = json.loads(self.vfx_fields_json)
+                if not isinstance(parsed, list):
+                    self.report({'ERROR'}, "VFX Fields JSON must be a JSON array of field objects")
+                    return {'CANCELLED'}
+            except Exception as e:
+                self.report({'ERROR'}, f"Invalid VFX Fields JSON: {e}")
+                return {'CANCELLED'}
+
+        obj["vfx_name"] = self.vfx_name
+        if self.vfx_fields_json:
+            obj["vfx_fields_json"] = self.vfx_fields_json
+        self.report({'INFO'}, "Updated VFX definition object")
+        return {'FINISHED'}
 
 
 # ─── LightGrid Import/Export ───
@@ -4148,6 +4282,8 @@ classes = (
     MAPGEO_OT_import_external_mesh,
     MAPGEO_OT_import_particles_map,
     MAPGEO_OT_export_particles_map,
+    MAPGEO_OT_edit_selected_mapparticle,
+    MAPGEO_OT_edit_selected_vfx_definition,
     MAPGEO_OT_create_lightgrid,
     MAPGEO_OT_bake_lightgrid,
     MAPGEO_OT_import_lightgrid,

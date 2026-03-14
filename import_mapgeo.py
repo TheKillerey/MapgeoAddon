@@ -103,23 +103,45 @@ def _safe_set_vertex_normals(bl_mesh, normals, label="mesh"):
     # ── Sanitise normal values ───────────────────────────────────────
     sanitised = []
     fallback = (0.0, 0.0, 1.0)  # safe default pointing up
-    bad_count = 0
-    for n in normals:
+    bad_indices = []
+    for i, n in enumerate(normals):
         nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
         if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
             sanitised.append(fallback)
-            bad_count += 1
+            bad_indices.append(i)
             continue
         length_sq = nx * nx + ny * ny + nz * nz
         if length_sq < 1e-12:
             sanitised.append(fallback)
-            bad_count += 1
+            bad_indices.append(i)
             continue
         sanitised.append((nx, ny, nz))
 
-    if bad_count > 0:
-        print(f"[Mapgeo] {label}: sanitised {bad_count}/{len(normals)} "
-              f"bad normals (NaN/Inf/zero-length)")
+    # Recalculate bad normals from face geometry instead of using static fallback
+    if bad_indices:
+        bad_set = set(bad_indices)
+        # Accumulate face normals for each bad vertex
+        accum = {vi: [0.0, 0.0, 0.0] for vi in bad_set}
+        for poly in bl_mesh.polygons:
+            pn = poly.normal
+            if pn.length_squared < 1e-12:
+                continue
+            for vi in poly.vertices:
+                if vi in bad_set:
+                    accum[vi][0] += pn.x
+                    accum[vi][1] += pn.y
+                    accum[vi][2] += pn.z
+        for vi in bad_indices:
+            ax, ay, az = accum[vi]
+            l_sq = ax * ax + ay * ay + az * az
+            if l_sq > 1e-12:
+                inv_l = 1.0 / math.sqrt(l_sq)
+                sanitised[vi] = (ax * inv_l, ay * inv_l, az * inv_l)
+            # else: keeps the (0,0,1) fallback
+
+        print(f"[Mapgeo] {label}: recalculated {len(bad_indices)}/{len(normals)} "
+              f"bad normals (NaN/Inf/zero-length) from face geometry")
+    
 
     try:
         bl_mesh.normals_split_custom_set_from_vertices(sanitised)
@@ -137,7 +159,7 @@ def _extract_visibility_controller_layers(materials_path: str) -> dict:
     layer bit to its corresponding path_hash.
     
     Args:
-        materials_path: Path to materials.py or materials.bin.json
+        materials_path: Path to materials.py or materials.bin
         
     Returns: 
         dict[layer_bit: int] → path_hash: int
@@ -201,10 +223,9 @@ def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
 
     When ``use_linked_materials`` is enabled the function searches the same
     directory as the .mapgeo file for a matching materials file:
-        base.mapgeo  ->  base.materials.py  /  base.materials.bin.json
-        base_srx.mapgeo  ->  base_srx.materials.py  /  ...
+        base.mapgeo  ->  base.materials.bin
 
-    Falls back to the manually-specified ``materials_json_path`` if linked
+    Falls back to the manually-specified ``materials_file_path`` if linked
     mode is off or no linked file can be found.
     """
     log = get_debug_log()
@@ -214,19 +235,18 @@ def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
         mapgeo_dir = os.path.dirname(mapgeo_filepath)
         mapgeo_base = os.path.splitext(os.path.basename(mapgeo_filepath))[0]
 
-        # Try common naming patterns
+        # Try matching .materials.bin
         candidates = [
-            os.path.join(mapgeo_dir, mapgeo_base + ".materials.py"),
-            os.path.join(mapgeo_dir, mapgeo_base + ".materials.bin.json"),
+            os.path.join(mapgeo_dir, mapgeo_base + ".materials.bin"),
         ]
         for candidate in candidates:
             if os.path.exists(candidate):
                 log.info("Material", f"Linked materials found: {candidate}")
                 return candidate
 
-        # Also scan the directory for any .materials.py / .materials.bin.json
+        # Also scan the directory for any materials .bin file
         for fname in os.listdir(mapgeo_dir):
-            if fname.endswith('.materials.py') or fname.endswith('.materials.bin.json'):
+            if fname.endswith('.materials.bin'):
                 found = os.path.join(mapgeo_dir, fname)
                 log.info("Material", f"Linked materials fallback found: {found}")
                 return found
@@ -234,7 +254,7 @@ def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
         log.warning("Material", f"No materials file found next to {os.path.basename(mapgeo_filepath)}")
 
     # Fall back to manually specified path
-    manual = getattr(settings, 'materials_json_path', '')
+    manual = getattr(settings, 'materials_file_path', '')
     return manual if manual else ""
 
 
@@ -284,7 +304,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
 
     import_particles: BoolProperty(
         name="Import Particles",
-        description="Import MapParticle entries from linked materials.py",
+        description="Import MapParticle entries from linked materials file",
         default=True,
     )
     
@@ -390,30 +410,20 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             if show_progress:
                 context.window_manager.progress_update(70)
 
-            # Preserve source materials.py path for round-trip export
-            # (entries are re-parsed on demand at export time — instant at import)
+            # Preserve source materials path for round-trip export
             _t1 = _time.perf_counter()
-            try:
-                resolved_materials = _resolve_materials_path(settings, self.filepath)
-                if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
-                    from . import import_materials_blender
-                    import_materials_blender._store_other_entries(
-                        {}, [],          # not used by the new path-based storage
-                        resolved_materials,
-                    )
-            except Exception as e:
-                log.warning("Material", f"Failed to preserve materials.py path: {e}")
+            # (No longer needed — .py format removed, .bin is handled by prey system)
             print(f"[TIMING] preserve_other_entries: {_time.perf_counter() - _t1:.2f}s")
 
-            # Auto-import particles from materials.py when available
+            # Auto-import particles from materials file when available
             _t2 = _time.perf_counter()
             if self.import_particles:
                 try:
                     resolved_materials = _resolve_materials_path(settings, self.filepath)
-                    if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                    if resolved_materials:
                         from . import particles_materials
-                        log.info("Particles", "Importing particles from linked materials.py")
-                        imported_particles = particles_materials.import_particles_from_materials_py(
+                        log.info("Particles", f"Importing particles from {os.path.basename(resolved_materials)}")
+                        imported_particles = particles_materials.import_particles_from_materials(
                             context,
                             resolved_materials,
                             log=log,
@@ -609,22 +619,16 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             
             yield 70
             
-            # Preserve materials.py path
-            try:
-                resolved_materials = _resolve_materials_path(settings, self.filepath)
-                if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
-                    from . import import_materials_blender
-                    import_materials_blender._store_other_entries({}, [], resolved_materials)
-            except Exception as e:
-                log.warning("Material", f"Failed to preserve materials.py path: {e}")
+            # Preserve materials path (no-op — .py format removed)
+            # .bin is handled by prey system
             
             # Import particles
             if self.import_particles:
                 try:
                     resolved_materials = _resolve_materials_path(settings, self.filepath)
-                    if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+                    if resolved_materials:
                         from . import particles_materials
-                        imported_particles = particles_materials.import_particles_from_materials_py(
+                        imported_particles = particles_materials.import_particles_from_materials(
                             context, resolved_materials, log=log
                         )
                 except Exception as e:
@@ -729,7 +733,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Store materials
         materials = {}
         
-        # Load materials from JSON if available
+        # Load materials from file if available
         materials_db = {}
         material_loader = None
         baron_parser = None
@@ -739,39 +743,94 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         # Resolve materials path (linked mode or manual)
         resolved_materials = _resolve_materials_path(settings, self.filepath)
         if resolved_materials:
-            settings.materials_json_path = resolved_materials
-        
-        if resolved_materials and os.path.exists(resolved_materials):
+            settings.materials_file_path = resolved_materials
+
+        # Check for prey-based loading (set by Project Manager)
+        prey_dir = getattr(settings, 'prey_materials_dir', '') or ''
+        prey_base = getattr(settings, 'prey_materials_base', '') or ''
+        use_prey = bool(prey_dir and prey_base and os.path.isfile(
+            os.path.join(prey_dir, f"{prey_base}.prey.materials")))
+
+        if use_prey:
             has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
             has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
-            
-            if has_original_assets or has_custom_assets:
-                log.info("Material", f"Loading materials from: {os.path.basename(resolved_materials)}")
-                if has_original_assets:
-                    log.info("Material", f"Original assets folder: {settings.assets_folder}")
-                if has_custom_assets:
-                    log.info("Material", f"Custom assets folder (fallback): {settings.custom_assets_folder}")
-                
-                material_loader = mat_loader.MaterialLoader(
-                    assets_folder=settings.assets_folder,
-                    levels_folder=settings.levels_folder if hasattr(settings, 'levels_folder') else "",
-                    map_py_path=settings.map_py_path if hasattr(settings, 'map_py_path') else "",
-                    dragon_layer=settings.dragon_layer_filter if hasattr(settings, 'dragon_layer_filter') else "LAYER_1",
-                    custom_assets_folder=settings.custom_assets_folder if hasattr(settings, 'custom_assets_folder') else "",
-                    prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
-                )
-                materials_db = material_loader.load_materials(resolved_materials)
-                
-                # Load map settings (sun, lightmap, fog)
-                map_settings = material_loader.load_map_settings(resolved_materials)
-                
-                # Initialize baron hash parser for visibility decoding
-                baron_parser = baron_hash_parser.MaterialsBinParser(resolved_materials)
-                log.info("Import", "Baron hash parser initialized")
-            else:
+
+            if not has_original_assets and not has_custom_assets:
                 log.warning("Material", "Assets folder not set or doesn't exist — materials will be created without textures")
+
+            log.info("Material", f"Loading materials from prey: {prey_base}.prey.materials")
+            if has_original_assets:
+                log.info("Material", f"Original assets folder: {settings.assets_folder}")
+            if has_custom_assets:
+                log.info("Material", f"Custom assets folder (fallback): {settings.custom_assets_folder}")
+
+            material_loader = mat_loader.MaterialLoader(
+                assets_folder=settings.assets_folder if has_original_assets else "",
+                levels_folder=settings.levels_folder if hasattr(settings, 'levels_folder') else "",
+                map_py_path=settings.map_py_path if hasattr(settings, 'map_py_path') else "",
+                dragon_layer=settings.dragon_layer_filter if hasattr(settings, 'dragon_layer_filter') else "LAYER_1",
+                custom_assets_folder=settings.custom_assets_folder if has_custom_assets else "",
+                prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
+            )
+            materials_db = material_loader.load_materials_from_prey(
+                prey_dir, prey_base, materials_path=resolved_materials or "")
+
+            # Load map settings from prey
+            from . import prey_format as _prey_fmt
+            map_settings = _prey_fmt.load_prey_map_settings(prey_dir, prey_base)
+
+            # Fall back to loading directly from bin if prey had no sun/fog data
+            if not map_settings.get('sun_direction') and resolved_materials and os.path.exists(resolved_materials):
+                from . import project_manager as _pm
+                bin_settings = _pm.load_map_settings_from_bin(resolved_materials)
+                if bin_settings:
+                    log.info("MapSettings", "Prey map settings missing sun data, loaded from bin directly")
+                    # Merge: bin values fill in any gaps
+                    for k, v in bin_settings.items():
+                        if k not in map_settings:
+                            map_settings[k] = v
+
+            # Baron hash parser still needs the original materials file
+            if resolved_materials and os.path.exists(resolved_materials):
+                baron_parser = baron_hash_parser.MaterialsBinParser(resolved_materials)
+                log.info("Import", "Baron hash parser initialized (from original materials)")
+
+        elif resolved_materials and os.path.exists(resolved_materials):
+            has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
+            has_custom_assets = settings.custom_assets_folder and os.path.exists(settings.custom_assets_folder)
+
+            if not has_original_assets and not has_custom_assets:
+                log.warning("Material", "Assets folder not set or doesn't exist — materials will be created without textures")
+
+            log.info("Material", f"Loading materials from: {os.path.basename(resolved_materials)}")
+            if has_original_assets:
+                log.info("Material", f"Original assets folder: {settings.assets_folder}")
+            if has_custom_assets:
+                log.info("Material", f"Custom assets folder (fallback): {settings.custom_assets_folder}")
+
+            material_loader = mat_loader.MaterialLoader(
+                assets_folder=settings.assets_folder if has_original_assets else "",
+                levels_folder=settings.levels_folder if hasattr(settings, 'levels_folder') else "",
+                map_py_path=settings.map_py_path if hasattr(settings, 'map_py_path') else "",
+                dragon_layer=settings.dragon_layer_filter if hasattr(settings, 'dragon_layer_filter') else "LAYER_1",
+                custom_assets_folder=settings.custom_assets_folder if has_custom_assets else "",
+                prioritize_custom=settings.prioritize_custom_assets if hasattr(settings, 'prioritize_custom_assets') else False,
+            )
+            materials_db = material_loader.load_materials(resolved_materials)
+
+            # Load map settings (sun, lightmap, fog)
+            map_settings = material_loader.load_map_settings(resolved_materials)
+
+            # Initialize baron hash parser for visibility decoding
+            baron_parser = baron_hash_parser.MaterialsBinParser(resolved_materials)
+            log.info("Import", "Baron hash parser initialized")
         else:
-            log.info("Material", "No materials JSON specified — using simple materials")
+            log.info("Material", "No materials file specified — using simple materials")
+        
+        # Clear prey routing properties after use
+        if prey_dir:
+            settings.prey_materials_dir = ""
+            settings.prey_materials_base = ""
         
         # Get lightmap color scale from map settings
         lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
@@ -860,6 +919,13 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Create mesh
                 bl_mesh.from_pydata(vertices, [], faces)
                 _optimized_mesh_update(bl_mesh)
+                
+                # Store per-face primitive index for multi-prim round-trip.
+                # This preserves original primitive boundaries even when prims share the same material.
+                if len(mesh_data.primitives) > 1 and face_materials:
+                    prim_attr = bl_mesh.attributes.new(name="mapgeo_prim_idx", type='INT', domain='FACE')
+                    for fi in range(min(len(face_materials), len(bl_mesh.polygons))):
+                        prim_attr.data[fi].value = face_materials[fi]
                 
                 # Apply normals - Blender 5.0+ automatically uses custom normals when set
                 if self.import_normals and normals:
@@ -1026,6 +1092,12 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 
                 # Create object
                 obj = bpy.data.objects.new(mesh_name, bl_mesh)
+                
+                # Store per-primitive material names for multi-prim round-trip export
+                if len(mesh_data.primitives) > 1:
+                    import json as _json
+                    prim_mats = [p.material for p in mesh_data.primitives]
+                    obj["mapgeo_prim_materials"] = _json.dumps(prim_mats)
                 
                 # Link object to main Meshes collection (this owns the object data)
                 meshes_collection.objects.link(obj)
@@ -1525,8 +1597,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         - Fog as Volume Scatter on World (from fogColor, fogStartAndEnd)
         - MapBakeProperties stored as custom properties
         
-        Lightmapped materials use Emission (not affected by scene lights).
-        Non-lightmapped materials (NO_BAKED_LIGHTING) respond to these lights.
+        Lightmapped materials use Emission + Base Color so they show baked
+        lighting and respond to scene lights (sun, sky ambient).
         """
         log = get_debug_log()
         import math
@@ -1650,22 +1722,16 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         
         if fog_enabled and fog_color and fog_start_end:
             # fogStartAndEnd: vec2 = { Start, End }
-            # Start = top of fog box (higher Z position where fog begins)
-            # End = bottom of fog box (lower Z position, how deep fog extends)
-            # Values are typically negative, use absolute values
-            fog_start_top = abs(fog_start_end[0])    # Index 0 = Start (top Z)
-            fog_end_bottom = abs(fog_start_end[1])   # Index 1 = End (bottom Z, depth)
+            # Values represent Z-axis positions (can be negative).
+            # Example: {0, -19000} means fog from Z=0 down to Z=-19000
+            fog_val_a = float(fog_start_end[0])
+            fog_val_b = float(fog_start_end[1])
             
-            # Fog depth is the vertical range
-            fog_depth = abs(fog_end_bottom - fog_start_top)
+            fog_top_z = max(fog_val_a, fog_val_b)
+            fog_bottom_z = min(fog_val_a, fog_val_b)
+            fog_depth = fog_top_z - fog_bottom_z
             
             if fog_depth > 0:
-                # Determine the Z position range
-                # Top of fog (higher Z)
-                fog_top_z = max(fog_start_top, fog_end_bottom)
-                # Bottom of fog (lower Z)
-                fog_bottom_z = min(fog_start_top, fog_end_bottom)
-                
                 # Create a large cube mesh to hold the fog volume
                 # Horizontal size should be large enough to cover the map
                 fog_horizontal_size = max(fog_depth * 3.0, 20000.0)
@@ -1689,10 +1755,10 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 fog_obj.location = (0, 0, fog_center_z)
                 fog_obj.display_type = 'BOUNDS'  # Show as wireframe box in viewport
                 
-                # Calculate fog density based on depth
-                fog_density = 3.0 / max(fog_depth, 100.0)
+                # Fixed fog density matching Riot rendering
+                fog_density = 0.000558
                 
-                # Create volume scatter material
+                # Create Principled Volume material
                 fog_mat = bpy.data.materials.new(name="MapFog_Volume")
                 fog_mat.use_nodes = True
                 fog_nodes = fog_mat.node_tree.nodes
@@ -1702,26 +1768,33 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 fog_output = fog_nodes.new('ShaderNodeOutputMaterial')
                 fog_output.location = (300, 0)
                 
-                vol_scatter = fog_nodes.new('ShaderNodeVolumeScatter')
-                vol_scatter.location = (0, 0)
-                vol_scatter.inputs['Color'].default_value = (
+                principled_vol = fog_nodes.new('ShaderNodeVolumePrincipled')
+                principled_vol.location = (0, 0)
+                principled_vol.inputs['Color'].default_value = (
                     fog_color[0], fog_color[1], fog_color[2], 1.0
                 )
-                vol_scatter.inputs['Density'].default_value = fog_density
-                vol_scatter.label = f"Fog (density={fog_density:.6f})"
+                principled_vol.inputs['Density'].default_value = fog_density
                 
-                fog_links.new(vol_scatter.outputs['Volume'], fog_output.inputs['Volume'])
+                # Set anisotropy color from fog_alternate_color
+                fog_alt_color = map_settings.get('fog_alternate_color')
+                if fog_alt_color:
+                    principled_vol.inputs['Absorption Color'].default_value = (
+                        fog_alt_color[0], fog_alt_color[1], fog_alt_color[2], 1.0
+                    )
+                
+                principled_vol.label = f"Fog (density={fog_density:.6f})"
+                
+                fog_links.new(principled_vol.outputs['Volume'], fog_output.inputs['Volume'])
                 
                 fog_mesh.materials.append(fog_mat)
                 
                 # Store fog properties on the fog object
                 fog_obj["fog_color"] = list(fog_color)
                 fog_obj["fog_density"] = fog_density
-                fog_obj["fog_start_top"] = fog_top_z
-                fog_obj["fog_end_bottom"] = fog_bottom_z
+                fog_obj["fog_start_bottom"] = fog_bottom_z
+                fog_obj["fog_end_top"] = fog_top_z
                 fog_obj["fog_depth"] = fog_depth
                 
-                fog_alt_color = map_settings.get('fog_alternate_color')
                 if fog_alt_color:
                     fog_obj["fog_alternate_color"] = list(fog_alt_color)
                 
@@ -1734,7 +1807,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 log.info("MapSettings", f"Created Fog volume: color=({fog_color[0]:.3f}, {fog_color[1]:.3f}, {fog_color[2]:.3f}), "
                       f"density={fog_density:.6f}, Z range=[{fog_top_z:.0f} (top) to {fog_bottom_z:.0f} (bottom)], depth={fog_depth:.0f}")
             else:
-                log.info("MapSettings", f"Fog skipped: zero depth (Start={fog_start_top:.0f}, End={fog_end_bottom:.0f})")
+                log.info("MapSettings", f"Fog skipped: zero depth (values={fog_val_a:.0f}, {fog_val_b:.0f})")
         elif not fog_enabled:
             log.info("MapSettings", "Fog disabled in map settings")
         
@@ -2021,6 +2094,25 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
         return mat_blender
 
 
+def apply_map_settings_to_scene(context, map_settings):
+    """Apply map settings (sun, fog, world ambient) to the current scene.
+
+    Standalone wrapper around IMPORT_SCENE_OT_mapgeo.create_scene_lighting
+    so project_manager can call it without an operator instance.
+    Returns True if lighting was created, False otherwise.
+    """
+    if not map_settings:
+        return False
+    settings = context.scene.mapgeo_settings
+    col_name = settings.root_collection_name or "rey_map"
+    collection = bpy.data.collections.get(col_name)
+    if not collection:
+        return False
+    # create_scene_lighting does not use 'self'
+    IMPORT_SCENE_OT_mapgeo.create_scene_lighting(None, context, collection, map_settings)
+    return True
+
+
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_SCENE_OT_mapgeo.bl_idname, text="League of Legends Mapgeo (.mapgeo)")
 
@@ -2287,7 +2379,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
     # Resolve materials path (linked mode or manual)
     resolved_materials = _resolve_materials_path(settings, filepath)
     if resolved_materials:
-        settings.materials_json_path = resolved_materials
+        settings.materials_file_path = resolved_materials
     
     if resolved_materials and os.path.exists(resolved_materials):
         has_original_assets = settings.assets_folder and os.path.exists(settings.assets_folder)
@@ -2308,17 +2400,6 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             lightmap_color_scale = map_settings.get('lightmap_color_scale', 1.0) if map_settings else 1.0
             
             baron_parser_inst = baron_hash_parser.MaterialsBinParser(resolved_materials)
-
-            # Preserve non-material entries for materials.py round-trip
-            if resolved_materials.lower().endswith(".materials.py"):
-                try:
-                    from . import import_materials_blender
-                    import_materials_blender._store_other_entries(
-                        {}, [],
-                        resolved_materials,
-                    )
-                except Exception:
-                    pass
     
     # ─── Import matching meshes ───
     imported_count = 0
@@ -2384,6 +2465,12 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             bl_mesh = bpy.data.meshes.new(mesh_name)
             bl_mesh.from_pydata(vertices, [], faces)
             _optimized_mesh_update(bl_mesh)
+            
+            # Store per-face primitive index for multi-prim round-trip
+            if len(mesh_data.primitives) > 1 and face_materials:
+                prim_attr = bl_mesh.attributes.new(name="mapgeo_prim_idx", type='INT', domain='FACE')
+                for fi in range(min(len(face_materials), len(bl_mesh.polygons))):
+                    prim_attr.data[fi].value = face_materials[fi]
             
             # Normals
             if normals:
@@ -2509,6 +2596,13 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
             
             # ── Create object & link to collections ──
             obj = bpy.data.objects.new(mesh_name, bl_mesh)
+            
+            # Store per-primitive material names for multi-prim round-trip export
+            if len(mesh_data.primitives) > 1:
+                import json as _json
+                prim_mats = [p.material for p in mesh_data.primitives]
+                obj["mapgeo_prim_materials"] = _json.dumps(prim_mats)
+            
             meshes_collection.objects.link(obj)
             
             # Link to target sub-collection (Bushes, RenderRegions, etc.)
@@ -2632,12 +2726,12 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
     except Exception:
         pass
 
-    # Auto-import particles from materials.py when available
+    # Auto-import particles from materials file when available
     if import_particles:
         try:
-            if resolved_materials and resolved_materials.lower().endswith(".materials.py"):
+            if resolved_materials:
                 from . import particles_materials
-                particles_materials.import_particles_from_materials_py(context, resolved_materials, log=log)
+                particles_materials.import_particles_from_materials(context, resolved_materials, log=log)
         except Exception:
             pass
     

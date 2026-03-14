@@ -258,6 +258,142 @@ def download_hashes_async(categories: str = "bin", on_complete=None):
     return thread
 
 
+# ============================================================================
+# Custom hash auto-computation from .bin files
+# ============================================================================
+
+# Separate store for project-derived hashes
+_custom_hashes: dict[int, str] = {}
+
+
+def _fnv1a_32(s: str) -> int:
+    """FNV-1a 32-bit hash (lowercase input)."""
+    s = s.lower()
+    h = 0x811c9dc5
+    for c in s:
+        h ^= ord(c)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _extract_strings_from_fields(fields: list, strings: set):
+    """Recursively extract all string values from parsed bin fields."""
+    for field in fields:
+        _extract_strings_from_value(field, strings)
+
+
+def _extract_strings_from_value(value: dict, strings: set):
+    """Extract string values from a single parsed value node."""
+    if not isinstance(value, dict):
+        return
+    type_id = value.get("type", 0)
+    val = value.get("value")
+
+    # String values (TYPE_STRING = 16)
+    if type_id == 16 and isinstance(val, str) and val:
+        strings.add(val)
+
+    # Container / list (0x80, 0x81)
+    elif type_id in (0x80, 0x81):
+        for elem in value.get("values", []):
+            _extract_strings_from_value(elem, strings)
+
+    # Struct / embedded (0x82, 0x83)
+    elif type_id in (0x82, 0x83):
+        for f in value.get("fields") or []:
+            _extract_strings_from_value(f, strings)
+
+    # Optional (0x85)
+    elif type_id == 0x85:
+        inner = value.get("value")
+        if inner:
+            _extract_strings_from_value(inner, strings)
+
+    # Map (0x86)
+    elif type_id == 0x86:
+        for pair in value.get("pairs", []):
+            _extract_strings_from_value(pair.get("key", {}), strings)
+            _extract_strings_from_value(pair.get("value", {}), strings)
+
+
+def compute_custom_hashes(bin_data: dict) -> int:
+    """Compute FNV-1a hashes from all strings found in parsed .bin data.
+
+    Extracts every string value, computes its hash, and registers into
+    the global resolution dictionaries so the PropertyBin editor can
+    resolve them.
+
+    Args:
+        bin_data: Parsed output from propertybin_parser.parse_bin()
+
+    Returns:
+        Number of new hashes registered.
+    """
+    strings: set[str] = set()
+
+    # Extract from linked_files
+    for lf in bin_data.get("linked_files", []):
+        if lf:
+            strings.add(lf)
+
+    # Extract from all entries
+    for entry in bin_data.get("entries", []):
+        for f in entry.get("fields") or []:
+            _extract_strings_from_value(f, strings)
+
+    count = 0
+    for s in strings:
+        h = _fnv1a_32(s)
+        if h not in _all_hashes:
+            _all_hashes[h] = s
+            _custom_hashes[h] = s
+            count += 1
+        # Also register the unhashed string as a potential entry path
+        if '/' in s:
+            bin_entries[h] = bin_entries.get(h, s)
+            bin_hashes[h] = bin_hashes.get(h, s)
+
+    if count:
+        print(f"[CommunityHashes] Computed {count} custom hashes from {len(strings)} strings")
+    return count
+
+
+def compute_custom_hashes_from_folder(folder: str) -> int:
+    """Scan all .bin files in a folder and compute custom hashes.
+
+    Args:
+        folder: Directory to scan recursively for .bin files.
+
+    Returns:
+        Total number of new hashes registered.
+    """
+    try:
+        from . import propertybin_parser
+    except ImportError:
+        import propertybin_parser
+
+    total = 0
+    for root, _dirs, files in os.walk(folder):
+        for fname in files:
+            if fname.lower().endswith('.bin'):
+                fp = os.path.join(root, fname)
+                try:
+                    data = propertybin_parser.parse_bin(fp)
+                    total += compute_custom_hashes(data)
+                except Exception:
+                    pass
+    return total
+
+
+def clear_custom_hashes():
+    """Remove all project-derived custom hashes."""
+    for h in list(_custom_hashes):
+        _all_hashes.pop(h, None)
+        bin_entries.pop(h, None)
+        bin_hashes.pop(h, None)
+    _custom_hashes.clear()
+
+
 def resolve(hash_val: int | str) -> str:
     """
     Look up a hash in the unified dictionary.

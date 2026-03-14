@@ -40,7 +40,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
     export_version: IntProperty(
         name="Mapgeo Version",
         description="Version of mapgeo format to export",
-        default=17,
+        default=18,
         min=13,
         max=18,
     )
@@ -154,7 +154,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             if show_progress:
                 context.window_manager.progress_update(20)
             
-            # Find meshes from root collection by name
+            # Find meshes from the _Meshes subcollection only
+            # (excludes Fog, Sun, Particles, etc.)
             root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
             
             def collect_collection_meshes(collection, output):
@@ -164,29 +165,22 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 for child in collection.children:
                     collect_collection_meshes(child, output)
             
-            # Find root collection by name
-            root_collection = bpy.data.collections.get(root_name)
-            if root_collection:
+            # Only collect from _Meshes subcollection
+            meshes_col = bpy.data.collections.get(f"{root_name}_Meshes")
+            if meshes_col:
+                collected_meshes = set()
+                collect_collection_meshes(meshes_col, collected_meshes)
+                objects = [obj for obj in objects if obj in collected_meshes]
+                print(f"Exporting from '{meshes_col.name}': {len(objects)} mesh objects")
+            elif bpy.data.collections.get(root_name):
+                # Fallback: root exists but no _Meshes child — use root
+                root_collection = bpy.data.collections.get(root_name)
                 collected_meshes = set()
                 collect_collection_meshes(root_collection, collected_meshes)
                 objects = [obj for obj in objects if obj in collected_meshes]
-                print(f"Exporting from root collection '{root_name}': {len(objects)} mesh objects")
+                print(f"Warning: No '{root_name}_Meshes' found; using root '{root_name}': {len(objects)} meshes")
             else:
-                # Fallback: try source_mapgeo_path
-                if settings.last_import_path:
-                    source_collections = [
-                        col for col in bpy.data.collections
-                        if col.get("source_mapgeo_path") == settings.last_import_path
-                    ]
-                    if source_collections:
-                        collected_meshes = set()
-                        for source_col in source_collections:
-                            collect_collection_meshes(source_col, collected_meshes)
-                        objects = [obj for obj in objects if obj in collected_meshes]
-                    else:
-                        print(f"Warning: No root collection '{root_name}' found; exporting all meshes")
-                else:
-                    print(f"Warning: No root collection '{root_name}' found; exporting all meshes")
+                print(f"Warning: No collection '{root_name}' or '{root_name}_Meshes' found; exporting all meshes")
             
             if not objects:
                 self.report({'WARNING'}, "No mesh objects to export (excluding bucket grids)")
@@ -209,11 +203,6 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             if show_progress:
                 context.window_manager.progress_update(75)
 
-            # Align mesh hash fields with exported bucket grids.
-            # This fixes cases where render-region hashes end up in
-            # visibility_controller_path_hash (or vice versa).
-            self._realign_mesh_hash_fields_to_bucket_grids(mapgeo)
-            
             if show_progress:
                 context.window_manager.progress_update(85)
             
@@ -325,7 +314,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             yield 20
             
-            # Find meshes from root collection
+            # Find meshes from the _Meshes subcollection only
             root_name = settings.root_collection_name if hasattr(settings, 'root_collection_name') and settings.root_collection_name else "rey_map"
             
             def collect_collection_meshes(collection, output):
@@ -335,8 +324,13 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 for child in collection.children:
                     collect_collection_meshes(child, output)
             
-            root_collection = bpy.data.collections.get(root_name)
-            if root_collection:
+            meshes_col = bpy.data.collections.get(f"{root_name}_Meshes")
+            if meshes_col:
+                collected_meshes = set()
+                collect_collection_meshes(meshes_col, collected_meshes)
+                objects = [obj for obj in objects if obj in collected_meshes]
+            elif bpy.data.collections.get(root_name):
+                root_collection = bpy.data.collections.get(root_name)
                 collected_meshes = set()
                 collect_collection_meshes(root_collection, collected_meshes)
                 objects = [obj for obj in objects if obj in collected_meshes]
@@ -359,9 +353,6 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             yield 75
             
-            # Realign mesh hash fields
-            self._realign_mesh_hash_fields_to_bucket_grids(mapgeo)
-            
             yield 85
             
             # Write to file
@@ -381,51 +372,6 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             traceback.print_exc()
             raise
 
-    def _realign_mesh_hash_fields_to_bucket_grids(self, mapgeo: mapgeo_parser.MapgeoFile):
-        """Realign mesh hash fields to match exported bucket-grid identifier domains.
-
-        Riot format uses two hash domains:
-        - BucketGrid.path_hash  <-> Mesh.visibility_controller_path_hash
-        - BucketGrid.v18 hash   <-> Mesh.unknown_version18_int
-
-        If a mesh hash is in the wrong domain, the game can fail lookups during map load.
-        """
-        grid_path_hashes = set()
-        grid_v18_hashes = set()
-
-        for grid in mapgeo.bucket_grids:
-            if grid.path_hash:
-                grid_path_hashes.add(grid.path_hash)
-            v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
-            if v18_uint:
-                grid_v18_hashes.add(v18_uint)
-
-        moved_to_v18 = 0
-        moved_to_path = 0
-
-        for mesh in mapgeo.meshes:
-            path_hash = getattr(mesh, 'visibility_controller_path_hash', 0) or 0
-            rr_hash = getattr(mesh, 'unknown_version18_int', 0) or 0
-
-            # Path hash is not present in path-grid domain, but exists in v18-grid domain.
-            # Move it into unknown_version18_int.
-            if path_hash and path_hash not in grid_path_hashes and path_hash in grid_v18_hashes:
-                if rr_hash == 0:
-                    mesh.unknown_version18_int = path_hash
-                mesh.visibility_controller_path_hash = 0
-                moved_to_v18 += 1
-                continue
-
-            # Render-region hash is not present in v18-grid domain, but exists in path-grid domain.
-            # Move it into visibility_controller_path_hash.
-            if rr_hash and rr_hash not in grid_v18_hashes and rr_hash in grid_path_hashes:
-                if path_hash == 0:
-                    mesh.visibility_controller_path_hash = rr_hash
-                mesh.unknown_version18_int = 0
-                moved_to_path += 1
-
-        if moved_to_v18 or moved_to_path:
-            print(f"Realigned mesh hash fields: moved_to_v18={moved_to_v18}, moved_to_path={moved_to_path}")
     
     def create_mapgeo(self, context, objects) -> mapgeo_parser.MapgeoFile:
         """Create mapgeo data structure from Blender objects"""
@@ -484,8 +430,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                         vb_ids.append(len(mapgeo.vertex_buffers))
                         mapgeo.vertex_buffers.append(vb)
                     
-                    # Create index buffer
-                    index_buffer = self.create_index_buffer(mesh)
+                    # Create index buffer (inherit mesh visibility for environment layering)
+                    ib_visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility",
+                                            mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
+                    index_buffer = self.create_index_buffer(mesh, visibility=ib_visibility, obj=obj)
                     index_buffer_id = len(mapgeo.index_buffers)
                     mapgeo.index_buffers.append(index_buffer)
                     
@@ -501,8 +449,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     vertex_buffer_id = len(mapgeo.vertex_buffers)
                     mapgeo.vertex_buffers.append(vertex_buffer)
                     
-                    # Create index buffer
-                    index_buffer = self.create_index_buffer(mesh)
+                    # Create index buffer (inherit mesh visibility for environment layering)
+                    ib_visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility",
+                                            mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
+                    index_buffer = self.create_index_buffer(mesh, visibility=ib_visibility, obj=obj)
                     index_buffer_id = len(mapgeo.index_buffers)
                     mapgeo.index_buffers.append(index_buffer)
                     
@@ -975,32 +925,64 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             vertex_count=vertex_count
         )
     
-    def create_index_buffer(self, mesh) -> mapgeo_parser.IndexBuffer:
-        """Create index buffer from mesh"""
+    def create_index_buffer(self, mesh, visibility=None, obj=None) -> mapgeo_parser.IndexBuffer:
+        """Create index buffer from mesh.
+        
+        If the mesh has a 'mapgeo_prim_idx' face attribute (stored during import for
+        multi-primitive meshes), faces are written grouped by primitive index to
+        preserve original primitive boundaries. Otherwise faces are written in
+        polygon order.
+        """
+        if visibility is None:
+            visibility = mapgeo_parser.EnvironmentVisibility.ALL_LAYERS
         
         index_count = len(mesh.polygons) * 3
         index_data = bytearray(index_count * 2)  # U16 format
         
-        idx = 0
-        for poly in mesh.polygons:
-            if len(poly.vertices) != 3:
-                print(f"Warning: Non-triangle face found (vertices: {len(poly.vertices)})")
-                continue
+        # Check for stored primitive index attribute
+        prim_attr = mesh.attributes.get("mapgeo_prim_idx")
+        has_prim_order = prim_attr is not None and obj is not None and "mapgeo_prim_materials" in obj
+        
+        if has_prim_order:
+            # Group faces by their original primitive index and write in prim order
+            prim_faces = {}  # prim_idx -> list of poly_idx
+            for poly_idx, poly in enumerate(mesh.polygons):
+                if poly_idx < len(prim_attr.data):
+                    pi = prim_attr.data[poly_idx].value
+                else:
+                    pi = 0
+                prim_faces.setdefault(pi, []).append(poly_idx)
             
-            # Reverse winding order: Blender faces were reversed on import
-            # (i0, i2, i1) to compensate for Y/Z coordinate swap handedness.
-            # Export must reverse again to restore original mapgeo winding.
-            v0, v1, v2 = poly.vertices
-            struct.pack_into('<H', index_data, idx * 2, v0)
-            struct.pack_into('<H', index_data, (idx + 1) * 2, v2)
-            struct.pack_into('<H', index_data, (idx + 2) * 2, v1)
-            idx += 3
+            idx = 0
+            for pi in sorted(prim_faces.keys()):
+                for poly_idx in prim_faces[pi]:
+                    poly = mesh.polygons[poly_idx]
+                    if len(poly.vertices) != 3:
+                        continue
+                    v0, v1, v2 = poly.vertices
+                    struct.pack_into('<H', index_data, idx * 2, v0)
+                    struct.pack_into('<H', index_data, (idx + 1) * 2, v2)
+                    struct.pack_into('<H', index_data, (idx + 2) * 2, v1)
+                    idx += 3
+        else:
+            idx = 0
+            for poly in mesh.polygons:
+                if len(poly.vertices) != 3:
+                    print(f"Warning: Non-triangle face found (vertices: {len(poly.vertices)})")
+                    continue
+                
+                # Reverse winding order: Blender faces were reversed on import
+                v0, v1, v2 = poly.vertices
+                struct.pack_into('<H', index_data, idx * 2, v0)
+                struct.pack_into('<H', index_data, (idx + 1) * 2, v2)
+                struct.pack_into('<H', index_data, (idx + 2) * 2, v1)
+                idx += 3
         
         return mapgeo_parser.IndexBuffer(
             data=bytes(index_data),
             format=0,  # U16
             index_count=idx,
-            visibility=mapgeo_parser.EnvironmentVisibility.ALL_LAYERS
+            visibility=visibility
         )
     
     def create_mesh_entry(self, mesh, obj, vertex_buffer_id, index_buffer_id) -> mapgeo_parser.Mesh:
@@ -1033,91 +1015,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             except (ValueError, TypeError):
                 mesh_entry.visibility_controller_path_hash = 0
         
-        # Calculate bounding volumes in LOCAL space
-        # The game engine combines these bounds with the per-mesh transform matrix.
-        # Vertex data is stored in local space, and bounds must also be in local space.
-        if mesh.vertices:
-            # Convert local vertex positions to League coords: Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
-            local_positions = []
-            for v in mesh.vertices:
-                local_positions.append((v.co.x, v.co.z, v.co.y))
-            
-            min_x = min(p[0] for p in local_positions)
-            min_y = min(p[1] for p in local_positions)
-            min_z = min(p[2] for p in local_positions)
-            max_x = max(p[0] for p in local_positions)
-            max_y = max(p[1] for p in local_positions)
-            max_z = max(p[2] for p in local_positions)
-            
-            mesh_entry.bounding_box = mapgeo_parser.BoundingBox(
-                min=(min_x, min_y, min_z),
-                max=(max_x, max_y, max_z)
-            )
-            
-            # Bounding sphere from local-space positions
-            center_x = (min_x + max_x) / 2
-            center_y = (min_y + max_y) / 2
-            center_z = (min_z + max_z) / 2
-            center = Vector((center_x, center_y, center_z))
-            
-            radius = max(
-                (Vector(p) - center).length 
-                for p in local_positions
-            )
-            
-            mesh_entry.bounding_sphere = mapgeo_parser.BoundingSphere(
-                center=(center_x, center_y, center_z),
-                radius=radius
-            )
-        
-        # Buffer references
-        mesh_entry.vertex_buffer_id = vertex_buffer_id
-        mesh_entry.vertex_declaration_id = vertex_buffer_id
-        mesh_entry.vertex_declaration_count = 1
-        mesh_entry.vertex_buffer_ids = [vertex_buffer_id]
-        mesh_entry.vertex_count = len(mesh.vertices)
-        mesh_entry.index_buffer_id = index_buffer_id
-        
-        # Create primitive(s)
-        # Group by material
-        material_groups = {}
-        
-        for poly_idx, poly in enumerate(mesh.polygons):
-            mat_idx = poly.material_index
-            mat_name = mesh.materials[mat_idx].name if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
-            
-            if mat_name not in material_groups:
-                material_groups[mat_name] = []
-            
-            material_groups[mat_name].append(poly_idx)
-        
-        # Create primitives
-        current_index = 0
-        for mat_name, poly_indices in material_groups.items():
-            index_count = len(poly_indices) * 3
-            
-            # Calculate vertex range
-            all_verts = set()
-            for poly_idx in poly_indices:
-                poly = mesh.polygons[poly_idx]
-                all_verts.update(poly.vertices)
-            
-            min_vertex = min(all_verts) if all_verts else 0
-            max_vertex = max(all_verts) if all_verts else 0
-            
-            primitive = mapgeo_parser.MeshPrimitive(
-                material=mat_name,
-                start_index=current_index,
-                index_count=index_count,
-                min_vertex=min_vertex,
-                max_vertex=max_vertex
-            )
-            
-            mesh_entry.primitives.append(primitive)
-            current_index += index_count
-        
-        mesh_entry.index_count = current_index
-        
+        # Compute the League-space transform matrix first (needed for world-space bounding volumes).
         # Convert Blender matrix_world back to League coordinate system
         # Import does: mat_blender = conversion @ mat_league @ conversion.inverted()
         # Export reverses: mat_league = conversion.inverted() @ mat_blender @ conversion
@@ -1138,6 +1036,147 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             mat_league[0][2], mat_league[1][2], mat_league[2][2], mat_league[3][2],  # col 2
             mat_league[0][3], mat_league[1][3], mat_league[2][3], mat_league[3][3],  # col 3
         ]
+        
+        if mesh.vertices:
+            # Convert local vertex positions to League coords: Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
+            local_positions = []
+            for v in mesh.vertices:
+                local_positions.append((v.co.x, v.co.z, v.co.y))
+            
+            min_x = min(p[0] for p in local_positions)
+            min_y = min(p[1] for p in local_positions)
+            min_z = min(p[2] for p in local_positions)
+            max_x = max(p[0] for p in local_positions)
+            max_y = max(p[1] for p in local_positions)
+            max_z = max(p[2] for p in local_positions)
+            
+            # Bounding box in local space (same coordinate space as vertex data).
+            # The game applies the transform_matrix at runtime to get world bounds.
+            mesh_entry.bounding_box = mapgeo_parser.BoundingBox(
+                min=(min_x, min_y, min_z),
+                max=(max_x, max_y, max_z)
+            )
+            
+            # Bounding sphere from local AABB
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+            center_z = (min_z + max_z) / 2
+            center = Vector((center_x, center_y, center_z))
+            
+            corners = [
+                Vector((min_x, min_y, min_z)), Vector((max_x, min_y, min_z)),
+                Vector((min_x, max_y, min_z)), Vector((max_x, max_y, min_z)),
+                Vector((min_x, min_y, max_z)), Vector((max_x, min_y, max_z)),
+                Vector((min_x, max_y, max_z)), Vector((max_x, max_y, max_z)),
+            ]
+            
+            radius = max(
+                (c - center).length 
+                for c in corners
+            )
+            
+            mesh_entry.bounding_sphere = mapgeo_parser.BoundingSphere(
+                center=(center_x, center_y, center_z),
+                radius=radius
+            )
+        
+        # Buffer references
+        mesh_entry.vertex_buffer_id = vertex_buffer_id
+        mesh_entry.vertex_declaration_id = vertex_buffer_id
+        mesh_entry.vertex_declaration_count = 1
+        mesh_entry.vertex_buffer_ids = [vertex_buffer_id]
+        mesh_entry.vertex_count = len(mesh.vertices)
+        mesh_entry.index_buffer_id = index_buffer_id
+        
+        # Create primitive(s)
+        # Check for stored multi-primitive data from import
+        prim_attr = mesh.attributes.get("mapgeo_prim_idx")
+        has_stored_prims = prim_attr is not None and "mapgeo_prim_materials" in obj
+        
+        if has_stored_prims:
+            # Use stored primitive boundaries (preserves same-material multi-prim meshes)
+            prim_mat_names = json.loads(obj["mapgeo_prim_materials"])
+            
+            # Group faces by stored primitive index
+            prim_faces = {}  # prim_idx -> list of poly_idx
+            for poly_idx, poly in enumerate(mesh.polygons):
+                if poly_idx < len(prim_attr.data):
+                    pi = prim_attr.data[poly_idx].value
+                else:
+                    pi = 0
+                prim_faces.setdefault(pi, []).append(poly_idx)
+            
+            current_index = 0
+            for pi in sorted(prim_faces.keys()):
+                poly_indices = prim_faces[pi]
+                index_count = len(poly_indices) * 3
+                
+                # Use stored material name if available, fall back to face material
+                if pi < len(prim_mat_names):
+                    mat_name = prim_mat_names[pi]
+                else:
+                    # Fallback: use material from first face in this group
+                    first_poly = mesh.polygons[poly_indices[0]]
+                    mat_idx = first_poly.material_index
+                    mat_name = mesh.materials[mat_idx].name if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
+                
+                all_verts = set()
+                for poly_idx in poly_indices:
+                    poly = mesh.polygons[poly_idx]
+                    all_verts.update(poly.vertices)
+                
+                min_vertex = min(all_verts) if all_verts else 0
+                max_vertex = max(all_verts) if all_verts else 0
+                
+                primitive = mapgeo_parser.MeshPrimitive(
+                    material=mat_name,
+                    start_index=current_index,
+                    index_count=index_count,
+                    min_vertex=min_vertex,
+                    max_vertex=max_vertex
+                )
+                
+                mesh_entry.primitives.append(primitive)
+                current_index += index_count
+        else:
+            # Fallback: group by material name (original behavior)
+            material_groups = {}
+            
+            for poly_idx, poly in enumerate(mesh.polygons):
+                mat_idx = poly.material_index
+                mat_name = mesh.materials[mat_idx].name if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
+                
+                if mat_name not in material_groups:
+                    material_groups[mat_name] = []
+                
+                material_groups[mat_name].append(poly_idx)
+            
+            # Create primitives
+            current_index = 0
+            for mat_name, poly_indices in material_groups.items():
+                index_count = len(poly_indices) * 3
+                
+                # Calculate vertex range
+                all_verts = set()
+                for poly_idx in poly_indices:
+                    poly = mesh.polygons[poly_idx]
+                    all_verts.update(poly.vertices)
+                
+                min_vertex = min(all_verts) if all_verts else 0
+                max_vertex = max(all_verts) if all_verts else 0
+                
+                primitive = mapgeo_parser.MeshPrimitive(
+                    material=mat_name,
+                    start_index=current_index,
+                    index_count=index_count,
+                    min_vertex=min_vertex,
+                    max_vertex=max_vertex
+                )
+                
+                mesh_entry.primitives.append(primitive)
+                current_index += index_count
+        
+        mesh_entry.index_count = current_index
         
         # Reconstruct light channels from stored properties
         baked_light = mapgeo_parser.LightChannel()

@@ -2,7 +2,7 @@
 
 [![Blender](https://img.shields.io/badge/Blender-5.0+-orange.svg)](https://www.blender.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.2.7-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Status](https://img.shields.io/badge/status-stable-green)
 
 **Edit League of Legends maps in Blender!** Open Summoner's Rift, ARAM, or any League map as a 3D model, make changes, and save them back.

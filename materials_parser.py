@@ -591,16 +591,16 @@ class MaterialsExporter:
     
     @staticmethod
     def _write_preserved_entry(lines: list, entry_content: str) -> None:
-        """Write a preserved (non-material) entry with correct indentation"""
+        """Write a preserved (non-material) entry with correct indentation.
+
+        The stored content already includes the 4-space indent from the
+        original file (captured by the parser's full_text), so we write
+        each line as-is.
+        """
         entry_lines = entry_content.split('\n')
-        for i, entry_line in enumerate(entry_lines):
+        for entry_line in entry_lines:
             if entry_line.strip():
-                if i == 0:
-                    # First line needs 4-space indent (entry declaration)
-                    lines.append(f"    {entry_line}")
-                else:
-                    # Inner lines already have correct indentation from original file
-                    lines.append(entry_line)
+                lines.append(entry_line)
             else:
                 lines.append("")
     

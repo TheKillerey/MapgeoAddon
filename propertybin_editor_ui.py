@@ -701,6 +701,36 @@ class PROPBIN_OT_reload_community_hashes(Operator):
         return {'FINISHED'}
 
 
+class PROPBIN_OT_compute_custom_hashes(Operator):
+    """Compute FNV-1a hashes from all strings in the currently loaded .bin file"""
+    bl_idname = "propbin.compute_custom_hashes"
+    bl_label = "Compute Custom Hashes"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.propbin_settings
+        if not settings.is_loaded or not settings.raw_data_json:
+            self.report({'WARNING'}, "No .bin file loaded")
+            return {'CANCELLED'}
+
+        bin_data = json.loads(settings.raw_data_json)
+        count = community_hashes.compute_custom_hashes(bin_data)
+
+        if count > 0:
+            # Refresh entries to show newly resolved names
+            _populate_entries(settings, bin_data)
+            if len(settings.nodes) > 0:
+                idx = settings.active_entry_index
+                entries = bin_data.get("entries", [])
+                if 0 <= idx < len(entries):
+                    _populate_nodes(settings, entries[idx])
+            self.report({'INFO'}, f"Computed {count} new custom hashes")
+        else:
+            self.report({'INFO'}, "No new hashes found (all already known)")
+
+        return {'FINISHED'}
+
+
 class PROPBIN_OT_remove_entry(Operator):
     """Remove the selected entry from the bin data"""
     bl_idname = "propbin.remove_entry"
@@ -944,6 +974,16 @@ class VIEW3D_PT_propbin_panel(Panel):
         row.operator("propbin.download_community_hashes", text="Download Latest", icon='URL')
         row.operator("propbin.reload_community_hashes", text="", icon='FILE_REFRESH')
 
+        # Custom Hashes (auto-computed from loaded .bin)
+        custom_count = len(community_hashes._custom_hashes)
+        if settings.is_loaded or custom_count > 0:
+            box2 = layout.box()
+            box2.label(text="Custom Hashes", icon='COLLECTION_COLOR_03')
+            if custom_count > 0:
+                box2.label(text=f"Project hashes: {custom_count:,}")
+            if settings.is_loaded:
+                box2.operator("propbin.compute_custom_hashes", text="Compute from Loaded .bin", icon='FILE_REFRESH')
+
         # File Info
         if settings.is_loaded:
             box = layout.box()
@@ -1066,6 +1106,7 @@ _classes = (
     PROPBIN_OT_add_hash_names,
     PROPBIN_OT_download_community_hashes,
     PROPBIN_OT_reload_community_hashes,
+    PROPBIN_OT_compute_custom_hashes,
     PROPBIN_OT_remove_entry,
     PROPBIN_OT_duplicate_entry,
     VIEW3D_PT_propbin_panel,

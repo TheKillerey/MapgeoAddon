@@ -1,6 +1,6 @@
 """
 Material Loader for Mapgeo Addon
-Loads materials from .materials.bin.json or .materials.py files and creates Blender materials
+Loads materials from .materials.bin or .materials.py files and creates Blender materials
 """
 
 import json
@@ -44,7 +44,7 @@ def _is_hash_key(key: str) -> bool:
 
 
 class MaterialLoader:
-    """Loads and creates Blender materials from League materials JSON or Python format"""
+    """Loads and creates Blender materials from League .materials.bin files"""
     
     def __init__(self, assets_folder: str = "", levels_folder: str = "",
                  map_py_path: str = "", dragon_layer: str = "LAYER_1", custom_assets_folder: str = "", prioritize_custom: bool = False):
@@ -60,21 +60,50 @@ class MaterialLoader:
     
     def load_materials(self, file_path: str) -> Dict[str, dict]:
         """
-        Load materials from a .materials.bin.json or .materials.py file.
-        Auto-detects format based on file extension.
+        Load materials from a .materials.bin file.
         
         Returns:
             Dictionary of material_name -> material_data
         """
         self._materials_path = file_path  # Store for grass tint chain
-        if file_path.endswith('.py'):
-            return self._load_materials_py(file_path)
-        else:
-            return self._load_materials_json(file_path)
+        return self._load_materials_bin(file_path)
+
+    def load_materials_from_prey(self, prey_dir: str, base_name: str,
+                                  materials_path: str = "") -> Dict[str, dict]:
+        """Load materials from .prey.materials file.
+
+        Args:
+            prey_dir: Directory containing .prey.* files
+            base_name: Base name for prey files
+            materials_path: Original materials path (stored for grass tint chain)
+
+        Returns:
+            Dictionary of material_name -> material_data
+        """
+        if materials_path:
+            self._materials_path = materials_path
+        try:
+            from . import prey_format
+            materials = prey_format.load_materials_db_from_prey(prey_dir, base_name)
+            _log().info("Material", f"Loaded {len(materials)} materials from prey ({base_name}.prey.materials)")
+            return materials
+        except Exception as e:
+            _log().error("Material", f"Error loading materials from prey: {e}")
+            return {}
     
-    def load_materials_from_json(self, json_path: str) -> Dict[str, dict]:
-        """Legacy method - calls load_materials for backwards compatibility"""
-        return self.load_materials(json_path)
+    def _load_materials_bin(self, bin_path: str) -> Dict[str, dict]:
+        """
+        Load materials directly from a binary .materials.bin file.
+        Parses with propertybin_parser and converts to normalized material dicts.
+        """
+        try:
+            from . import project_manager
+            materials = project_manager.load_materials_from_bin(bin_path)
+            _log().info("Material", f"Loaded {len(materials)} materials from binary {os.path.basename(bin_path)}")
+            return materials
+        except Exception as e:
+            _log().error("Material", f"Error loading materials.bin: {e}")
+            return {}
     
     def load_map_settings(self, file_path: str) -> dict:
         """
@@ -88,58 +117,26 @@ class MaterialLoader:
         if file_path.endswith('.py'):
             return self._load_map_settings_py(file_path)
         else:
-            return self._load_map_settings_json(file_path)
+            return self._load_map_settings_bin(file_path)
     
-    def _load_map_settings_json(self, json_path: str) -> dict:
-        """Parse map settings from JSON format"""
+    def _load_map_settings_bin(self, bin_path: str) -> dict:
+        """Parse map settings from a binary .materials.bin (or any .bin) file.
+        
+        Looks for MapSunProperties, MapBakeProperties, and MapLightingV2
+        entries in the propertybin data.
+        """
         settings = {}
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            for key, value in data.items():
-                if not isinstance(value, dict):
-                    continue
-                # Look for mapContainer entries with components
-                components = value.get('components', [])
-                if not isinstance(components, list):
-                    continue
-                
-                for comp in components:
-                    if not isinstance(comp, dict):
-                        continue
-                    comp_type = comp.get('__type', '')
-                    
-                    if comp_type == 'MapSunProperties':
-                        settings['sun_color'] = comp.get('sunColor', [1, 1, 1, 1])
-                        settings['sun_direction'] = comp.get('sunDirection', [0, 1, 0])
-                        settings['sky_light_color'] = comp.get('skyLightColor', [1, 1, 1, 1])
-                        settings['horizon_color'] = comp.get('horizonColor', [1, 1, 1, 1])
-                        settings['ground_color'] = comp.get('groundColor', [1, 1, 1, 1])
-                        settings['sky_light_scale'] = comp.get('skyLightScale', 1.0)
-                        settings['lightmap_color_scale'] = comp.get('lightMapColorScale', 1.0)
-                        settings['fog_enabled'] = comp.get('fogEnabled', True)
-                        settings['fog_color'] = comp.get('fogColor', [0, 0, 0, 1])
-                        settings['fog_alternate_color'] = comp.get('fogAlternateColor', [0, 0, 0, 1])
-                        settings['fog_start_end'] = comp.get('fogStartAndEnd', [0, -10000])
-                        
-                    elif comp_type == 'MapBakeProperties':
-                        settings['light_grid_size'] = comp.get('lightGridSize', 256)
-                        settings['light_grid_file'] = comp.get('lightGridFileName', '')
-                        settings['rma_light_grid_texture'] = comp.get('RmaStaticLightGridTexturePath', '')
-                        settings['rma_light_grid_intensity_scale'] = comp.get('RmaStaticLightGridIntensityScale', 1.0)
-                        settings['light_grid_fullbright'] = comp.get('lightGridCharacterFullBrightIntensity', 0.5)
-                        
-                    elif comp_type == 'MapLightingV2':
-                        settings['min_env_color_contribution'] = comp.get('MinimumEnvironmentColorContribution', 0.8)
-            
-            if settings:
-                _log().info("MapSettings", f"Loaded map settings from {os.path.basename(json_path)}")
+            from . import project_manager
+            data = project_manager.load_map_settings_from_bin(bin_path)
+            if data:
+                settings.update(data)
+                _log().info("MapSettings", f"Loaded map settings from {os.path.basename(bin_path)}")
                 if 'lightmap_color_scale' in settings:
                     _log().info("MapSettings", f"lightMapColorScale: {settings['lightmap_color_scale']}")
             return settings
         except Exception as e:
-            _log().error("MapSettings", f"Error loading map settings from JSON: {e}")
+            _log().error("MapSettings", f"Error loading map settings from bin: {e}")
             return {}
     
     def _load_map_settings_py(self, py_path: str) -> dict:
@@ -263,76 +260,6 @@ class MaterialLoader:
             _log().error("MapSettings", f"Error loading map settings from .py: {e}")
             return {}
     
-    def _load_materials_json(self, json_path: str) -> Dict[str, dict]:
-        """
-        Load materials from a .materials.bin.json file
-        
-        Returns:
-            Dictionary of material_name -> material_data (normalized with shader/blend/cull fields)
-        """
-        materials = {}
-        
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Iterate through all entries and find StaticMaterialDef
-            hash_resolved = 0
-            for key, value in data.items():
-                if isinstance(value, dict) and value.get("__type") == "StaticMaterialDef":
-                    # Normalize: extract shader/blend/cull from techniques into top-level keys
-                    techniques = value.get('techniques', [])
-                    if techniques and isinstance(techniques, list):
-                        passes = techniques[0].get('passes', [])
-                        if passes and isinstance(passes, list):
-                            first_pass = passes[0]
-                            value['shader'] = first_pass.get('shader', '')
-                            value['blendEnable'] = first_pass.get('blendEnable', False)
-                            value['cullEnable'] = first_pass.get('cullEnable', False)
-                    
-                    # Ensure defaults exist
-                    value.setdefault('shader', '')
-                    value.setdefault('blendEnable', False)
-                    value.setdefault('cullEnable', False)
-                    value.setdefault('switches', {})
-                    value.setdefault('shaderMacros', {})
-                    value.setdefault('techniques', [])
-                    value.setdefault('childTechniques', [])
-                    
-                    # Normalize switches from list to dict if needed
-                    switches_raw = value.get('switchValues', value.get('switches', {}))
-                    if isinstance(switches_raw, list):
-                        switches_dict = {}
-                        for sw in switches_raw:
-                            if isinstance(sw, dict):
-                                sw_name = sw.get('name', '')
-                                sw_on = sw.get('on', True)
-                                if sw_name:
-                                    switches_dict[sw_name] = sw_on
-                        value['switches'] = switches_dict
-                    
-                    # Resolve hashed keys: if key is a hash like "0x0221ffad",
-                    # use the 'name' field inside the material data as the real key
-                    mat_key = key
-                    if _is_hash_key(key):
-                        inner_name = value.get('name', '')
-                        if inner_name:
-                            mat_key = inner_name
-                            hash_resolved += 1
-                        # Also store under hash key for fallback
-                        materials[key] = value
-                    
-                    materials[mat_key] = value
-            
-            if hash_resolved:
-                _log().info("Material", f"Resolved {hash_resolved} hashed material name(s)")
-            _log().info("Material", f"Loaded {len(materials)} static materials from {os.path.basename(json_path)}")
-            return materials
-        
-        except Exception as e:
-            _log().error("Material", f"Error loading materials JSON: {e}")
-            return {}
-    
     def _load_materials_py(self, py_path: str) -> Dict[str, dict]:
         """
         Load materials from a .materials.py file.
@@ -350,7 +277,7 @@ class MaterialLoader:
             }
         
         Returns:
-            Dictionary of material_name -> material_data (same format as JSON)
+            Dictionary of material_name -> material_data
         """
         materials = {}
         
@@ -413,7 +340,7 @@ class MaterialLoader:
                 
                 body = content[start_pos:pos-1]
                 
-                # Parse into JSON-compatible dict
+                # Build normalized material dict
                 mat_data = {
                     '__type': 'StaticMaterialDef',
                     'name': mat_name,
@@ -518,6 +445,7 @@ class MaterialLoader:
                         pass_dict = {
                             "shader": "",
                             "blendEnable": False,
+                            "cullEnable": False,
                             "srcColorBlendFactor": 1,
                             "srcAlphaBlendFactor": 1,
                             "dstColorBlendFactor": 0,
@@ -532,11 +460,31 @@ class MaterialLoader:
                         if blend_match:
                             pass_dict["blendEnable"] = blend_match.group(1) == 'true'
 
+                        cull_match = re.search(r'cullEnable:\s*bool\s*=\s*(true|false)', pass_content)
+                        if cull_match:
+                            pass_dict["cullEnable"] = cull_match.group(1) == 'true'
+
+                        write_mask_match = re.search(r'writeMask:\s*u32\s*=\s*(\d+)', pass_content)
+                        if write_mask_match:
+                            pass_dict["writeMask"] = int(write_mask_match.group(1))
+
                         for factor in ['srcColorBlendFactor', 'srcAlphaBlendFactor',
                                        'dstColorBlendFactor', 'dstAlphaBlendFactor']:
                             factor_match = re.search(rf'{factor}:\s*u32\s*=\s*(\d+)', pass_content)
                             if factor_match:
                                 pass_dict[factor] = int(factor_match.group(1))
+
+                        # Per-pass shader macros
+                        pass_macros_match = re.search(
+                            r'shaderMacros:\s*map\[string,string\]\s*=\s*\{([^}]+)\}',
+                            pass_content
+                        )
+                        if pass_macros_match:
+                            pass_macros = {}
+                            for pm in re.finditer(r'"([^"]+)"\s*=\s*"([^"]*)"', pass_macros_match.group(1)):
+                                pass_macros[pm.group(1)] = pm.group(2)
+                            if pass_macros:
+                                pass_dict["shaderMacros"] = pass_macros
 
                         technique["passes"].append(pass_dict)
 
@@ -708,7 +656,7 @@ class MaterialLoader:
         Extract the mapContainer key from a materials file.
         
         In .py format: "Maps/MapGeometry/Map11/Sodapop_SRS" = mapContainer {
-        In .json format: key with __type == "mapContainer"
+        In .bin format: entry with type_hash 0xdde8c114 (mapContainer)
         
         Returns the container key string or empty string.
         """
@@ -719,24 +667,47 @@ class MaterialLoader:
                 m = re.search(r'"([^"]+)"\s*=\s*mapContainer\s*\{', content)
                 if m:
                     return m.group(1)
-            else:
-                with open(materials_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for key, value in data.items():
-                    if isinstance(value, dict) and value.get('__type') == 'mapContainer':
-                        return key
+            elif materials_path.endswith('.bin'):
+                from . import propertybin_parser
+                data = propertybin_parser.parse_bin(materials_path)
+                for entry in data.get('entries', []):
+                    if entry.get('type_hash') == '0xdde8c114':  # mapContainer
+                        fields = entry.get('fields', [])
+                        for f in fields:
+                            h = f.get('name_hash_int', 0)
+                            # 0xcc5e808a is the link field containing the
+                            # container path (e.g. Maps/MapGeometry/Map11/...)
+                            if h == 0xcc5e808a and f.get('type') == 16:
+                                val = f.get('value', '')
+                                if val:
+                                    return str(val)
+                            # 0x8d39bde6 is the name field (fallback)
+                            if h == 0x8d39bde6:
+                                val = f.get('value', '')
+                                if val:
+                                    return str(val)
+                        return entry.get('path_hash', '')
         except Exception as e:
             _log().error("GrassTint", f"Error extracting mapContainer: {e}")
         return ''
     
+    # Grass tint hash constants (FNV-1a 32-bit)
+    _HASH_MAP_SKIN             = 0xcd19ef3c  # MapSkin
+    _HASH_MAP_CONTAINER_LINK   = 0x960efd81  # mMapContainerLink
+    _HASH_GRASS_TINT_TEXTURE   = 0xbac3a0fa  # mGrassTintTexture
+    _HASH_ALTERNATE_ASSETS     = 0xc7c088eb  # mAlternateAssets
+    _HASH_MAP_ALTERNATE_ASSET  = 0xe54c014f  # MapAlternateAsset
+    _HASH_GRASS_TINT_TEX_NAME  = 0xdcabad81  # mGrassTintTextureName
+    _HASH_VISIBILITY_FLAG_NAME = 0x97472c4d  # mVisibilityFlagName
+
     def _parse_map_file_grass_tints(self, map_file_path: str, container_name: str) -> dict:
         """
-        Parse a map*.py file to find the MapSkin whose mMapContainerLink
+        Parse a map*.py or map*.bin file to find the MapSkin whose mMapContainerLink
         matches container_name, then extract grass tint texture paths.
         
         Returns dict:
             {
-                'base': 'GrassTint_SRX.something.dds',  # filename only
+                'base': 'GrassTint_SRX.something.dds',
                 'alternates': {
                     'Fire': 'ASSETS/Maps/Info/Map11/GrassTint_SRX_Infernal.tex',
                     'earth': 'ASSETS/Maps/Info/Map11/GrassTint_SRX_Mountain.tex',
@@ -745,6 +716,9 @@ class MaterialLoader:
             }
         """
         result = {'base': '', 'alternates': {}}
+
+        if map_file_path.lower().endswith('.bin'):
+            return self._parse_map_bin_grass_tints(map_file_path, container_name)
         
         try:
             with open(map_file_path, 'r', encoding='utf-8') as f:
@@ -815,6 +789,74 @@ class MaterialLoader:
         except Exception as e:
             _log().error("GrassTint", f"Error parsing map file: {e}")
         
+        return result
+
+    def _parse_map_bin_grass_tints(self, bin_path: str, container_name: str) -> dict:
+        """Parse a map*.bin file for grass tint textures (binary propertybin format)."""
+        result = {'base': '', 'alternates': {}}
+
+        try:
+            from . import propertybin_parser
+            data = propertybin_parser.parse_bin(bin_path)
+        except Exception as e:
+            _log().error("GrassTint", f"Error parsing bin file: {e}")
+            return result
+
+        def _get_field(fields, hash_int):
+            if not fields:
+                return None
+            for f in fields:
+                if f.get('name_hash_int') == hash_int:
+                    return f
+            return None
+
+        for entry in data.get('entries', []):
+            type_hash_str = entry.get('type_hash', '')
+            try:
+                type_hash_int = int(type_hash_str, 16) if type_hash_str.startswith('0x') else 0
+            except ValueError:
+                continue
+
+            if type_hash_int != self._HASH_MAP_SKIN:
+                continue
+
+            fields = entry.get('fields', [])
+
+            # Check mMapContainerLink
+            link_f = _get_field(fields, self._HASH_MAP_CONTAINER_LINK)
+            if not link_f:
+                continue
+            link_val = str(link_f.get('value', ''))
+            if link_val != container_name:
+                continue
+
+            skin_name = entry.get('path_hash', '')
+            _log().info("GrassTint", f"Found matching MapSkin (bin): {skin_name}")
+
+            # Base grass tint texture
+            base_f = _get_field(fields, self._HASH_GRASS_TINT_TEXTURE)
+            if base_f:
+                result['base'] = str(base_f.get('value', ''))
+                _log().info("GrassTint", f"Base: {result['base']}")
+
+            # Alternate assets (dragon grass tints)
+            alt_f = _get_field(fields, self._HASH_ALTERNATE_ASSETS)
+            if alt_f:
+                for alt_item in alt_f.get('values', []):
+                    alt_fields = alt_item.get('fields', [])
+                    if not alt_fields:
+                        continue
+                    tint_f = _get_field(alt_fields, self._HASH_GRASS_TINT_TEX_NAME)
+                    flag_f = _get_field(alt_fields, self._HASH_VISIBILITY_FLAG_NAME)
+                    if tint_f and flag_f:
+                        flag_name = str(flag_f.get('value', ''))
+                        tint_path = str(tint_f.get('value', ''))
+                        if flag_name and tint_path:
+                            result['alternates'][flag_name] = tint_path
+                            _log().info("GrassTint", f"{flag_name}: {tint_path}")
+
+            break  # Found our matching skin
+
         return result
     
     # Map dragon layer enum to visibility flag name from map file
@@ -992,9 +1034,17 @@ class MaterialLoader:
     def _find_grass_tint_from_map_file(self) -> str:
         """
         Try to find grass tint texture using the map file chain:
-        materials.py -> mapContainer name -> map*.py -> MapSkin -> grass tint
+        materials -> mapContainer name -> map*.py/bin -> MapSkin -> grass tint
+        
+        Falls back to Riot WAD cache if map file is not in the project folder.
         """
-        if not self.map_py_path or not os.path.exists(self.map_py_path):
+        map_path = self.map_py_path
+        
+        # If no map file set, try to auto-discover it from project settings
+        if (not map_path or not os.path.exists(map_path)):
+            map_path = self._find_map_file_from_riot_wad()
+        
+        if not map_path or not os.path.exists(map_path):
             return ''
         
         # We need to know the mapContainer name from the materials file
@@ -1009,12 +1059,42 @@ class MaterialLoader:
         
         _log().info("GrassTint", f"mapContainer: {container_name}")
         
-        grass_tint_info = self._parse_map_file_grass_tints(self.map_py_path, container_name)
+        grass_tint_info = self._parse_map_file_grass_tints(map_path, container_name)
         if not grass_tint_info.get('base') and not grass_tint_info.get('alternates'):
             _log().warning("GrassTint", "No grass tint textures found in map file")
             return ''
         
         return self._resolve_grass_tint_path(grass_tint_info)
+
+    def _find_map_file_from_riot_wad(self) -> str:
+        """Try to find a map*.bin file from Riot WAD cache via project settings."""
+        try:
+            import bpy
+            if not hasattr(bpy.context, 'scene') or not hasattr(bpy.context.scene, 'project_settings'):
+                return ''
+            ps = bpy.context.scene.project_settings
+            if not ps.use_riot_base or not ps.project_map_id or not ps.league_install:
+                return ''
+            
+            from . import project_manager
+            league_path = bpy.path.abspath(ps.league_install)
+            map_id_lower = ps.project_map_id.lower()
+            
+            riot_cache = project_manager._ensure_riot_wad_cache(league_path, ps.project_map_id)
+            if not riot_cache:
+                return ''
+            
+            for sub_path in [
+                os.path.join("data", "maps", "shipping", map_id_lower, f"{map_id_lower}.bin"),
+                os.path.join("maps", "shipping", map_id_lower, f"{map_id_lower}.bin"),
+            ]:
+                candidate = os.path.join(riot_cache, sub_path)
+                if os.path.isfile(candidate):
+                    _log().info("GrassTint", f"Found map file from Riot WAD: {candidate}")
+                    return candidate
+        except Exception:
+            pass
+        return ''
     
     def _find_grass_tint_fallback(self) -> str:
         """Fallback: search for grass tint texture by globbing the assets folder."""
@@ -1053,7 +1133,7 @@ class MaterialLoader:
         
         Args:
             settings: MapgeoSettings with assets_folder, levels_folder, map_py_path,
-                      materials_json_path, dragon_layer_filter
+                      materials_file_path, dragon_layer_filter
         
         Returns:
             Number of materials updated
@@ -1061,7 +1141,7 @@ class MaterialLoader:
         assets_folder = getattr(settings, 'assets_folder', '')
         levels_folder = getattr(settings, 'levels_folder', '')
         map_py_path = getattr(settings, 'map_py_path', '')
-        materials_path = getattr(settings, 'materials_json_path', '')
+        materials_path = getattr(settings, 'materials_file_path', '')
         dragon_layer = getattr(settings, 'dragon_layer_filter', 'LAYER_1')
         
         if not map_py_path or not materials_path:
@@ -1261,6 +1341,24 @@ class MaterialLoader:
         child_techniques = mat_data.get('childTechniques', mat_data.get('child_techniques', []))
         if child_techniques:
             bl_mat["child_techniques"] = json.dumps(child_techniques)
+
+        # Snapshot for dirty-tracking: store the exact property strings at load
+        # time so save_prey_materials can detect what actually changed.
+        bl_mat["_material_snapshot"] = json.dumps({
+            "samplers": bl_mat.get("samplers", "[]"),
+            "parameters": bl_mat.get("parameters", "[]"),
+            "switches": bl_mat.get("switches", "[]"),
+            "shader_macros": bl_mat.get("shader_macros", "{}"),
+            "techniques": bl_mat.get("techniques", "[]"),
+            "child_techniques": bl_mat.get("child_techniques", "[]"),
+            "type": mat_data.get('type', 0),
+        })
+
+        # Store lightmap metadata for editor rebuild support
+        if lightmap_texture:
+            bl_mat["lightmap_texture"] = lightmap_texture
+        if lightmap_color_scale != 1.0:
+            bl_mat["lightmap_color_scale"] = lightmap_color_scale
         
         # --- Dispatch to shader-specific builder ---
         if shader_name in ('ENV_Glass', 'ENV_Glass_Vertex_Offset', 'ENV_Glass_Diffuse',
@@ -1316,8 +1414,11 @@ class MaterialLoader:
         if shader_name == 'Flowmap_River':
             bl_mat.use_backface_culling = True
         
-        # Render method: BLENDED if blendEnable, otherwise DITHERED
-        # Special cases: PREMULTIPLIED_ALPHA always uses DITHERED, Indicator_Faelights always uses BLENDED
+        # Render method based on blend factors:
+        #   blendEnable + src=1(ONE), dst=7(INV_DST_ALPHA)  → DITHERED
+        #   blendEnable + src=6(DST_ALPHA), dst=7(INV_DST_ALPHA) → BLENDED (Indicator_Faelights) or DITHERED
+        #   blendEnable (other combos) → BLENDED
+        #   no blend → DITHERED (opaque)
         # addressU=1 + addressV=1 on diffuse sampler forces BLENDED (Clamp mode)
         # Exception: BakedTerrain uses clip for UV clamping but stays DITHERED (opaque terrain)
         diffuse_sampler = (self._get_sampler_data(mat_data, 'DiffuseTexture') or 
@@ -1326,36 +1427,37 @@ class MaterialLoader:
         needs_clip_blend = (self._sampler_needs_clip(diffuse_sampler) 
                             and shader_name != 'DefaultEnv_Flat_BakedTerrain')
         
-        if needs_clip_blend:
-            bl_mat.surface_render_method = 'BLENDED'
-        elif shader_macros.get('PREMULTIPLIED_ALPHA') == '1':
+        blend_state = self._get_primary_pass_blend_state(mat_data)
+        blend_on = blend_state['blendEnable']
+        src_c = blend_state['srcColorBlendFactor']
+        dst_c = blend_state['dstColorBlendFactor']
+        src_a = blend_state['srcAlphaBlendFactor']
+        dst_a = blend_state['dstAlphaBlendFactor']
+
+        if not blend_on:
+            # No blending → always Dithered (opaque)
             bl_mat.surface_render_method = 'DITHERED'
-        elif shader_name == 'Indicator_Faelights':
+        elif needs_clip_blend:
             bl_mat.surface_render_method = 'BLENDED'
-            bl_mat.use_transparency_overlap = True
-        elif mat_data.get('blendEnable', False):
+        elif src_c == 1 and dst_c == 7:
+            # ONE / INV_DST_ALPHA → Dithered
+            bl_mat.surface_render_method = 'DITHERED'
+        elif src_c == 6 and dst_c == 7 and shader_name == 'Indicator_Faelights':
+            # DST_ALPHA / INV_DST_ALPHA on Faelights → Blended + overlap
+            bl_mat.surface_render_method = 'BLENDED'
+        else:
             bl_mat.surface_render_method = 'BLENDED'
             bl_mat.show_transparent_back = False
-        else:
-            bl_mat.surface_render_method = 'DITHERED'
 
-        # Transparency Overlap is strictly controlled by pass blend factors:
-        # Src Color = DST_ALPHA (6)
-        # Dst Color = INV_DST_ALPHA (7)
-        # Src Alpha = DST_ALPHA (6)
-        # Dst Alpha = INV_DST_ALPHA (7)
+        # Transparency Overlap: only for Indicator_Faelights with
+        # src=6(DST_ALPHA), dst=7(INV_DST_ALPHA) blend factors.
         if hasattr(bl_mat, 'use_transparency_overlap'):
-            blend_state = self._get_primary_pass_blend_state(mat_data)
             overlap_on = (
-                blend_state['blendEnable'] and
-                blend_state['srcColorBlendFactor'] == 6 and
-                blend_state['dstColorBlendFactor'] == 7 and
-                blend_state['srcAlphaBlendFactor'] == 6 and
-                blend_state['dstAlphaBlendFactor'] == 7
+                blend_on and
+                src_c == 6 and dst_c == 7 and
+                src_a == 6 and dst_a == 7 and
+                shader_name == 'Indicator_Faelights'
             )
-            # Explicit shader override
-            if shader_name == 'VertexDeform':
-                overlap_on = False
             bl_mat.use_transparency_overlap = overlap_on
 
         # EEVEE: disable material shadow casting globally
@@ -2146,10 +2248,18 @@ class MaterialLoader:
             links.new(tinted_color_output, final_mix.inputs[6])
             links.new(lm_multiply.outputs[2], final_mix.inputs[7])
             
-            # → Emission (Combined pass)
+            # → Emission (baked lighting from lightmap)
             links.new(final_mix.outputs[2], bsdf_node.inputs['Emission Color'])
             bsdf_node.inputs['Emission Strength'].default_value = 1.0
-            bsdf_node.inputs['Base Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+            # Route diffuse to Base Color so material also responds to scene
+            # lights (sun, sky, ambient). Without this, lightmapped materials
+            # are pure self-lit and ignore all scene lighting.
+            links.new(tinted_color_output, bsdf_node.inputs['Base Color'])
+            # Reduce specular for lightmapped surfaces — League env shaders
+            # are diffuse-only; specular highlights would be incorrect.
+            if 'Specular IOR Level' in bsdf_node.inputs:
+                bsdf_node.inputs['Specular IOR Level'].default_value = 0.0
+            bsdf_node.inputs['Roughness'].default_value = 1.0
             
             if tinted_alpha_output:
                 links.new(tinted_alpha_output, bsdf_node.inputs['Alpha'])

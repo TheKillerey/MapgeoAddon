@@ -11,6 +11,7 @@ maps, optionals, and embedded objects.
 
 import struct
 from pathlib import Path
+import re
 
 
 # ============================================================================
@@ -90,6 +91,30 @@ TYPE_NAMES = {
 }
 
 TYPE_NAME_TO_ID = {v: k for k, v in TYPE_NAMES.items()}
+
+# StaticMaterialDef type hash used by old v2 map materials bins.
+_TYPE_HASH_STATIC_MATERIAL_DEF = 0xFF9D3409
+
+
+class _LegacyTypeRetry(Exception):
+    """Internal signal to retry entry parsing with legacy type decoding enabled."""
+
+
+def _unpack_type(type_id: int, use_legacy_type: bool = False) -> int:
+    """Match LeagueToolkit legacy type remapping for old PROP2 bins."""
+    if not use_legacy_type:
+        return type_id
+
+    # Old bins did not have TYPE_FILE (WadChunkLink) at primitive index 18.
+    # Values 18..127 are shifted into complex/container range.
+    if TYPE_FILE <= type_id < TYPE_CONTAINER:
+        type_id = (type_id - TYPE_FILE) | TYPE_CONTAINER
+
+    # Complex type ids after unordered container are shifted by +1 in legacy bins.
+    if type_id >= TYPE_CONTAINER2:
+        type_id += 1
+
+    return type_id & 0xFF
 
 
 # ============================================================================
@@ -215,7 +240,7 @@ class BinWriter:
 # Value Reader
 # ============================================================================
 
-def _read_value(reader: BinReader, type_id: int):
+def _read_value(reader: BinReader, type_id: int, use_legacy_type: bool = False):
     """Read a typed value from the stream. Returns a Python dict describing the value."""
 
     if type_id == TYPE_NONE:
@@ -279,23 +304,23 @@ def _read_value(reader: BinReader, type_id: int):
         return {"type": type_id, "value": f"0x{h:016x}"}
 
     elif type_id in (TYPE_CONTAINER, TYPE_CONTAINER2):
-        return _read_container(reader, type_id)
+        return _read_container(reader, type_id, use_legacy_type)
 
     elif type_id == TYPE_STRUCT:
-        return _read_struct(reader, nullable=True)
+        return _read_struct(reader, nullable=True, use_legacy_type=use_legacy_type)
 
     elif type_id == TYPE_EMBEDDED:
-        return _read_struct(reader, nullable=False)
+        return _read_struct(reader, nullable=False, use_legacy_type=use_legacy_type)
 
     elif type_id == TYPE_LINK:
         h = reader.read_u32()
         return {"type": type_id, "value": f"0x{h:08x}"}
 
     elif type_id == TYPE_OPTIONAL:
-        return _read_optional(reader)
+        return _read_optional(reader, use_legacy_type)
 
     elif type_id == TYPE_MAP:
-        return _read_map(reader)
+        return _read_map(reader, use_legacy_type)
 
     elif type_id == TYPE_BITBOOL:
         return {"type": type_id, "value": bool(reader.read_u8())}
@@ -304,15 +329,15 @@ def _read_value(reader: BinReader, type_id: int):
         raise ValueError(f"Unknown type ID: {type_id} (0x{type_id:02x}) at pos {reader.pos}")
 
 
-def _read_container(reader: BinReader, container_type: int) -> dict:
+def _read_container(reader: BinReader, container_type: int, use_legacy_type: bool = False) -> dict:
     """Read a Container / List."""
-    elem_type = reader.read_u8()
+    elem_type = _unpack_type(reader.read_u8(), use_legacy_type)
     data_size = reader.read_u32()
     count = reader.read_u32()
 
     elements = []
     for _ in range(count):
-        elem = _read_value(reader, elem_type)
+        elem = _read_value(reader, elem_type, use_legacy_type)
         elements.append(elem)
 
     return {
@@ -322,7 +347,7 @@ def _read_container(reader: BinReader, container_type: int) -> dict:
     }
 
 
-def _read_struct(reader: BinReader, nullable: bool) -> dict:
+def _read_struct(reader: BinReader, nullable: bool, use_legacy_type: bool = False) -> dict:
     """Read a Struct or Embedded object."""
     class_hash = reader.read_u32()
     type_id = TYPE_STRUCT if nullable else TYPE_EMBEDDED
@@ -334,7 +359,7 @@ def _read_struct(reader: BinReader, nullable: bool) -> dict:
     field_count = reader.read_u16()
     fields = []
     for _ in range(field_count):
-        field = _read_field(reader)
+        field = _read_field(reader, use_legacy_type)
         fields.append(field)
 
     return {
@@ -344,13 +369,13 @@ def _read_struct(reader: BinReader, nullable: bool) -> dict:
     }
 
 
-def _read_optional(reader: BinReader) -> dict:
+def _read_optional(reader: BinReader, use_legacy_type: bool = False) -> dict:
     """Read an Optional<T>."""
-    elem_type = reader.read_u8()
+    elem_type = _unpack_type(reader.read_u8(), use_legacy_type)
     has_value = reader.read_u8()
 
     if has_value:
-        val = _read_value(reader, elem_type)
+        val = _read_value(reader, elem_type, use_legacy_type)
     else:
         val = None
 
@@ -361,17 +386,17 @@ def _read_optional(reader: BinReader) -> dict:
     }
 
 
-def _read_map(reader: BinReader) -> dict:
+def _read_map(reader: BinReader, use_legacy_type: bool = False) -> dict:
     """Read a Map<K, V>."""
-    key_type = reader.read_u8()
-    value_type = reader.read_u8()
+    key_type = _unpack_type(reader.read_u8(), use_legacy_type)
+    value_type = _unpack_type(reader.read_u8(), use_legacy_type)
     data_size = reader.read_u32()
     count = reader.read_u32()
 
     pairs = []
     for _ in range(count):
-        k = _read_value(reader, key_type)
-        v = _read_value(reader, value_type)
+        k = _read_value(reader, key_type, use_legacy_type)
+        v = _read_value(reader, value_type, use_legacy_type)
         pairs.append({"key": k, "value": v})
 
     return {
@@ -382,12 +407,12 @@ def _read_map(reader: BinReader) -> dict:
     }
 
 
-def _read_field(reader: BinReader) -> dict:
+def _read_field(reader: BinReader, use_legacy_type: bool = False) -> dict:
     """Read a single field (name_hash + type + value)."""
     name_hash = reader.read_u32()
-    type_id = reader.read_u8()
+    type_id = _unpack_type(reader.read_u8(), use_legacy_type)
 
-    value_data = _read_value(reader, type_id)
+    value_data = _read_value(reader, type_id, use_legacy_type)
 
     return {
         "name_hash": f"0x{name_hash:08x}",
@@ -626,21 +651,33 @@ def parse_bin(filepath: str) -> dict:
     entry_types = [reader.read_u32() for _ in range(entry_count)]
 
     # Read entries
-    entries = []
-    for i in range(entry_count):
-        try:
-            entry = _read_entry(reader, entry_types[i])
-            entries.append(entry)
-        except Exception as e:
-            print(f"[PropertyBin] Error reading entry {i}: {e}")
-            # Try to continue by creating a placeholder
-            entries.append({
-                "path_hash": f"0x{0:08x}",
-                "type_hash": f"0x{entry_types[i]:08x}",
-                "fields": [],
-                "_error": str(e),
-            })
-            break  # Can't reliably continue after a parse error
+    entries_offset = reader.pos
+
+    def _read_entries(use_legacy_type: bool) -> list[dict]:
+        reader.pos = entries_offset
+        parsed_entries = []
+        for i in range(entry_count):
+            try:
+                entry = _read_entry(reader, entry_types[i], version, use_legacy_type=use_legacy_type)
+                parsed_entries.append(entry)
+            except _LegacyTypeRetry:
+                # Trigger one full retry with LeagueToolkit-style legacy type decode.
+                raise
+            except Exception as e:
+                print(f"[PropertyBin] Error reading entry {i}: {e}")
+                parsed_entries.append({
+                    "path_hash": f"0x{0:08x}",
+                    "type_hash": f"0x{entry_types[i]:08x}",
+                    "fields": [],
+                    "_error": str(e),
+                })
+                # Continue; _read_entry consumes full entry chunk before parsing.
+        return parsed_entries
+
+    try:
+        entries = _read_entries(use_legacy_type=False)
+    except _LegacyTypeRetry:
+        entries = _read_entries(use_legacy_type=True)
 
     # Version 3 patch sections (if any trailing data)
     patch_entries = []
@@ -672,32 +709,176 @@ def parse_bin(filepath: str) -> dict:
     return result
 
 
-def _read_entry(reader: BinReader, type_hash: int) -> dict:
-    """Read a single entry from the stream."""
-    content_length = reader.read_u32()
-    start_pos = reader.pos
+def _read_entry(reader: BinReader, type_hash: int, version: int, use_legacy_type: bool = False) -> dict:
+    """Read a single entry from the stream.
 
-    path_hash = reader.read_u32()
-    field_count = reader.read_u16()
+    Parsing is done from an isolated entry chunk so parse errors don't
+    desync the outer stream.
+    """
+    content_length = reader.read_u32()
+    content = reader.read_bytes(content_length)
+
+    entry_reader = BinReader(content)
+    path_hash = entry_reader.read_u32()
+    field_count = entry_reader.read_u16()
 
     fields = []
-    for _ in range(field_count):
-        field = _read_field(reader)
-        fields.append(field)
+    preserve_raw = False
+    try:
+        for _ in range(field_count):
+            fields.append(_read_field(entry_reader, use_legacy_type))
+    except Exception:
+        if not use_legacy_type:
+            # Match LeagueToolkit behavior: retry whole object table using legacy type mapping.
+            raise _LegacyTypeRetry()
+        # Legacy v2 StaticMaterialDef payloads in some older map bins are not
+        # encoded with the standard typed-field layout. Fall back to a minimal
+        # parser so these files remain loadable.
+        if type_hash == _TYPE_HASH_STATIC_MATERIAL_DEF:
+            fields = _read_legacy_v2_static_material_fields(content)
+            preserve_raw = True
+        else:
+            fields = _read_legacy_v2_entry_fields(content)
+            preserve_raw = True
 
-    # Verify we consumed the right amount of data
-    consumed = reader.pos - start_pos
-    if consumed < content_length:
-        # Skip any extra padding/data
-        reader.read_bytes(content_length - consumed)
-    elif consumed > content_length:
-        print(f"[PropertyBin] Warning: entry 0x{path_hash:08x} overread by {consumed - content_length} bytes")
-
-    return {
+    result = {
         "path_hash": f"0x{path_hash:08x}",
         "type_hash": f"0x{type_hash:08x}",
         "fields": fields,
     }
+    if preserve_raw:
+        # Keep original payload bytes for lossless round-trip writing.
+        result["_preserve_raw"] = True
+        result["_raw_entry_data"] = content.hex()
+    return result
+
+
+def _extract_legacy_strings(data: bytes) -> list[str]:
+    """Extract short UTF-8-ish strings prefixed by u16 length."""
+    out = []
+    i = 0
+    n = len(data)
+    while i + 2 <= n:
+        slen = int.from_bytes(data[i:i + 2], 'little')
+        if 0 < slen <= 512 and i + 2 + slen <= n:
+            raw = data[i + 2:i + 2 + slen]
+            try:
+                s = raw.decode('utf-8')
+            except Exception:
+                i += 1
+                continue
+            # Keep mostly-printable strings only.
+            if s and sum(1 for ch in s if 32 <= ord(ch) < 127) >= max(1, int(len(s) * 0.8)):
+                out.append(s)
+        i += 1
+    return out
+
+
+def _read_legacy_v2_static_material_fields(content: bytes) -> list[dict]:
+    """Best-effort decoder for legacy v2 StaticMaterialDef entries.
+
+    It reconstructs essential fields (name, type, diffuse sampler) so old
+    version-2 map materials bins can be loaded without hard failure.
+    """
+    r = BinReader(content)
+    _path_hash = r.read_u32()
+    field_count = r.read_u16()
+
+    name = ""
+    mat_type = 0
+
+    # The first fields are usually still standard typed fields.
+    for idx in range(min(field_count, 3)):
+        pos = r.pos
+        try:
+            fld = _read_field(r)
+        except Exception:
+            r.pos = pos
+            break
+        if idx == 0 and fld.get('type') == TYPE_STRING:
+            name = str(fld.get('value') or '')
+        elif idx == 1 and fld.get('type') == TYPE_U32:
+            mat_type = int(fld.get('value') or 0)
+
+    # Extract texture-like strings from the remainder.
+    strings = _extract_legacy_strings(content)
+    texture_path = ""
+    for s in strings:
+        low = s.lower()
+        if ('assets/' in low or 'maps/' in low) and (low.endswith('.dds') or low.endswith('.tex')):
+            texture_path = s.replace('\\', '/')
+            break
+
+    # Normalize old .dds references to .tex naming when possible.
+    if texture_path.lower().endswith('.dds'):
+        texture_path = re.sub(r'(?i)\.dds$', '.tex', texture_path)
+        texture_path = re.sub(r'(?i)\.srt[^./\\]*(?=\.[^./\\]+$)', '', texture_path)
+
+    fields = [
+        {
+            'name_hash': '0x8d39bde6',
+            'name_hash_int': 0x8D39BDE6,
+            'type': TYPE_STRING,
+            'value': name,
+        },
+        {
+            'name_hash': '0x5127f14d',
+            'name_hash_int': 0x5127F14D,
+            'type': TYPE_U32,
+            'value': mat_type,
+        },
+    ]
+
+    if texture_path:
+        fields.append({
+            'name_hash': '0x0a6f0eb5',
+            'name_hash_int': 0x0A6F0EB5,
+            'type': TYPE_CONTAINER,
+            'value_type': TYPE_EMBEDDED,
+            'values': [
+                {
+                    'type': TYPE_EMBEDDED,
+                    'class_hash': '0x663d7491',
+                    'fields': [
+                        {
+                            'name_hash': '0xb311d4ef',
+                            'name_hash_int': 0xB311D4EF,
+                            'type': TYPE_STRING,
+                            'value': 'DiffuseTexture',
+                        },
+                        {
+                            'name_hash': '0xf0a363e3',
+                            'name_hash_int': 0xF0A363E3,
+                            'type': TYPE_STRING,
+                            'value': texture_path,
+                        },
+                    ],
+                }
+            ],
+        })
+
+    return fields
+
+
+def _read_legacy_v2_entry_fields(content: bytes) -> list[dict]:
+    """Best-effort parser for malformed legacy v2 entry payloads.
+
+    It decodes fields until the first structural mismatch and returns what was
+    parsed so callers can still inspect the entry instead of dropping it.
+    """
+    r = BinReader(content)
+    _path_hash = r.read_u32()
+    field_count = r.read_u16()
+
+    fields = []
+    for _ in range(field_count):
+        pos = r.pos
+        try:
+            fields.append(_read_field(r))
+        except Exception:
+            r.pos = pos
+            break
+    return fields
 
 
 # ============================================================================
@@ -757,6 +938,12 @@ def write_bin(bin_data: dict, filepath: str):
 
 def _write_entry(writer: BinWriter, entry: dict):
     """Write a single entry to the stream."""
+    if entry.get("_preserve_raw") and entry.get("_raw_entry_data"):
+        raw = bytes.fromhex(entry["_raw_entry_data"])
+        writer.write_u32(len(raw))
+        writer.write_bytes(raw)
+        return
+
     # Build entry content first to compute size
     inner = BinWriter()
     inner.write_u32(_parse_hex(entry["path_hash"]))

@@ -6,9 +6,10 @@ Texture edits propagate to the viewport in real-time.
 
 import bpy
 import json
+import math
 import os
 import re
-from bpy.types import Operator, Panel, PropertyGroup
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy.props import (
     StringProperty, IntProperty, FloatProperty, BoolProperty,
     CollectionProperty, FloatVectorProperty, EnumProperty,
@@ -48,6 +49,16 @@ except ImportError:
     SHADER_LINKS = []
     PARAMS_ALL = []
     PARAM_TOP_USED = []
+
+try:
+    from dx11_shader_parser import (
+        validate_material_defines,
+        find_nearest_valid_defines,
+        clear_shader_cache,
+    )
+    _HAS_SHADER_VALIDATION = True
+except ImportError:
+    _HAS_SHADER_VALIDATION = False
 
 # ============================================================================
 # Constants
@@ -301,11 +312,11 @@ def _apply_pass_material_settings(mat, pass_data):
     """Apply technique-pass blend/cull settings to Blender material preview settings.
 
     Uses blend factor analysis to choose the best Blender blend/render mode:
-      - src=1, dst=0 → Opaque (DITHERED)
-      - src=6, dst=7 → Standard alpha blend (BLENDED)
-      - src=1, dst=7 → Premultiplied alpha (DITHERED)
-      - src=6, dst=1 → Additive reflection (BLENDED)
-      - src=1, dst=6 → Additive glow (BLENDED)
+      - src=1, dst=7 (ONE/INV_DST_ALPHA) → DITHERED
+      - src=6, dst=7 (DST_ALPHA/INV_DST_ALPHA) on Indicator_Faelights → BLENDED + overlap
+      - src=6, dst=7 (DST_ALPHA/INV_DST_ALPHA) otherwise → BLENDED, no overlap
+      - other blends → BLENDED
+      - no blend → DITHERED (opaque)
     """
     if not mat or not pass_data:
         return
@@ -313,38 +324,54 @@ def _apply_pass_material_settings(mat, pass_data):
     blend_enabled = bool(pass_data.get("blendEnable", False))
     src_color = pass_data.get("srcColorBlendFactor", 1)
     dst_color = pass_data.get("dstColorBlendFactor", 0)
+    src_alpha = pass_data.get("srcAlphaBlendFactor", 1)
+    dst_alpha = pass_data.get("dstAlphaBlendFactor", 0)
+
+    # Determine shader name for special-case handling
+    shader_name = ""
+    try:
+        shader_name = pass_data.get("shader", "").rsplit("/", 1)[-1]
+    except Exception:
+        pass
 
     # Determine Blender blend / render mode
-    if blend_enabled:
-        if src_color == 1 and dst_color == 7:
-            # Premultiplied alpha → DITHERED (Blender handles premultiply)
-            if hasattr(mat, "surface_render_method"):
-                mat.surface_render_method = 'DITHERED'
-            elif hasattr(mat, "blend_method"):
-                mat.blend_method = 'HASHED'
-        else:
-            # Standard alpha blend, additive, etc. → BLENDED
-            if hasattr(mat, "surface_render_method"):
-                mat.surface_render_method = 'BLENDED'
-            elif hasattr(mat, "blend_method"):
-                mat.blend_method = 'BLEND'
-    else:
-        # Opaque
+    if not blend_enabled:
+        # No blending → always Dithered (opaque)
         if hasattr(mat, "surface_render_method"):
             mat.surface_render_method = 'DITHERED'
         elif hasattr(mat, "blend_method"):
             mat.blend_method = 'OPAQUE'
+    elif src_color == 1 and dst_color == 7:
+        # ONE / INV_DST_ALPHA → Dithered
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = 'DITHERED'
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = 'HASHED'
+    elif src_color == 6 and dst_color == 7 and shader_name == 'Indicator_Faelights':
+        # DST_ALPHA / INV_DST_ALPHA on Faelights → Blended + overlap
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = 'BLENDED'
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = 'BLEND'
+    else:
+        # Standard alpha blend, additive, etc. → BLENDED
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = 'BLENDED'
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = 'BLEND'
 
-    # Blender API varies by version/build; guard optional attributes.
-    if hasattr(mat, "shadow_method"):
-        try:
-            mat.shadow_method = 'HASHED' if blend_enabled else 'OPAQUE'
-        except Exception:
-            pass
+    # Transparency Overlap: only for Indicator_Faelights with 6/7/6/7 blend factors
+    if hasattr(mat, "use_transparency_overlap"):
+        overlap_on = (
+            blend_enabled and
+            src_color == 6 and dst_color == 7 and
+            src_alpha == 6 and dst_alpha == 7 and
+            shader_name == 'Indicator_Faelights'
+        )
+        mat.use_transparency_overlap = overlap_on
 
     # Show transparent back for glass/additive shaders
     if hasattr(mat, "show_transparent_back"):
-        # Additive shaders (reflection/glow) show both sides
         is_additive = blend_enabled and dst_color in (1, 6)
         mat.show_transparent_back = is_additive
 
@@ -755,6 +782,7 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
 
     # ── Preserve loaded images from old nodes ───────────────────────
     previous_images = {}
+    lightmap_image = None  # Preserve lightmap separately
     for node in nodes:
         if node.type == 'TEX_IMAGE' and node.image:
             if node.label:
@@ -764,6 +792,12 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
             if node.image.filepath:
                 img_stem = os.path.splitext(os.path.basename(node.image.filepath))[0].lower()
                 previous_images[f"__filepath__{img_stem}"] = node.image
+            # Detect lightmap node: connected from a LightmapUV node
+            for inp in node.inputs:
+                for link in inp.links:
+                    if (link.from_node.type == 'UVMAP' and
+                            getattr(link.from_node, 'uv_map', '') == 'LightmapUV'):
+                        lightmap_image = node.image
 
     # ── Clear all nodes except output, then reuse/create output ─────
     # Remove everything (loader-created nodes don't have MAPGEO_ prefix,
@@ -954,6 +988,77 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
         if alpha_input and alpha_out:
             links.new(alpha_out, alpha_input)
 
+    # ── Lightmap reconnection (preserves baked lighting across edits) ──
+    # Check stored metadata or preserved lightmap image
+    _lm_image = lightmap_image
+    if not _lm_image and mat.get("lightmap_texture"):
+        # Try to find in previous_images by filepath stem
+        lm_path = mat["lightmap_texture"]
+        lm_stem = os.path.splitext(os.path.basename(lm_path.replace("\\", "/")))[0].lower()
+        _lm_image = previous_images.get(f"__filepath__{lm_stem}")
+    
+    # Also check shader macros: only apply lightmap if material uses baked lighting
+    _has_baked = True
+    try:
+        _macros = json.loads(mat.get("shader_macros", "{}"))
+        if "NO_BAKED_LIGHTING" in _macros:
+            _has_baked = False
+    except Exception:
+        pass
+
+    if _lm_image and _has_baked and diffuse_node and shader_node.type == 'BSDF_PRINCIPLED':
+        lm_scale = mat.get("lightmap_color_scale", 1.0)
+
+        # Create LightmapUV node
+        lm_uv = nodes.new("ShaderNodeUVMap")
+        lm_uv.uv_map = "LightmapUV"
+        lm_uv.label = "LightmapUV"
+        lm_uv.location = (-820, -400)
+
+        # Create lightmap texture node
+        lm_tex = nodes.new("ShaderNodeTexImage")
+        lm_tex.image = _lm_image
+        lm_tex.label = "Lightmap"
+        lm_tex.location = (-620, -400)
+        if _lm_image:
+            _lm_image.colorspace_settings.name = 'Non-Color'
+        links.new(lm_uv.outputs['UV'], lm_tex.inputs['Vector'])
+
+        # LM × Scale
+        lm_scale_node = nodes.new('ShaderNodeMix')
+        lm_scale_node.data_type = 'RGBA'
+        lm_scale_node.blend_type = 'MULTIPLY'
+        lm_scale_node.location = (-320, -400)
+        lm_scale_node.inputs['Factor'].default_value = 1.0
+        lm_scale_node.label = "LM × Scale"
+        links.new(lm_tex.outputs['Color'], lm_scale_node.inputs[6])
+        lm_scale_node.inputs[7].default_value = (lm_scale, lm_scale, lm_scale, 1.0)
+
+        # Diffuse × Lightmap
+        lm_mix = nodes.new('ShaderNodeMix')
+        lm_mix.data_type = 'RGBA'
+        lm_mix.blend_type = 'MULTIPLY'
+        lm_mix.location = (-100, -200)
+        lm_mix.inputs['Factor'].default_value = 1.0
+        lm_mix.label = "Diffuse × Lightmap"
+        links.new(diffuse_node.outputs['Color'], lm_mix.inputs[6])
+        links.new(lm_scale_node.outputs[2], lm_mix.inputs[7])
+
+        # Wire to Emission
+        ec_in = shader_node.inputs.get("Emission Color")
+        es_in = shader_node.inputs.get("Emission Strength")
+        if ec_in:
+            links.new(lm_mix.outputs[2], ec_in)
+        if es_in:
+            es_in.default_value = 1.0
+        # Reduce specular for lightmapped surfaces
+        spec_in = shader_node.inputs.get("Specular IOR Level") or shader_node.inputs.get("Specular")
+        if spec_in:
+            spec_in.default_value = 0.0
+        rough_in = shader_node.inputs.get("Roughness")
+        if rough_in:
+            rough_in.default_value = 1.0
+
     # ── Emissive / Glow texture wiring (skip shader templates) ──────
     _EMISSIVE_NAMES = {
         "emissive_texture", "emissiontex", "emission_tex",
@@ -966,19 +1071,23 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
             break
 
     if emissive_tex_node and shader_node.type == 'BSDF_PRINCIPLED':
-        ecolor = emissive_tex_node.outputs.get("Color")
-        ein = shader_node.inputs.get("Emission Color") or shader_node.inputs.get("Emission")
-        if ecolor and ein:
-            links.new(ecolor, ein)
-        estr = shader_node.inputs.get("Emission Strength")
-        if estr:
-            # Only enable emission when the emissive texture has an actual image loaded
-            estr.default_value = 1.0 if emissive_tex_node.image else 0.0
+        # Only apply separate emissive texture if no lightmap (lightmap uses Emission)
+        if not (_lm_image and _has_baked):
+            ecolor = emissive_tex_node.outputs.get("Color")
+            ein = shader_node.inputs.get("Emission Color") or shader_node.inputs.get("Emission")
+            if ecolor and ein:
+                links.new(ecolor, ein)
+            estr = shader_node.inputs.get("Emission Strength")
+            if estr:
+                # Only enable emission when the emissive texture has an actual image loaded
+                estr.default_value = 1.0 if emissive_tex_node.image else 0.0
 
     # ── EmissionMaskTex → controls Emission Strength (not color) ────
+    # Skip if lightmap already owns the emission channel
     _EMISSION_MASK_NAME = "emissionmasktex"
     emission_mask_node = sampler_nodes.get(_EMISSION_MASK_NAME)
-    if emission_mask_node and _EMISSION_MASK_NAME not in _shader_template_samplers:
+    if (emission_mask_node and _EMISSION_MASK_NAME not in _shader_template_samplers
+            and not (_lm_image and _has_baked)):
         if shader_node.type == 'BSDF_PRINCIPLED':
             # If we have a mask but no separate emissive, use diffuse as emission color
             ein = shader_node.inputs.get("Emission Color") or shader_node.inputs.get("Emission")
@@ -997,7 +1106,9 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
 
     # For glow_sign / glow_mask / glow_decal: if no separate emissive tex but we
     # have a mask texture, use the mask to modulate emission from diffuse
-    if not emissive_tex_node and category in ("glow", "glow_sign", "glow_mask", "glow_decal"):
+    # Skip if lightmap already owns the emission channel
+    if (not emissive_tex_node and not (_lm_image and _has_baked)
+            and category in ("glow", "glow_sign", "glow_mask", "glow_decal")):
         mask_node = None
         for mn in ("mask_texture", "mask_tex"):
             if mn in sampler_nodes and mn not in _shader_template_samplers:
@@ -1270,9 +1381,6 @@ def _rebuild_shader_preview_nodes(mat, shader_path, assets_folder="", custom_ass
                     links.new(diffuse_node.outputs["Color"], gt_mix.inputs[6])
                     links.new(gt_tex.outputs["Color"], gt_mix.inputs[7])
                     links.new(gt_mix.outputs[2], bc)
-
-    # ── Apply parameters from JSON ──────────────────────────────────
-    _apply_material_parameter_values(mat, shader_node, category)
 
 
 def _apply_material_parameter_values(mat, shader_node, category="standard"):
@@ -1551,7 +1659,15 @@ def _apply_material_parameter_values(mat, shader_node, category="standard"):
                          "glow", "glow_sign", "glow_mask", "glow_decal",
                          "emissive_decal", "scrolling_emissive", "flipbook_emissive",
                          "twist_emissive", "gradient_color"):
-        if has_emissive_sampler:
+        # Skip emission override when lightmap owns the emission channel
+        _lm_owns_em = bool(mat.get("lightmap_texture"))
+        try:
+            _mm = json.loads(mat.get("shader_macros", "{}"))
+            if "NO_BAKED_LIGHTING" in _mm:
+                _lm_owns_em = False
+        except Exception:
+            pass
+        if has_emissive_sampler and not _lm_owns_em:
             emission_color = (_get("emission_emissioncolor") or _get("emissioncolor")
                               or _get("flow_color"))
             if emission_color:
@@ -1569,7 +1685,7 @@ def _apply_material_parameter_values(mat, shader_node, category="standard"):
                 if ec and not ec.links:
                     ec.default_value = (float(bloom_color[0]), float(bloom_color[1]),
                                         float(bloom_color[2]), 1.0)
-        else:
+        elif not _lm_owns_em:
             es = shader_node.inputs.get("Emission Strength")
             if es:
                 es.default_value = 0.0
@@ -1943,10 +2059,20 @@ def _update_parameters_only(mat):
                 cmix.inputs[7].default_value = (float(gc2[0]), float(gc2[1]), float(gc2[2]), 1.0)
 
     # Emission color/strength (only when an emissive sampler is defined in material data)
+    # Skip if material has a lightmap (lightmap manages emission)
     has_emissive_sampler_defined = _material_has_emissive_sampler(mat)
+    _has_lightmap = bool(mat.get("lightmap_texture"))
+    _has_baked_lt = True
+    try:
+        _m = json.loads(mat.get("shader_macros", "{}"))
+        if "NO_BAKED_LIGHTING" in _m:
+            _has_baked_lt = False
+    except Exception:
+        pass
+    _lightmap_owns_emission = _has_lightmap and _has_baked_lt
 
     es = shader_node.inputs.get("Emission Strength") if shader_node.type == 'BSDF_PRINCIPLED' else None
-    if not has_emissive_sampler_defined:
+    if not has_emissive_sampler_defined and not _lightmap_owns_emission:
         if es:
             es.default_value = 0.0
     else:
@@ -2026,16 +2152,8 @@ def refresh_league_materials(materials=None, technique_index=0, pass_index=0):
     Returns:
         Number of materials refreshed.
     """
-    # Get assets folders from scene settings
-    assets_folder = ""
-    custom_assets_folder = ""
-    prioritize_custom = False
-    
-    if hasattr(bpy.context, 'scene') and hasattr(bpy.context.scene, 'mapgeo_settings'):
-        settings = bpy.context.scene.mapgeo_settings
-        assets_folder = getattr(settings, 'assets_folder', '')
-        custom_assets_folder = getattr(settings, 'custom_assets_folder', '')
-        prioritize_custom = getattr(settings, 'prioritize_custom_assets', False)
+    # Get assets folders from scene settings (includes Riot WAD fallback)
+    assets_folder, custom_assets_folder, prioritize_custom = _get_assets_folders_from_context()
     
     mats = materials if materials is not None else bpy.data.materials
     refreshed = 0
@@ -2048,8 +2166,33 @@ def refresh_league_materials(materials=None, technique_index=0, pass_index=0):
     return refreshed
 
 
+def _get_riot_wad_assets_fallback():
+    """Get Riot WAD cache assets path if project settings allow it.
+    
+    Returns the riot assets folder path, or empty string.
+    Uses the already-extracted WAD cache (fast — no re-extraction).
+    """
+    try:
+        if hasattr(bpy.context, 'scene') and hasattr(bpy.context.scene, 'project_settings'):
+            ps = bpy.context.scene.project_settings
+            if ps.use_riot_base and ps.project_map_id and ps.league_install:
+                from . import project_manager
+                league_path = bpy.path.abspath(ps.league_install)
+                riot_cache = project_manager._ensure_riot_wad_cache(league_path, ps.project_map_id)
+                if riot_cache:
+                    riot_assets = os.path.join(riot_cache, "assets")
+                    if os.path.isdir(riot_assets):
+                        return riot_assets
+    except Exception:
+        pass
+    return ""
+
+
 def _get_assets_folders_from_context():
     """Get assets folders from scene settings.
+    
+    If custom_assets_folder is not set, auto-populates from Riot WAD cache
+    when project settings are available.
     
     Returns:
         Tuple of (assets_folder, custom_assets_folder, prioritize_custom)
@@ -2063,6 +2206,10 @@ def _get_assets_folders_from_context():
         assets_folder = getattr(settings, 'assets_folder', '')
         custom_assets_folder = getattr(settings, 'custom_assets_folder', '')
         prioritize_custom = getattr(settings, 'prioritize_custom_assets', False)
+    
+    # Auto-populate Riot WAD fallback if custom_assets_folder is not set
+    if not custom_assets_folder:
+        custom_assets_folder = _get_riot_wad_assets_fallback()
     
     return assets_folder, custom_assets_folder, prioritize_custom
 
@@ -2118,13 +2265,7 @@ def _sync_sampler_texture(mat, sampler_index, texture_path):
             tex_path += '.tex'
 
         # Resolve the on-disk file ------------------------------------------
-        assets_folder = None
-        custom_assets_folder = None
-        prioritize_custom = False
-        if hasattr(bpy.context.scene, 'mapgeo_settings'):
-            assets_folder = bpy.context.scene.mapgeo_settings.assets_folder
-            custom_assets_folder = bpy.context.scene.mapgeo_settings.custom_assets_folder
-            prioritize_custom = bpy.context.scene.mapgeo_settings.prioritize_custom_assets
+        assets_folder, custom_assets_folder, prioritize_custom = _get_assets_folders_from_context()
 
         resolved_path = None
         if (assets_folder or custom_assets_folder) and resolve_texture_path:
@@ -2205,7 +2346,7 @@ def _sync_sampler_texture(mat, sampler_index, texture_path):
 # ============================================================================
 
 class MAPGEO_OT_import_materials_file(Operator):
-    """Import materials from a League .materials.py file"""
+    """Import materials from a League .materials.bin file"""
     bl_idname = "mapgeo.import_materials_file"
     bl_label = "Import Materials File"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2745,7 +2886,7 @@ class MAPGEO_OT_duplicate_material(Operator):
 
 
 class MAPGEO_OT_export_materials_to_file(Operator):
-    """Export all League materials to .materials.py"""
+    """Export all League materials to .materials.bin"""
     bl_idname = "mapgeo.export_materials_to_file"
     bl_label = "Export Materials"
     bl_options = {'REGISTER'}
@@ -2768,7 +2909,7 @@ class MAPGEO_OT_export_materials_to_file(Operator):
 
 
 class MAPGEO_OT_export_materials_merge_file(Operator):
-    """Export materials merged with an existing .materials.py file (preserves VFX, containers, etc.)"""
+    """Export materials merged with an existing .materials.bin file (preserves VFX, containers, etc.)"""
     bl_idname = "mapgeo.export_materials_merge_file"
     bl_label = "Export Materials (Merge)"
     bl_options = {'REGISTER'}
@@ -3057,7 +3198,6 @@ class MAPGEO_OT_add_parameter(Operator):
             "value": [self.value_x, self.value_y, self.value_z, self.value_w],
         })
         mat["parameters"] = json.dumps(params)
-        _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
         _tag_redraw(context)
         self.report({'INFO'}, f"Added '{self.param_name}'")
         return {'FINISHED'}
@@ -3103,7 +3243,6 @@ class MAPGEO_OT_edit_parameter(Operator):
             "value": [self.value_x, self.value_y, self.value_z, self.value_w],
         }
         mat["parameters"] = json.dumps(params)
-        _update_parameters_only(mat)
         _tag_redraw(context)
         self.report({'INFO'}, f"Updated '{self.param_name}'")
         return {'FINISHED'}
@@ -3144,7 +3283,6 @@ class MAPGEO_OT_remove_parameter(Operator):
         if 0 <= self.param_index < len(params):
             removed = params.pop(self.param_index)
             mat["parameters"] = json.dumps(params)
-            _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
             _tag_redraw(context)
             self.report({'INFO'}, f"Removed '{removed.get('name', '?')}'")
             return {'FINISHED'}
@@ -3185,7 +3323,6 @@ class MAPGEO_OT_add_switch(Operator):
             return {'CANCELLED'}
         switches.append({"name": self.switch_name, "on": self.enabled})
         mat["switches"] = json.dumps(switches)
-        _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
         _tag_redraw(context)
         self.report({'INFO'}, f"Added switch '{self.switch_name}'")
         return {'FINISHED'}
@@ -3210,7 +3347,6 @@ class MAPGEO_OT_toggle_switch(Operator):
         if 0 <= self.switch_index < len(switches):
             switches[self.switch_index]["on"] = not switches[self.switch_index].get("on", False)
             mat["switches"] = json.dumps(switches)
-            _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
             _tag_redraw(context)
             state = "ON" if switches[self.switch_index]["on"] else "OFF"
             self.report({'INFO'}, f"{switches[self.switch_index]['name']} -> {state}")
@@ -3234,7 +3370,6 @@ class MAPGEO_OT_remove_switch(Operator):
         if 0 <= self.switch_index < len(switches):
             removed = switches.pop(self.switch_index)
             mat["switches"] = json.dumps(switches)
-            _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
             _tag_redraw(context)
             self.report({'INFO'}, f"Removed '{removed.get('name', '?')}'")
             return {'FINISHED'}
@@ -3277,7 +3412,6 @@ class MAPGEO_OT_add_macro(Operator):
             self.report({'WARNING'}, f"Macro '{self.macro_name}' already exists — updating value")
         macros[self.macro_name] = self.macro_value
         mat["shader_macros"] = json.dumps(macros)
-        _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
         _tag_redraw(context)
         self.report({'INFO'}, f"Added macro '{self.macro_name}' = '{self.macro_value}'")
         return {'FINISHED'}
@@ -3302,7 +3436,6 @@ class MAPGEO_OT_edit_macro(Operator):
         macros = json.loads(mat.get("shader_macros", "{}"))
         macros[self.macro_name] = self.macro_value
         mat["shader_macros"] = json.dumps(macros)
-        _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
         _tag_redraw(context)
         self.report({'INFO'}, f"'{self.macro_name}' = '{self.macro_value}'")
         return {'FINISHED'}
@@ -3332,7 +3465,6 @@ class MAPGEO_OT_remove_macro(Operator):
         if self.macro_name in macros:
             del macros[self.macro_name]
             mat["shader_macros"] = json.dumps(macros)
-            _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
             _tag_redraw(context)
             self.report({'INFO'}, f"Removed '{self.macro_name}'")
             return {'FINISHED'}
@@ -3427,6 +3559,11 @@ class MAPGEO_OT_edit_technique_pass(Operator):
         description="Update samplers, parameters, switches, and macros from the shader template. Keeps existing DiffuseTexture path",
         default=True,
     )
+    include_low_freq: BoolProperty(
+        name="Include Rare Properties",
+        default=False,
+        description="Also include parameters/switches that appear in <10% of materials using this shader",
+    )
     blend_enable: BoolProperty(name="Blend Enable", default=False)
     src_color: IntProperty(name="Src Color Factor", min=0, max=10, default=1)
     dst_color: IntProperty(name="Dst Color Factor", min=0, max=10, default=0)
@@ -3451,10 +3588,12 @@ class MAPGEO_OT_edit_technique_pass(Operator):
             box = layout.box()
             box.prop(self, "apply_template", icon='FILE_REFRESH')
             if self.apply_template:
+                box.prop(self, "include_low_freq")
                 tpl = _SHADER_TEMPLATES[new_shader]
-                samp = len(tpl.get("samplers", []))
-                parm = len(tpl.get("parameters", []))
-                sw = len(tpl.get("switches", []))
+                threshold = 0 if self.include_low_freq else 10
+                samp = len([s for s in tpl.get("samplers", []) if s.get("frequency", 0) >= threshold])
+                parm = len([p for p in tpl.get("parameters", []) if p.get("frequency", 0) >= threshold])
+                sw = len([s for s in tpl.get("switches", []) if s.get("frequency", 0) >= threshold])
                 box.label(text=f"Template: {samp} samplers, {parm} params, {sw} switches", icon='INFO')
                 box.label(text="DiffuseTexture path will be preserved", icon='IMAGE_DATA')
 
@@ -3514,6 +3653,7 @@ class MAPGEO_OT_edit_technique_pass(Operator):
     def _apply_shader_template(self, mat, shader_path):
         """Apply shader template data to material, preserving DiffuseTexture path"""
         tpl = _SHADER_TEMPLATES[shader_path]
+        threshold = 0 if self.include_low_freq else 10
 
         # --- Preserve existing sampler paths by sampler name ---
         preserved_paths = {}
@@ -3530,37 +3670,40 @@ class MAPGEO_OT_edit_technique_pass(Operator):
         # --- Samplers ---
         samplers = []
         for s in tpl.get("samplers", []):
-            sampler_name = s["name"]
-            sampler = {
-                "textureName": sampler_name,
-                "texturePath": "",
-                "addressU": s.get("addressU"),
-                "addressV": s.get("addressV"),
-                "addressW": s.get("addressW"),
-            }
-            # Restore existing texture path for matching sampler names
-            preserved = preserved_paths.get(sampler_name.lower())
-            if preserved:
-                sampler["texturePath"] = preserved
-            samplers.append(sampler)
+            if s.get("frequency", 0) >= threshold:
+                sampler_name = s["name"]
+                sampler = {
+                    "textureName": sampler_name,
+                    "texturePath": "",
+                    "addressU": s.get("addressU"),
+                    "addressV": s.get("addressV"),
+                    "addressW": s.get("addressW"),
+                }
+                # Restore existing texture path for matching sampler names
+                preserved = preserved_paths.get(sampler_name.lower())
+                if preserved:
+                    sampler["texturePath"] = preserved
+                samplers.append(sampler)
         mat["samplers"] = json.dumps(samplers)
 
         # --- Parameters ---
         params = []
         for p in tpl.get("parameters", []):
-            params.append({
-                "name": p["name"],
-                "value": p.get("value", [0, 0, 0, 0]),
-            })
+            if p.get("frequency", 0) >= threshold:
+                params.append({
+                    "name": p["name"],
+                    "value": p.get("value", [0, 0, 0, 0]),
+                })
         mat["parameters"] = json.dumps(params)
 
         # --- Switches ---
         switches = []
         for s in tpl.get("switches", []):
-            switches.append({
-                "name": s["name"],
-                "on": s.get("on", False),
-            })
+            if s.get("frequency", 0) >= threshold:
+                switches.append({
+                    "name": s["name"],
+                    "on": s.get("on", False),
+                })
         mat["switches"] = json.dumps(switches)
 
         # --- Material-level shader macros ---
@@ -3655,6 +3798,7 @@ class MATERIAL_PT_league_info(Panel):
     bl_region_type = 'WINDOW'
     bl_context = "material"
     bl_parent_id = "MATERIAL_PT_league_properties"
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -3685,6 +3829,16 @@ class MATERIAL_PT_league_info(Panel):
             row.label(text=f"{n_samp} samplers  |  {n_par} params  |  {n_sw} switches")
         except Exception:
             pass
+
+        # Lightmap info
+        lm_tex = mat.get("lightmap_texture", "")
+        if lm_tex:
+            lm_scale = mat.get("lightmap_color_scale", 1.0)
+            col = layout.column(align=True)
+            col.label(text="Lightmap:", icon='SHADING_RENDERED')
+            col.label(text=f"  {os.path.basename(lm_tex)}")
+            if lm_scale != 1.0:
+                col.label(text=f"  Scale: {lm_scale:.2f}")
 
 
 # --- Samplers sub-panel ---------------------------------------------------
@@ -3935,6 +4089,251 @@ class MATERIAL_PT_league_techniques(Panel):
 
 
 # ============================================================================
+# Shader Validation Panel
+# ============================================================================
+
+def _get_shader_from_material(mat):
+    """Extract shader path from a Blender material's techniques JSON."""
+    try:
+        techs = json.loads(mat.get("techniques", "[]"))
+        if techs and techs[0].get("passes"):
+            return techs[0]["passes"][0].get("shader", "")
+    except Exception:
+        pass
+    return ""
+
+
+def _get_all_defines_from_material(mat):
+    """
+    Collect material-level macros and first pass macros from a material.
+    Returns (material_macros, pass_macros).
+    """
+    material_macros = {}
+    pass_macros = {}
+
+    try:
+        material_macros = json.loads(mat.get("shader_macros", "{}"))
+        if not isinstance(material_macros, dict):
+            material_macros = {}
+    except Exception:
+        pass
+
+    try:
+        techs = json.loads(mat.get("techniques", "[]"))
+        if techs and techs[0].get("passes"):
+            pass_macros = techs[0]["passes"][0].get("shaderMacros", {})
+            if not isinstance(pass_macros, dict):
+                pass_macros = {}
+    except Exception:
+        pass
+
+    return material_macros, pass_macros
+
+
+class MAPGEO_OT_validate_shader(Operator):
+    """Validate material defines against compiled shader permutations"""
+    bl_idname = "mapgeo.validate_shader"
+    bl_label = "Validate Shader Defines"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        if not _HAS_SHADER_VALIDATION:
+            self.report({'WARNING'}, "Shader validation unavailable (dx11_shader_parser or xxhash not installed)")
+            return {'CANCELLED'}
+
+        mat = context.material
+        if not mat or not mat.get("league_material_name"):
+            self.report({'WARNING'}, "No League material selected")
+            return {'CANCELLED'}
+
+        shader_path = _get_shader_from_material(mat)
+        if not shader_path:
+            self.report({'WARNING'}, "No shader set on this material")
+            return {'CANCELLED'}
+
+        material_macros, pass_macros = _get_all_defines_from_material(mat)
+
+        result = validate_material_defines(
+            shader_path=shader_path,
+            material_macros=material_macros,
+            pass_macros=pass_macros,
+        )
+
+        status = result.get("status", "")
+        if status == "valid":
+            self.report({'INFO'}, "Shader defines are VALID - this material will work in-game")
+            return {'FINISHED'}
+
+        if status in ("no_cache", "unknown_shader", "no_xxhash"):
+            self.report({'WARNING'}, result.get("message", "Validation unavailable"))
+            return {'CANCELLED'}
+
+        # Invalid — do deep analysis
+        self.report({'ERROR'}, f"INVALID permutation: {result['message']}")
+
+        # Find nearest valid
+        nearest = find_nearest_valid_defines(
+            shader_path=shader_path,
+            material_macros=material_macros,
+            pass_macros=pass_macros,
+        )
+
+        # Store results for the panel to display
+        mat["_shader_validation"] = json.dumps({
+            "status": status,
+            "message": result["message"],
+            "shader_name": result.get("shader_name", ""),
+            "filtered_defines": result.get("filtered_defines", {}),
+            "unrecognized_defines": result.get("unrecognized_defines", {}),
+            "hash": str(result.get("hash", 0)),
+            "multi_value_defines": result.get("multi_value_defines", {}),
+            "nearest": [
+                {"distance": d, "defines": c, "changes": ch}
+                for d, c, ch in (nearest or [])
+            ],
+        })
+
+        return {'FINISHED'}
+
+
+class MATERIAL_PT_league_shader_validation(Panel):
+    """Shader define validation — checks if material will crash in-game"""
+    bl_label = "Shader Validation"
+    bl_idname = "MATERIAL_PT_league_shader_validation"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "material"
+    bl_parent_id = "MATERIAL_PT_league_properties"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        mat = context.material
+
+        if not _HAS_SHADER_VALIDATION:
+            layout.label(text="Validation unavailable", icon='ERROR')
+            layout.label(text="Install xxhash: pip install xxhash")
+            return
+
+        shader_path = _get_shader_from_material(mat)
+        if not shader_path:
+            layout.label(text="No shader set", icon='INFO')
+            return
+
+        short_name = shader_path.rsplit("/", 1)[-1]
+
+        # --- Live quick-check (lightweight: one hash lookup) ---
+        material_macros, pass_macros = _get_all_defines_from_material(mat)
+        result = validate_material_defines(
+            shader_path=shader_path,
+            material_macros=material_macros,
+            pass_macros=pass_macros,
+        )
+
+        status = result.get("status", "")
+
+        # Show what defines were detected
+        if material_macros or pass_macros:
+            info_box = layout.box()
+            info_box.label(text="Defines detected:", icon='INFO')
+            if material_macros:
+                for k, v in sorted(material_macros.items()):
+                    info_box.label(text=f"  Material: {k} = {v}")
+            if pass_macros:
+                for k, v in sorted(pass_macros.items()):
+                    info_box.label(text=f"  Pass: {k} = {v}")
+
+        # Status header
+        if status == "valid":
+            box = layout.box()
+            box.label(text="VALID", icon='CHECKMARK')
+            box.label(text=f"{short_name}: exact permutation hash found")
+            box.label(text=f"Permutations: {result.get('permutation_count', '?')}  |  "
+                       f"Bytecodes: {result.get('bytecode_count', '?')}")
+        elif status == "invalid":
+            box = layout.box()
+            row = box.row()
+            row.alert = True
+            row.label(text="WILL CRASH", icon='ERROR')
+
+            # Show specific reason
+            missing_req = result.get("missing_required", {})
+            if missing_req:
+                box.label(text=f"{short_name}: missing required shader macro(s)")
+                col = box.column(align=True)
+                col.alert = True
+                col.label(text="Required defines (add these to Shader Macros):")
+                for k, v in sorted(missing_req.items()):
+                    col.label(text=f"    {k} = {v}", icon='ERROR')
+            else:
+                box.label(text=f"{short_name}: no compiled permutation for these defines")
+
+            # Show the filtered defines that were used
+            filtered = result.get("filtered_defines", {})
+            if filtered:
+                col = box.column(align=True)
+                col.label(text="Active defines (after filtering):")
+                for k, v in sorted(filtered.items()):
+                    col.label(text=f"    {k} = {v}", icon='DOT')
+
+            # Show unrecognized defines
+            unrec = result.get("unrecognized_defines", {})
+            if unrec:
+                col = box.column(align=True)
+                col.label(text="Ignored (not in shader):")
+                for k, v in sorted(unrec.items()):
+                    col.label(text=f"    {k} = {v}", icon='REMOVE')
+
+            # Show multi-value defines (potential trouble spots)
+            multi = result.get("multi_value_defines", {})
+            if multi:
+                col = box.column(align=True)
+                col.label(text="Multi-value defines (check these):")
+                for name, vals in sorted(multi.items()):
+                    current_val = filtered.get(name, "absent")
+                    col.label(text=f"    {name}: current={current_val}, compiled={vals}",
+                              icon='QUESTION')
+        elif status == "no_cache":
+            box = layout.box()
+            box.label(text="Shader cache not found", icon='FILE_FOLDER')
+            box.label(text=result.get("message", ""))
+        elif status == "unknown_shader":
+            box = layout.box()
+            box.label(text=f"Unknown shader: {short_name}", icon='QUESTION')
+        else:
+            box = layout.box()
+            box.label(text=result.get("message", "Unavailable"), icon='INFO')
+
+        # Deep analysis button
+        layout.operator("mapgeo.validate_shader", text="Deep Validate (Find Fixes)",
+                        icon='VIEWZOOM')
+
+        # Show stored deep analysis results if available
+        try:
+            stored = json.loads(mat.get("_shader_validation", "{}"))
+        except Exception:
+            stored = {}
+
+        if stored and stored.get("status") == "invalid":
+            nearest = stored.get("nearest", [])
+            if nearest:
+                box = layout.box()
+                box.label(text="Nearest Valid Permutations:", icon='RECOVER_LAST')
+                for i, entry in enumerate(nearest[:3]):
+                    dist = entry.get("distance", "?")
+                    changes = entry.get("changes", [])
+                    sbox = box.box()
+                    sbox.label(text=f"Option {i + 1} ({dist} change{'s' if dist != 1 else ''}):")
+                    for ch in changes:
+                        if ch.startswith("+"):
+                            sbox.label(text=f"  Add: {ch[2:]}", icon='ADD')
+                        elif ch.startswith("-"):
+                            sbox.label(text=f"  Remove: {ch[2:]}", icon='REMOVE')
+                        else:
+                            sbox.label(text=f"  Change: {ch.strip()}", icon='FILE_REFRESH')
+
+
+# ============================================================================
 # 3D-Viewport Sidebar Panel
 # ============================================================================
 
@@ -3957,7 +4356,7 @@ class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
         box.label(text="Import / Export", icon='FILE_FOLDER')
         box.operator("mapgeo.import_materials_file", text="Import Materials", icon='IMPORT')
         box.operator("mapgeo.export_materials_to_file", text="Export Materials Only", icon='EXPORT')
-        box.operator("mapgeo.export_materials_merge_file", text="Export with .materials.py", icon='FILE_BLEND')
+        box.operator("mapgeo.export_materials_merge_file", text="Export Merged", icon='FILE_BLEND')
 
         # Material assignment
         box = layout.box()
@@ -4020,11 +4419,419 @@ class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
 
 
 # ============================================================================
+# VFX Definitions Manager (Object Properties)
+# ============================================================================
+
+class VfxTreeNodeItem(PropertyGroup):
+    """A flattened tree node for VFX bin fields display."""
+    depth: IntProperty(name="Depth", default=0)
+    path_key: StringProperty(name="Path")
+    name_hash: StringProperty(name="Hash")
+    resolved_name: StringProperty(name="Name")
+    type_label: StringProperty(name="Type")
+    value_display: StringProperty(name="Value")
+    is_leaf: BoolProperty(name="IsLeaf", default=True)
+    is_container: BoolProperty(name="IsContainer", default=False)
+
+
+class MAPGEO_UL_vfx_tree(UIList):
+    """UIList for VFX bin fields tree view."""
+    bl_idname = "MAPGEO_UL_vfx_tree"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            indent = "    " * item.depth
+            if item.is_container:
+                prefix = indent + "\u25BC "
+            elif not item.is_leaf:
+                prefix = indent + "\u25B6 "
+            else:
+                prefix = indent + "  "
+            name_text = item.resolved_name if item.resolved_name else item.name_hash
+            row.label(text=f"{prefix}{name_text}")
+            sub = row.row()
+            sub.scale_x = 0.35
+            sub.label(text=item.type_label)
+            sub2 = row.row()
+            sub2.scale_x = 1.5
+            val_text = item.value_display
+            if len(val_text) > 50:
+                val_text = val_text[:47] + "..."
+            sub2.label(text=val_text)
+
+
+# Module-level cache to avoid writing to Scene during draw
+_vfx_tree_cache_obj = ""
+_particle_tree_cache_obj = ""
+
+
+def _populate_vfx_tree(scene, obj):
+    """Populate the VFX tree collection — must be called OUTSIDE Panel.draw()."""
+    global _vfx_tree_cache_obj
+    col = scene.mapgeo_vfx_tree_items
+    obj_name = obj.name if obj else ""
+    _vfx_tree_cache_obj = obj_name
+    col.clear()
+    if not obj:
+        return
+    fields_json = obj.get("vfx_fields_json", "")
+    if not fields_json:
+        return
+    try:
+        fields = json.loads(fields_json)
+    except Exception:
+        return
+    try:
+        from . import propertybin_parser as pbp
+        flat = pbp.flatten_fields(fields)
+    except Exception:
+        flat = []
+    try:
+        from . import community_hashes
+        _resolve = community_hashes.resolve_field
+    except Exception:
+        _resolve = None
+    for fn in flat:
+        item = col.add()
+        item.depth = fn["depth"]
+        item.path_key = fn["path"]
+        item.name_hash = fn["name_hash"]
+        nh = fn["name_hash"]
+        if _resolve and nh.startswith("0x"):
+            try:
+                item.resolved_name = _resolve(int(nh, 16)) or nh
+            except (ValueError, TypeError):
+                item.resolved_name = nh
+        else:
+            item.resolved_name = nh
+        item.type_label = fn["type_name"]
+        item.is_leaf = fn["is_leaf"]
+        item.is_container = fn["is_container"]
+        item.value_display = fn.get("value_display", "")
+
+
+def _populate_particle_tree(scene, obj):
+    """Populate the particle tree collection — must be called OUTSIDE Panel.draw()."""
+    global _particle_tree_cache_obj
+    col = scene.mapgeo_particle_tree_items
+    obj_name = obj.name if obj else ""
+    _particle_tree_cache_obj = obj_name
+    col.clear()
+    if not obj:
+        return
+    for prop_key, label, editable, is_int in _PARTICLE_PROPS:
+        val = obj.get(prop_key)
+        if val is None:
+            continue
+        item = col.add()
+        item.prop_key = prop_key
+        item.label = label
+        item.value_display = str(val)
+        item.editable = editable
+        item.is_int = is_int
+
+
+@bpy.app.handlers.persistent
+def _sync_trees_on_depsgraph(scene, depsgraph=None):
+    """Depsgraph handler: sync VFX/particle tree collections when active object changes."""
+    global _vfx_tree_cache_obj, _particle_tree_cache_obj
+    try:
+        obj = bpy.context.view_layer.objects.active
+    except (AttributeError, RuntimeError):
+        return
+    obj_name = obj.name if obj else ""
+    need_vfx = (_vfx_tree_cache_obj != obj_name)
+    need_particle = (_particle_tree_cache_obj != obj_name)
+    if not need_vfx and not need_particle:
+        return
+    try:
+        sc = bpy.context.scene
+    except (AttributeError, RuntimeError):
+        return
+    if not hasattr(sc, "mapgeo_vfx_tree_items"):
+        return
+    if need_vfx:
+        _populate_vfx_tree(sc, obj)
+    if need_particle:
+        _populate_particle_tree(sc, obj)
+
+
+class OBJECT_PT_vfx_definitions(Panel):
+    """VFX Definitions Manager — edit VfxSystemDefinitionData properties"""
+    bl_label = "VFX Definitions"
+    bl_idname = "OBJECT_PT_vfx_definitions"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "object"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object and context.object.get("is_vfx_definition", False)
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+
+        col = layout.column(align=True)
+        col.label(text=obj.get("vfx_name", "---"), icon='PARTICLES')
+        col.label(text=f"Type: {obj.get('vfx_type', '---')}")
+
+        if obj.get("vfx_entry_hash"):
+            col.label(text=f"Entry Hash: {obj['vfx_entry_hash']}")
+        if obj.get("vfx_entry_type_hash"):
+            col.label(text=f"Type Hash: {obj['vfx_entry_type_hash']}")
+
+        col.separator()
+        col.label(text=f"Source: {obj.get('particle_source', '---')}", icon='FILE')
+
+        # Editable fields
+        box = layout.box()
+        box.label(text="Properties", icon='PREFERENCES')
+        col = box.column(align=True)
+
+        row = col.row(align=True)
+        row.label(text="Name:")
+        op = row.operator("mapgeo.edit_vfx_prop", text="", icon='GREASEPENCIL')
+        op.prop_name = "vfx_name"
+        op.prop_value = obj.get("vfx_name", "")
+        col.label(text=f"  {obj.get('vfx_name', '---')}")
+
+        if obj.get("vfx_entry_hash"):
+            row = col.row(align=True)
+            row.label(text="Entry Hash:")
+            op = row.operator("mapgeo.edit_vfx_prop", text="", icon='GREASEPENCIL')
+            op.prop_name = "vfx_entry_hash"
+            op.prop_value = obj.get("vfx_entry_hash", "")
+            col.label(text=f"  {obj.get('vfx_entry_hash', '---')}")
+
+        # VFX fields from bin — tree view
+        fields_json = obj.get("vfx_fields_json", "")
+        if fields_json:
+            box = layout.box()
+            box.label(text="Bin Fields", icon='FILE_TEXT')
+            scene = context.scene
+            items = scene.mapgeo_vfx_tree_items
+            if len(items) > 0:
+                box.template_list(
+                    "MAPGEO_UL_vfx_tree", "",
+                    scene, "mapgeo_vfx_tree_items",
+                    scene, "mapgeo_vfx_tree_active",
+                    rows=min(len(items), 12),
+                    maxrows=20,
+                )
+                # Show full details for selected item
+                idx = scene.mapgeo_vfx_tree_active
+                if 0 <= idx < len(items):
+                    sel = items[idx]
+                    detail = box.column(align=True)
+                    detail.label(text=f"Name: {sel.resolved_name}")
+                    detail.label(text=f"Hash: {sel.name_hash}")
+                    detail.label(text=f"Type: {sel.type_label}")
+                    val = sel.value_display
+                    if len(val) > 80:
+                        # Split long values across lines
+                        detail.label(text=f"Value: {val[:80]}")
+                        detail.label(text=f"       {val[80:160]}")
+                    else:
+                        detail.label(text=f"Value: {val}")
+            else:
+                box.label(text="(no fields)", icon='INFO')
+
+
+class MAPGEO_OT_edit_vfx_prop(Operator):
+    """Edit a VFX definition property"""
+    bl_idname = "mapgeo.edit_vfx_prop"
+    bl_label = "Edit VFX Property"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    prop_name: StringProperty(name="Property")
+    prop_value: StringProperty(name="Value")
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or not obj.get("is_vfx_definition"):
+            return {'CANCELLED'}
+        obj[self.prop_name] = self.prop_value
+        # Re-sync tree (operator context allows writes)
+        global _vfx_tree_cache_obj
+        _vfx_tree_cache_obj = ""
+        _populate_vfx_tree(context.scene, obj)
+        _tag_redraw(context)
+        self.report({'INFO'}, f"Updated {self.prop_name}")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        obj = context.object
+        if obj:
+            self.prop_value = str(obj.get(self.prop_name, ""))
+        return context.window_manager.invoke_props_dialog(self)
+
+
+# ============================================================================
+# MapParticle Manager (Object Properties)
+# ============================================================================
+
+# Particle property definitions: (custom_prop_key, display_label, editable, is_int)
+_PARTICLE_PROPS = [
+    ("particle_entry_hash",   "Entry Hash",    True,  False),
+    ("particle_entry_kind",   "Entry Kind",    True,  False),
+    ("particle_system",       "System",        True,  False),
+    ("particle_name_value",   "Name",          True,  False),
+    ("particle_name_kind",    "Name Kind",     True,  False),
+    ("particle_container",    "Container",     True,  False),
+    ("particle_visibility_flags", "Vis. Flags", True,  True),
+    ("particle_visibility_controller", "Vis. Controller", True, False),
+    ("baron_hash",            "Baron Hash",    True,  False),
+    ("baron_layers_decoded",  "Layers",        False, False),
+    ("baron_dragon_layers_decoded", "Dragon Layers", False, False),
+    ("particle_source",       "Source",        False, False),
+    ("particle_materials_path", "Materials Path", False, False),
+]
+
+
+class ParticleTreeItem(PropertyGroup):
+    """An item in the particle properties list."""
+    prop_key: StringProperty(name="Key")
+    label: StringProperty(name="Label")
+    value_display: StringProperty(name="Value")
+    editable: BoolProperty(name="Editable", default=False)
+    is_int: BoolProperty(name="IsInt", default=False)
+
+
+class MAPGEO_UL_particle_tree(UIList):
+    """UIList for MapParticle properties."""
+    bl_idname = "MAPGEO_UL_particle_tree"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.label(text=item.label, icon='DOT')
+            sub = row.row()
+            sub.scale_x = 2.0
+            val_text = item.value_display
+            if len(val_text) > 60:
+                val_text = val_text[:57] + "..."
+            sub.label(text=val_text)
+            if item.editable:
+                op = row.operator("mapgeo.edit_particle_prop", text="", icon='GREASEPENCIL')
+                op.prop_name = item.prop_key
+                op.prop_value = item.value_display
+                op.is_int = item.is_int
+
+
+# _sync_particle_tree removed — population handled by _populate_particle_tree
+# called from _sync_trees_on_depsgraph handler and operator execute
+
+
+class OBJECT_PT_map_particle(Panel):
+    """MapParticle Manager — edit placed particle properties"""
+    bl_label = "MapParticle"
+    bl_idname = "OBJECT_PT_map_particle"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "object"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object and context.object.get("is_particle_system", False)
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+
+        # Header info
+        col = layout.column(align=True)
+        system = obj.get("particle_system", "")
+        short_sys = system.rsplit('/', 1)[-1] if '/' in system else system
+        col.label(text=short_sys or obj.name, icon='PARTICLES')
+        col.label(text=f"Type: {obj.get('particle_entry_kind', '---')}")
+        col.label(text=f"Container: {obj.get('particle_container_short', obj.get('particle_container', '---'))}")
+
+        # Properties tree view (populated by depsgraph handler)
+        scene = context.scene
+        items = scene.mapgeo_particle_tree_items
+        if len(items) > 0:
+            box = layout.box()
+            box.label(text="Properties", icon='PREFERENCES')
+            box.template_list(
+                "MAPGEO_UL_particle_tree", "",
+                scene, "mapgeo_particle_tree_items",
+                scene, "mapgeo_particle_tree_active",
+                rows=min(len(items), 10),
+                maxrows=16,
+            )
+            # Show full value for selected item
+            idx = scene.mapgeo_particle_tree_active
+            if 0 <= idx < len(items):
+                sel = items[idx]
+                detail = box.column(align=True)
+                detail.label(text=f"{sel.label}: {sel.value_display}")
+
+        # Transform info
+        box = layout.box()
+        box.label(text="Transform", icon='ORIENTATION_LOCAL')
+        col = box.column(align=True)
+        loc = obj.location
+        col.label(text=f"Location: ({loc.x:.2f}, {loc.y:.2f}, {loc.z:.2f})")
+        scl = obj.scale
+        col.label(text=f"Scale: ({scl.x:.2f}, {scl.y:.2f}, {scl.z:.2f})")
+        rot = obj.rotation_euler
+        col.label(text=f"Rotation: ({math.degrees(rot.x):.1f}\u00b0, {math.degrees(rot.y):.1f}\u00b0, {math.degrees(rot.z):.1f}\u00b0)")
+
+
+class MAPGEO_OT_edit_particle_prop(Operator):
+    """Edit a MapParticle property"""
+    bl_idname = "mapgeo.edit_particle_prop"
+    bl_label = "Edit Particle Property"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    prop_name: StringProperty(name="Property")
+    prop_value: StringProperty(name="Value")
+    is_int: BoolProperty(default=False)
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or not obj.get("is_particle_system"):
+            return {'CANCELLED'}
+        if self.is_int:
+            try:
+                obj[self.prop_name] = int(self.prop_value)
+            except ValueError:
+                self.report({'ERROR'}, f"Invalid integer: {self.prop_value}")
+                return {'CANCELLED'}
+        else:
+            obj[self.prop_name] = self.prop_value
+        # Sync visibility_layer when visibility_flags changes
+        if self.prop_name == "particle_visibility_flags":
+            obj["visibility_layer"] = obj[self.prop_name]
+        # Sync baron_hash when visibility_controller changes
+        if self.prop_name == "particle_visibility_controller":
+            obj["baron_hash"] = self.prop_value.strip().upper()
+        # Re-sync tree (operator context allows writes)
+        global _particle_tree_cache_obj
+        _particle_tree_cache_obj = ""
+        _populate_particle_tree(context.scene, context.object)
+        _tag_redraw(context)
+        self.report({'INFO'}, f"Updated {self.prop_name}")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        obj = context.object
+        if obj:
+            self.prop_value = str(obj.get(self.prop_name, ""))
+        return context.window_manager.invoke_props_dialog(self)
+
+
+# ============================================================================
 # Registration
 # ============================================================================
 
 def register_material_editor_properties():
-    for cls in (MAPGEO_MaterialParameterProperty, MAPGEO_MaterialSwitchProperty, MAPGEO_MaterialEditorProperties):
+    for cls in (MAPGEO_MaterialParameterProperty, MAPGEO_MaterialSwitchProperty, MAPGEO_MaterialEditorProperties,
+                VfxTreeNodeItem, ParticleTreeItem):
         try:
             bpy.utils.register_class(cls)
         except Exception:
@@ -4037,13 +4844,26 @@ def register_material_editor_properties():
         bpy.types.Scene.mat_template_search = bpy.props.StringProperty(name="Template", default="")
     if not hasattr(bpy.types.Scene, "mat_new_name"):
         bpy.types.Scene.mat_new_name = bpy.props.StringProperty(name="New Name", default="New_Material")
+    # VFX tree view properties
+    if not hasattr(bpy.types.Scene, "mapgeo_vfx_tree_items"):
+        bpy.types.Scene.mapgeo_vfx_tree_items = CollectionProperty(type=VfxTreeNodeItem)
+    if not hasattr(bpy.types.Scene, "mapgeo_vfx_tree_active"):
+        bpy.types.Scene.mapgeo_vfx_tree_active = IntProperty(name="Active VFX Field", default=0)
+    # Particle tree view properties
+    if not hasattr(bpy.types.Scene, "mapgeo_particle_tree_items"):
+        bpy.types.Scene.mapgeo_particle_tree_items = CollectionProperty(type=ParticleTreeItem)
+    if not hasattr(bpy.types.Scene, "mapgeo_particle_tree_active"):
+        bpy.types.Scene.mapgeo_particle_tree_active = IntProperty(name="Active Particle Prop", default=0)
 
 
 def unregister_material_editor_properties():
-    for attr in ("mapgeo_material_props", "mat_editor_search", "mat_template_search", "mat_new_name"):
+    for attr in ("mapgeo_material_props", "mat_editor_search", "mat_template_search", "mat_new_name",
+                 "mapgeo_vfx_tree_items", "mapgeo_vfx_tree_active",
+                 "mapgeo_particle_tree_items", "mapgeo_particle_tree_active"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
-    for cls in (MAPGEO_MaterialEditorProperties, MAPGEO_MaterialSwitchProperty, MAPGEO_MaterialParameterProperty):
+    for cls in (MAPGEO_MaterialEditorProperties, MAPGEO_MaterialSwitchProperty, MAPGEO_MaterialParameterProperty,
+                ParticleTreeItem, VfxTreeNodeItem):
         try:
             bpy.utils.unregister_class(cls)
         except Exception:
@@ -4084,6 +4904,8 @@ material_editor_classes = (
     # Technique operators
     MAPGEO_OT_add_technique,
     MAPGEO_OT_edit_technique_pass,
+    # Shader validation
+    MAPGEO_OT_validate_shader,
     # Panels (parent first, then children)
     MATERIAL_PT_league_properties,
     MATERIAL_PT_league_info,
@@ -4092,8 +4914,18 @@ material_editor_classes = (
     MATERIAL_PT_league_switches,
     MATERIAL_PT_league_macros,
     MATERIAL_PT_league_techniques,
+    MATERIAL_PT_league_shader_validation,
     # 3D viewport sidebar
     VIEW3D_PT_mapgeo_material_editor_panel,
+    # Object Properties — VFX / MapParticle
+    VfxTreeNodeItem,
+    MAPGEO_UL_vfx_tree,
+    OBJECT_PT_vfx_definitions,
+    MAPGEO_OT_edit_vfx_prop,
+    ParticleTreeItem,
+    MAPGEO_UL_particle_tree,
+    OBJECT_PT_map_particle,
+    MAPGEO_OT_edit_particle_prop,
 )
 
 
@@ -4104,9 +4936,15 @@ def register():
             bpy.utils.register_class(cls)
         except Exception:
             pass
+    # Register depsgraph handler for tree sync
+    if _sync_trees_on_depsgraph not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_sync_trees_on_depsgraph)
 
 
 def unregister():
+    # Remove depsgraph handler
+    if _sync_trees_on_depsgraph in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_sync_trees_on_depsgraph)
     for cls in reversed(material_editor_classes):
         try:
             bpy.utils.unregister_class(cls)

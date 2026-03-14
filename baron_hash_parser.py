@@ -1,12 +1,11 @@
 """
 Baron Hash Controller Parser
-Parses materials.bin.json OR materials.py to decode ChildMapVisibilityController structures
+Parses materials.bin OR materials.py to decode ChildMapVisibilityController structures
 and determine which baron/dragon layers a mesh is visible on.
 
-Supports both JSON (.json) and Python (.py) material file formats.
+Supports both binary (.bin) and Python (.py) material file formats.
 """
 
-import json
 import os
 import re
 
@@ -25,59 +24,145 @@ class BaronHashController:
 
 
 class MaterialsBinParser:
-    """Parser for materials.bin.json to extract visibility controller data"""
+    """Parser for materials data to extract visibility controller data"""
     
-    # Type identifiers (JSON format uses curly braces)
+    # Type identifiers (used by .py format regex matching)
     TYPE_CHILD_CONTROLLER = "ChildMapVisibilityController"
-    TYPE_DRAGON_LAYER = "{c406a533}"  # Dragon layer visibility flag
-    TYPE_BARON_LAYER = "{ec733fe2}"   # Baron pit layer visibility flag
-    TYPE_NAMED_CONTROLLER = "{e07edfa4}"  # Named controller
     
-    # Property names (JSON format uses curly braces)
+    # Dict key constants for controller properties
     PROP_DRAGON_LAYER_BIT = "{27639032}"  # Dragon layer bit value
     PROP_BARON_LAYER_BIT = "{8bff8cdf}"   # Baron layer bit value
+    
+    # Type hashes (FNV-1a 32-bit lowercase)
+    BIN_TYPE_CHILD_CONTROLLER  = 0xe21083b5  # ChildMapVisibilityController
+    BIN_TYPE_DRAGON_LAYER      = 0xc406a533  # Dragon layer controller
+    BIN_TYPE_BARON_LAYER       = 0xec733fe2  # Baron layer controller
+    BIN_TYPE_NAMED_CONTROLLER  = 0xe07edfa4  # Named controller
+    BIN_TYPE_MUTATOR           = 0x4275b121  # MutatorMapVisibilityController
+    BIN_CONTROLLER_TYPES = {
+        BIN_TYPE_CHILD_CONTROLLER, BIN_TYPE_DRAGON_LAYER,
+        BIN_TYPE_BARON_LAYER, BIN_TYPE_NAMED_CONTROLLER, BIN_TYPE_MUTATOR,
+    }
+    
+    # Field hashes for binary .bin format
+    BIN_HASH_PARENTS      = 0x3044938a  # Parents
+    BIN_HASH_PARENT_MODE  = 0xc9d3f06a  # ParentMode
+    BIN_HASH_DRAGON_BIT   = 0x27639032  # Dragon layer bit
+    BIN_HASH_BARON_BIT    = 0x8bff8cdf  # Baron layer bit
     
     def __init__(self, materials_path):
         self.materials_path = materials_path
         self.data = {}
         self.controllers = {}  # PathHash -> controller data
-        self.file_format = None  # 'json' or 'py'
+        self.file_format = None  # 'py' or 'bin'
         
         if os.path.exists(materials_path):
             # Detect format
-            if materials_path.endswith('.json'):
-                self.file_format = 'json'
-            elif materials_path.endswith('.py'):
+            if materials_path.endswith('.py'):
                 self.file_format = 'py'
+            elif materials_path.endswith('.bin'):
+                self.file_format = 'bin'
             else:
-                print(f"[BaronHash] Warning: Unknown file extension for {materials_path}")
-                self.file_format = 'json'  # Default to JSON
+                print(f"[BaronHash] Warning: Unknown file extension for {materials_path}, trying as .bin")
+                self.file_format = 'bin'
             
             self.load()
     
     def load(self):
-        """Load and parse materials file (JSON or Python format)"""
+        """Load and parse materials file (.py or binary .bin format)"""
         try:
             if self.file_format == 'py':
-                # Parse .py format and convert to dict
                 self.data = self._parse_py_file()
             else:
-                # Load JSON format
-                with open(self.materials_path, 'r', encoding='utf-8') as f:
-                    self.data = json.load(f)
+                self.data = self._parse_bin_file()
             
             # Index all controllers by their PathHash
             self._index_controllers()
             
-            format_str = "Python .py" if self.file_format == 'py' else "JSON"
+            format_str = {"py": "Python .py", "bin": "binary .bin"}.get(self.file_format, self.file_format)
             print(f"[BaronHash] Loaded {len(self.controllers)} visibility controllers from {format_str}")
             return True
         except Exception as e:
             print(f"[BaronHash] Error loading materials file: {e}")
             return False
     
+    def _parse_bin_file(self):
+        """Parse binary .materials.bin using propertybin_parser and convert to
+        the dict format expected by _index_controllers."""
+        try:
+            from . import propertybin_parser
+        except ImportError:
+            import propertybin_parser
+        
+        parsed = propertybin_parser.parse_bin(self.materials_path)
+        controllers_dict = {}
+        
+        for entry in parsed.get('entries', []):
+            type_hash_str = entry.get('type_hash', '')
+            try:
+                type_hash_int = int(type_hash_str, 16) if type_hash_str.startswith('0x') else 0
+            except ValueError:
+                continue
+            
+            if type_hash_int not in self.BIN_CONTROLLER_TYPES:
+                continue
+            
+            path_hash_str = entry.get('path_hash', '')
+            # Convert to {xxxxxxxx} format used by the indexer
+            path_hash_key = "{" + path_hash_str[2:].lower() + "}" if path_hash_str.startswith('0x') else path_hash_str
+            fields = entry.get('fields', [])
+            
+            controller_data = {
+                'PathHash': path_hash_key,
+            }
+            
+            # Set __type based on type_hash_int
+            if type_hash_int == self.BIN_TYPE_CHILD_CONTROLLER:
+                controller_data['__type'] = 'ChildMapVisibilityController'
+            elif type_hash_int == self.BIN_TYPE_MUTATOR:
+                controller_data['__type'] = 'MutatorMapVisibilityController'
+            else:
+                # Dragon/Baron/Named controllers — use hex key format
+                controller_data['__type'] = type_hash_str
+            
+            # Extract fields by hash
+            for field in fields:
+                name_hash = field.get('name_hash_int', 0)
+                value = field.get('value')
+                
+                if name_hash == self.BIN_HASH_PARENTS:
+                    # Parents is a list of link hashes (type 132 struct-links or similar)
+                    parent_list = []
+                    for v in field.get('values', []):
+                        if isinstance(v, dict):
+                            link_val = v.get('value', '')
+                        elif isinstance(v, str):
+                            link_val = v
+                        else:
+                            continue
+                        # Convert to {xxxxxxxx} format
+                        if isinstance(link_val, str) and link_val.startswith('0x'):
+                            parent_list.append("{" + link_val[2:].lower() + "}")
+                        elif isinstance(link_val, str):
+                            parent_list.append(link_val)
+                    controller_data['Parents'] = parent_list
+                
+                elif name_hash == self.BIN_HASH_PARENT_MODE:
+                    controller_data['ParentMode'] = value if isinstance(value, int) else int(value)
+                
+                elif name_hash == self.BIN_HASH_DRAGON_BIT:
+                    controller_data[self.PROP_DRAGON_LAYER_BIT] = value if isinstance(value, int) else int(value)
+                
+                elif name_hash == self.BIN_HASH_BARON_BIT:
+                    controller_data[self.PROP_BARON_LAYER_BIT] = value if isinstance(value, int) else int(value)
+            
+            controllers_dict[path_hash_key] = controller_data
+        
+        print(f"[BaronHash] Parsed {len(controllers_dict)} visibility controllers from binary .bin")
+        return controllers_dict
+    
     def _parse_py_file(self):
-        """Parse .py format and convert to dict format compatible with JSON parser"""
+        """Parse .py format and convert to dict format compatible with controller indexer"""
         with open(self.materials_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
@@ -163,7 +248,7 @@ class MaterialsBinParser:
         if not self.data:
             return
         
-        # Materials.bin.json structure: keys and PathHash values use curly braces like "{5e652742}"
+        # Materials data structure: keys and PathHash values use curly braces like "{5e652742}"
         for key, value in self.data.items():
             if isinstance(value, dict):
                 # Check if this is a controller
@@ -205,7 +290,7 @@ class MaterialsBinParser:
             controller_data = self.controllers.get(f"{{{baron_hash.upper()}}}")
         
         if not controller_data:
-            print(f"[BaronHash] Controller {baron_hash} not found in materials.bin.json")
+            print(f"[BaronHash] Controller {baron_hash} not found in materials data")
             print(f"[BaronHash] Available controllers: {len(self.controllers)}")
             return controller
         

@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 2, 9),
+    "version": (0, 3, 0),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -41,8 +41,11 @@ from . import (
     propertybin_editor_ui,
     sco_scb_import,
     skn_skl_import,
+    wad_tool,
     light_management,
     legacy_map_ui,
+    project_manager,
+    map_porter,
     utils,
 )
 
@@ -478,13 +481,13 @@ class MapgeoSettings(PropertyGroup):
     
     use_linked_materials: BoolProperty(
         name="Use Linked Materials",
-        description="Automatically find materials file next to the .mapgeo file (e.g. base.mapgeo -> base.materials.py). Disable to manually specify a materials path",
+        description="Automatically find materials file next to the .mapgeo file (e.g. base.mapgeo -> base.materials.bin). Disable to manually specify a materials path",
         default=True
     )
 
-    materials_json_path: StringProperty(
+    materials_file_path: StringProperty(
         name="Materials File Path",
-        description="Path to the .materials.bin.json or .materials.py file (used when Linked Materials is disabled)",
+        description="Path to the .materials.bin file (used when Linked Materials is disabled)",
         default="",
         subtype='FILE_PATH'
     )
@@ -498,9 +501,22 @@ class MapgeoSettings(PropertyGroup):
     
     map_py_path: StringProperty(
         name="Map File Path",
-        description="Path to the map*.py or map*.json file containing MapSkin definitions for grass tint textures",
+        description="Path to the map*.py or map*.bin file containing MapSkin definitions for grass tint textures",
         default="",
         subtype='FILE_PATH'
+    )
+
+    # Prey-based loading (set by Project Manager to route materials through prey)
+    prey_materials_dir: StringProperty(
+        name="Prey Materials Dir",
+        description="Directory containing .prey.* files (set by Project Manager for prey-based loading)",
+        default="",
+    )
+
+    prey_materials_base: StringProperty(
+        name="Prey Materials Base",
+        description="Base name for .prey.* files (set by Project Manager for prey-based loading)",
+        default="",
     )
 
     lightmap_export_folder: StringProperty(
@@ -632,6 +648,8 @@ classes = (
     ui_panel.MAPGEO_OT_import_external_mesh,
     ui_panel.MAPGEO_OT_import_particles_map,
     ui_panel.MAPGEO_OT_export_particles_map,
+    ui_panel.MAPGEO_OT_edit_selected_mapparticle,
+    ui_panel.MAPGEO_OT_edit_selected_vfx_definition,
     ui_panel.MAPGEO_OT_create_lightgrid,
     ui_panel.MAPGEO_OT_bake_lightgrid,
     ui_panel.MAPGEO_OT_import_lightgrid,
@@ -706,6 +724,12 @@ def register():
         skn_skl_import.register()
     except Exception as e:
         print(f"[League Tools] SKN/SKL registration failed: {e}")
+
+    # Register WAD archive tool
+    try:
+        wad_tool.register()
+    except Exception as e:
+        print(f"[League Tools] WAD Tool registration failed: {e}")
     
     # Register light management
     try:
@@ -719,6 +743,18 @@ def register():
     except Exception as e:
         print(f"[Legacy Map] Registration failed: {e}")
     
+    # Register project manager
+    try:
+        project_manager.register()
+    except Exception as e:
+        print(f"[Project Manager] Registration failed: {e}")
+    
+    # Register map porter
+    try:
+        map_porter.register()
+    except Exception as e:
+        print(f"[Map Porter] Registration failed: {e}")
+    
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -727,6 +763,18 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister map porter
+    try:
+        map_porter.unregister()
+    except Exception as e:
+        print(f"[Map Porter] Unregister failed: {e}")
+    
+    # Unregister project manager
+    try:
+        project_manager.unregister()
+    except Exception as e:
+        print(f"[Project Manager] Unregister failed: {e}")
+    
     # Unregister legacy map UI
     try:
         legacy_map_ui.unregister()
@@ -739,6 +787,12 @@ def unregister():
     except Exception as e:
         print(f"[Light Management] Unregister failed: {e}")
     
+    # Unregister WAD archive tool
+    try:
+        wad_tool.unregister()
+    except Exception as e:
+        print(f"[League Tools] WAD Tool unregister failed: {e}")
+
     # Unregister SKN/SKL skinned mesh tools
     try:
         skn_skl_import.unregister()

@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.3.0] - 2026-03-14
+
+### 🗂️ Project Manager (NEW)
+- **Unified mod workflow** — Select a project folder, auto-detect League install, choose map variant, load/reload/export in one panel
+- **Riot WAD extraction** — Automatically extract base game assets (mapgeo, materials, textures) from League WAD archives
+- **One-click export** — Export mapgeo, materials, or both back to the project folder with a single button
+- **Map variant browser** — Discover and list all map variants (base, Sodapop, etc.) from project or Riot WAD
+- **Active map skin detection** — Reads Riot's map .bin to determine currently active skins
+- **Project creation** — Create new mod project folders from Riot base assets
+- **Legacy material updater** — Upgrade old materials.bin files using Riot's latest as reference
+- **Material cleanup** — Remove unused materials from the scene
+- **Exclude keyword filter** — Hide disabled/unwanted variants from the variant list
+- **Windows long-path support** — WAD cache handles paths exceeding MAX_PATH (260 chars) via `\\?\` prefix
+- **Incomplete cache detection** — Automatically re-extracts WAD caches that were interrupted or corrupted
+
+### 🦅 PREY Format (NEW)
+- **Human-readable materials split** — Converts `.materials.bin` into sorted, categorized JSON files:
+  - `.prey.materials` — All StaticMaterialDef entries
+  - `.prey.vfx` — VfxSystemDefinitionData, MapPlaceableContainer, particles
+  - `.prey.map` — Sun, fog, bake, lighting settings
+  - `.prey.visibility` — Dragon/Baron/Named/Child/Mutator visibility layers
+  - `.prey.extra` — Everything else
+  - `.prey.manifest` — Version and metadata
+- **Perfect round-trip** — bin → prey → bin preserves all data losslessly
+- **Save All to .prey** — Syncs Blender edits (materials, VFX transforms, VFX definitions) back to prey files
+- **Dirty tracking** — Snapshot-based change detection so "Save All" only writes what actually changed
+- **Rebuild from .prey** — Reassembles a complete `.materials.bin` from prey files for game use
+
+### 📦 WAD Archive Tool (NEW)
+- **Full WAD read/write** — Supports WAD versions 1.0, 2.0, 3.0 with GZip, Zstandard, and Satellite compression
+- **Browse & extract UI** — Open, browse, and extract WAD contents from Blender
+- **Hash resolution** — CommunityDragon XXHash64 dictionaries, custom .bin scanning, hashlist files
+- **WAD repacking** — Repack modified assets back into WAD format
+- **Pure-Python XXHash64** — No external dependencies required
+
+### 🗺️ Map Porter (NEW)
+- **Port maps between variants** — Copy/rename mapgeo, merge materials.bin between map variants
+- **Map .bin patching** — Swap MapSkin fields to activate particles, grass tint, VFX, and sound banks
+- **Dedicated UI panel** with source/target file pickers
+
+### 🎮 DX11 Shader Cache Parser (NEW)
+- **Parse compiled shader TOC files** from ShaderCache.dx11.wad
+- **TOC3.0 format** support with shader permutation info
+- **Multi-bundle layouts** (.dx11, .dx11_0, .dx11_100, ...)
+
+### 🎆 Particle / VFX System
+- **VFX definitions** — Import/export VfxSystemDefinitionData stored as JSON on mesh objects
+- **MapPlaceableContainer** — Groups of placed MapParticle items as Blender sub-collections
+- **Transform tracking** — Snapshot-based dirty tracking for VFX transforms and definitions
+- **Visual preview** — Cube mesh proxies in viewport for particle placement
+
+### 👁️ Visibility & Layer System
+- **Dragon layer filtering** — 8 layers: Base, Inferno, Mountain, Ocean, Cloud, Hextech, Chemtech, Void
+- **Baron layer filtering** — Base, Cup, Tunnel, Upgraded with ParentMode logic
+- **Combined visibility** — Dragon + Baron checks respecting baron hash overrides
+
+### 🏗️ Map Settings
+- **Sun/Fog/Bake/Lighting import** — Reads MapSunProperties, MapBakeProperties, MapLightingV2 from .bin
+- **Map settings export** — Updates sun, fog, bake, lighting on export
+- **MapContainer support** — Parses embedded items lists
+
+### 🎨 Material System Improvements
+- **Blend mode round-trip** — Blend enable/factors now correctly preserved through import → edit → export cycle
+- **Dual hash support** — Reads both modern and legacy blend/shader/passes hashes for maximum compatibility
+- **Field creation on export** — Missing blend fields are created (not just updated) when exporting
+- **Snapshot-based dirty tracking** — Materials only saved when actually changed
+
+### 🔧 Scene Management
+- **Full scene cleanup** — Reload Map now force-removes all data-blocks, not just orphans
+- **Recursive orphan purge** — Catches fake-user and circular-reference data-blocks
+
+### 📋 PropertyBin Enhancements
+- **Binary writer improvements** for round-trip fidelity
+- **Custom hash computation** from .bin files
+
+### ⚙️ Technical
+- **Blender 5.0+ targeting** — `bl_info` targets (5, 0, 0)
+- **Lightgrid tools** — Create, bake, import, export, clear, visualize, occluder/ignore flags
+- **Lightmap tools** — Assign texture, prepare setup, create UVs, remove no-bake macro, bake, export
+- **Bucket grid improvements** — Create, import from mapgeo, toggle selectable
+- **Import external mesh** — Import OBJ/FBX meshes as map objects
+- **Bush/render region import** — Import bushes and render regions from mapgeo
+
+---
+
 ## [0.2.9]
 ### 🦴 Phase 4 — SKN/SKL Skinned Mesh & Skeleton Import
 - **SKN Parser** — Full SimpleSkin binary parser supporting versions 0, 2, and 4

@@ -98,16 +98,17 @@ def export_blender_materials_merge(source_filepath: str, output_filepath: str,
     if MaterialsExporter is None:
         raise RuntimeError("materials_parser module not available")
     
-    # Parse the source file to get other_entries and entry_order
+    # Parse the source file to get other_entries, entry_order, and original materials
     parser = MaterialsParser(source_filepath)
     parser.parse()
     other_entries = parser.other_entries
     entry_order = parser.entry_order
+    source_materials = parser.materials  # Original materials from file
 
     if update_other_entries_with_particles:
         other_entries, entry_order = update_other_entries_with_particles(other_entries, entry_order)
     
-    print(f"Source file: {len(parser.materials)} materials, {len(other_entries)} other entries")
+    print(f"Source file: {len(source_materials)} materials, {len(other_entries)} other entries")
     
     # Collect Blender materials
     if materials_list is None:
@@ -122,13 +123,26 @@ def export_blender_materials_merge(source_filepath: str, output_filepath: str,
         except Exception as e:
             print(f"Warning: Failed to export material {blender_mat.name}: {e}")
     
-    # Export: use source file's other_entries and entry_order, but with Blender's materials
-    if league_materials:
-        MaterialsExporter.export(league_materials, output_filepath, other_entries, entry_order)
-        print(f"Exported {len(league_materials)} materials + {len(other_entries)} other entries")
+    # Merge: Blender materials override source, but source materials not in
+    # Blender (e.g. MapFog_Volume, Default) are preserved from the source file.
+    merged_materials = {}
+    for name, mat in source_materials.items():
+        merged_materials[name] = mat
+    for name, mat in league_materials.items():
+        merged_materials[name] = mat  # Blender version takes priority
+    
+    blender_count = len(league_materials)
+    preserved_count = len(merged_materials) - blender_count
+    if preserved_count > 0:
+        print(f"Preserving {preserved_count} source material(s) not in Blender")
+    
+    # Export: merged materials + other_entries in original order
+    if merged_materials:
+        MaterialsExporter.export(merged_materials, output_filepath, other_entries, entry_order)
+        print(f"Exported {len(merged_materials)} materials + {len(other_entries)} other entries")
         print(f"  (merged with: {source_filepath})")
     
-    return len(league_materials)
+    return blender_count
 
 
 def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:

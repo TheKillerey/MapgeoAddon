@@ -193,6 +193,18 @@ def _store_custom_properties(mat: bpy.types.Material, league_material: Material,
         child_tech_data.append(child_dict)
     mat["child_techniques"] = json.dumps(child_tech_data)
     
+    # Snapshot for dirty-tracking: store the exact property strings at load
+    # time so save_prey_materials can detect what actually changed.
+    mat["_material_snapshot"] = json.dumps({
+        "samplers": mat.get("samplers", "[]"),
+        "parameters": mat.get("parameters", "[]"),
+        "switches": mat.get("switches", "[]"),
+        "shader_macros": mat.get("shader_macros", "{}"),
+        "techniques": mat.get("techniques", "[]"),
+        "child_techniques": mat.get("child_techniques", "[]"),
+        "type": league_material.type,
+    })
+
     # Store dynamicMaterial (raw text, preserved as-is)
     if league_material.dynamicMaterial:
         mat["dynamic_material"] = league_material.dynamicMaterial
