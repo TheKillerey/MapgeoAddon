@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -16,8 +16,10 @@ bl_info = {
     "category": "Import-Export",
 }
 
+import os
 import sys
 import bpy
+import bpy.utils.previews
 from bpy.props import (
     StringProperty,
     BoolProperty,
@@ -46,8 +48,43 @@ from . import (
     legacy_map_ui,
     project_manager,
     map_porter,
+    map_objects_import,
     utils,
 )
+
+_icon_previews = None
+
+
+def _load_custom_icons():
+    """Load addon custom icons into Blender preview collection."""
+    global _icon_previews
+    if _icon_previews is not None:
+        return
+
+    previews = bpy.utils.previews.new()
+    icon_path = os.path.join(os.path.dirname(__file__), "mapgeo_addon_icon.png")
+    if os.path.isfile(icon_path):
+        previews.load("mapgeo_addon_icon", icon_path, 'IMAGE')
+
+    _icon_previews = previews
+
+
+def _clear_custom_icons():
+    """Dispose addon custom icon previews."""
+    global _icon_previews
+    if _icon_previews is not None:
+        bpy.utils.previews.remove(_icon_previews)
+        _icon_previews = None
+
+
+def get_custom_icon_id(name="mapgeo_addon_icon"):
+    """Get icon id for a loaded custom icon name, or 0 if unavailable."""
+    if _icon_previews is None:
+        return 0
+    icon = _icon_previews.get(name)
+    if icon is None:
+        return 0
+    return int(icon.icon_id)
 
 # Callback function for environment visibility
 def update_environment_visibility(self, context):
@@ -683,6 +720,8 @@ def menu_func_export(self, context):
 
 def register():
     """Register all addon classes and handlers"""
+    _load_custom_icons()
+
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -839,6 +878,8 @@ def unregister():
     # Unregister classes (in reverse order)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
+    _clear_custom_icons()
     
     print("Rey's Mapgeo Blender Addon unregistered")
 

@@ -2093,6 +2093,160 @@ def save_prey_vfx_transforms(prey_dir: str, base_name: str) -> int:
     return updated
 
 
+def save_prey_gds_transforms(prey_dir: str, base_name: str) -> int:
+    """Write Blender GdsMapObject position/rotation/scale back into prey.vfx.
+
+    Matches map objects using item_key and updates the transform field
+    in each MapPlaceableContainer item with class_hash 0xda9e5c0c.
+
+    Returns the number of map object items updated.
+    """
+    import bpy
+
+    vfx_path = os.path.join(prey_dir, f"{base_name}.prey.vfx")
+    if not os.path.isfile(vfx_path):
+        return 0
+
+    data = _read_json(vfx_path)
+    entries = data.get("entries", [])
+    if not entries:
+        return 0
+
+    # Collect Blender map object empties
+    scene = bpy.context.scene if bpy.context else None
+    source_objs = scene.objects if scene is not None else bpy.data.objects
+    mo_objs = [o for o in source_objs if o.get("is_map_object", False)]
+    if not mo_objs:
+        return 0
+
+    # Build lookup: item_key → object
+    by_item_key = {}
+    for obj in mo_objs:
+        ik = str(obj.get("map_object_item_key", "") or "").lower()
+        if ik:
+            by_item_key[ik] = obj
+
+    updated = 0
+    modified = False
+
+    CLASS_GDS = "0xda9e5c0c"
+
+    def _field_hash_int(field: dict) -> int:
+        h = field.get("name_hash_int")
+        if isinstance(h, int):
+            return h
+        hs = str(field.get("name_hash", "") or "")
+        if hs.startswith("0x"):
+            try:
+                return int(hs, 16)
+            except ValueError:
+                return 0
+        return 0
+
+    def _is_field(field: dict, friendly_name: str, hash_int: int) -> bool:
+        if field.get("_name") == friendly_name:
+            return True
+        return _field_hash_int(field) == hash_int
+
+    for entry in entries:
+        if entry.get("typeName") != "MapPlaceableContainer":
+            continue
+
+        fields = entry.get("fields") or []
+
+        # Find the items field (type=134, map/pairs)
+        items_field = None
+        for f in fields:
+            if f.get("type") == 134 and "pairs" in f:
+                items_field = f
+                break
+        if items_field is None:
+            continue
+
+        for pair in items_field.get("pairs") or []:
+            val = pair.get("value") or {}
+
+            # Check class_hash for GdsMapObject
+            class_hash = str(val.get("class_hash", "") or val.get("className", "") or "").lower()
+            if class_hash != CLASS_GDS:
+                # Also check typeName for prey decoded entries
+                if str(val.get("typeName", "")).lower() != "gdsmapobject":
+                    continue
+
+            # Get item key for matching
+            pair_key_hash = ""
+            key_node = pair.get("key") or {}
+            if isinstance(key_node, dict):
+                kv = key_node.get("value", "")
+                if kv:
+                    pair_key_hash = str(kv).lower()
+
+            obj = by_item_key.get(pair_key_hash)
+            if not obj:
+                continue
+
+            val_fields = val.get("fields") or []
+
+            # Find transform field
+            transform_field = None
+            name_field = None
+            type_field = None
+            for vf in val_fields:
+                if _is_field(vf, "transform", 0xe1ad931b):
+                    transform_field = vf
+                elif _is_field(vf, "name", 0x8d39bde6):
+                    name_field = vf
+                elif _is_field(vf, "type", 0x5127f14d):
+                    type_field = vf
+
+            # Dirty check: compare against original transform
+            if transform_field is not None:
+                orig_str = obj.get("_original_transform", "")
+                new_mtx = _blender_to_transform(obj)
+                transform_changed = False
+                if orig_str:
+                    try:
+                        orig_mtx = json.loads(orig_str)
+                        if _transforms_differ(new_mtx, orig_mtx):
+                            transform_field["value"] = new_mtx
+                            transform_changed = True
+                    except (json.JSONDecodeError, TypeError):
+                        if new_mtx != transform_field.get("value"):
+                            transform_field["value"] = new_mtx
+                            transform_changed = True
+                else:
+                    if new_mtx != transform_field.get("value"):
+                        transform_field["value"] = new_mtx
+                        transform_changed = True
+
+                if transform_changed:
+                    modified = True
+                    updated += 1
+
+            # Sync name changes
+            new_name = obj.get("map_object_name", "")
+            if new_name and name_field is not None:
+                if name_field.get("value") != new_name:
+                    name_field["value"] = new_name
+                    modified = True
+
+            # Sync type changes
+            new_type = obj.get("map_object_type")
+            if new_type is not None and type_field is not None:
+                try:
+                    new_val = int(new_type)
+                    if type_field.get("value") != new_val:
+                        type_field["value"] = new_val
+                        modified = True
+                except (ValueError, TypeError):
+                    pass
+
+    if modified:
+        _write_json(vfx_path, data)
+
+    return updated
+
+
 def save_prey_vfx_definitions(prey_dir: str, base_name: str) -> int:
     """Write Blender VFX definition edits back into prey.vfx.
 

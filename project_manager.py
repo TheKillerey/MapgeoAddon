@@ -2727,14 +2727,18 @@ def _export_materials_bin_merge(source_bin_path: str, output_bin_path: str) -> i
     # ── Update particles ──
     particle_updated = _update_bin_particles(entries)
 
+    # ── Update GdsMapObject entries ──
+    from . import map_objects_import
+    mo_updated = map_objects_import.update_bin_map_objects(entries)
+
     # ── Update / inject map settings (sun, fog, bake, lighting) ──
     _update_bin_map_settings(entries)
 
     propertybin_parser.write_bin(data, output_bin_path)
 
-    total = mat_updated + particle_updated
-    if particle_updated:
-        print(f"[Project Export] Updated {mat_updated} material(s), {particle_updated} particle(s)")
+    total = mat_updated + particle_updated + mo_updated
+    if particle_updated or mo_updated:
+        print(f"[Project Export] Updated {mat_updated} material(s), {particle_updated} particle(s), {mo_updated} map object(s)")
     return total
 
 
@@ -4045,6 +4049,16 @@ class PROJECT_OT_save_all_to_prey(Operator):
         except Exception as e:
             print(f"[Save All] Warning: vfx save failed: {e}")
 
+        # 3b. Save GdsMapObject transforms → .prey.vfx
+        mo_changed = 0
+        try:
+            from . import prey_format
+            mo_changed = prey_format.save_prey_gds_transforms(prey_dir, base)
+            if mo_changed:
+                saved.append(f'map objects ({mo_changed})')
+        except Exception as e:
+            print(f"[Save All] Warning: map objects save failed: {e}")
+
         # 4. Save VFX definition edits → .prey.vfx
         try:
             from . import prey_format
@@ -4429,6 +4443,10 @@ class PROJECT_OT_create_project(Operator):
                      f"from {map_display}/{variant_name}: {', '.join(created_files)}")
         return {'FINISHED'}
 
+
+
+
+
 class PROJECT_UL_variant_list(UIList):
     """UIList for map variants."""
     bl_idname = "PROJECT_UL_variant_list"
@@ -4465,6 +4483,22 @@ class VIEW3D_PT_project_manager(Panel):
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
     bl_order = 0  # Show at top
+
+    def draw_header(self, context):
+        layout = self.layout
+        icon_id = 0
+        try:
+            import sys
+            addon_module = sys.modules.get(__package__)
+            if addon_module and hasattr(addon_module, 'get_custom_icon_id'):
+                icon_id = int(addon_module.get_custom_icon_id("mapgeo_addon_icon") or 0)
+        except Exception:
+            icon_id = 0
+
+        if icon_id > 0:
+            layout.label(text="", icon_value=icon_id)
+        else:
+            layout.label(text="", icon='WORLD_DATA')
     
     def draw(self, context):
         layout = self.layout

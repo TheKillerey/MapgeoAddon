@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
-## [0.3.0] - 2026-03-14
+## [0.3.1] - 2026-03-14
 
 ### 🗂️ Project Manager (NEW)
 - **Unified mod workflow** — Select a project folder, auto-detect League install, choose map variant, load/reload/export in one panel

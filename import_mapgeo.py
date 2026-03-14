@@ -434,6 +434,25 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     log.warning("Particles", f"Particle import skipped: {e}")
             print(f"[TIMING] particle_import: {_time.perf_counter() - _t2:.2f}s")
 
+            # Auto-import GdsMapObject entries from materials file
+            _t2b = _time.perf_counter()
+            if self.import_particles:
+                try:
+                    resolved_materials = _resolve_materials_path(settings, self.filepath)
+                    if resolved_materials:
+                        from . import map_objects_import
+                        log.info("MapObjects", f"Importing map objects from {os.path.basename(resolved_materials)}")
+                        imported_mo = map_objects_import.import_map_objects_from_materials(
+                            context,
+                            resolved_materials,
+                            log=log,
+                        )
+                        if imported_mo:
+                            log.info("MapObjects", f"Imported {imported_mo} map object(s)")
+                except Exception as e:
+                    log.warning("MapObjects", f"Map object import skipped: {e}")
+            print(f"[TIMING] map_objects_import: {_time.perf_counter() - _t2b:.2f}s")
+
             if show_progress:
                 context.window_manager.progress_update(80)
 
@@ -633,7 +652,19 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                         )
                 except Exception as e:
                     log.warning("Particles", f"Particle import skipped: {e}")
-            
+
+            # Import GdsMapObject entries
+            if self.import_particles:
+                try:
+                    resolved_materials = _resolve_materials_path(settings, self.filepath)
+                    if resolved_materials:
+                        from . import map_objects_import
+                        map_objects_import.import_map_objects_from_materials(
+                            context, resolved_materials, log=log
+                        )
+                except Exception as e:
+                    log.warning("MapObjects", f"Map object import skipped: {e}")
+
             yield 80
             
             # Update visibility
@@ -2734,7 +2765,16 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                 particles_materials.import_particles_from_materials(context, resolved_materials, log=log)
         except Exception:
             pass
-    
+
+    # Auto-import GdsMapObject entries from materials file
+    if import_particles:
+        try:
+            if resolved_materials:
+                from . import map_objects_import
+                map_objects_import.import_map_objects_from_materials(context, resolved_materials, log=log)
+        except Exception:
+            pass
+
     return imported_count, None
 
 
