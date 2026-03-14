@@ -82,25 +82,13 @@ Use Project Manager for split-file editing:
 
 ## Screenshots
 
-Screenshots are referenced from docs/screenshots. Add your image files with these names:
-
 - docs/screenshots/overview_topdown.png
 - docs/screenshots/overview_ingame_angle.png
 - docs/screenshots/layers_visibility.png
 
-Then they appear below:
-
 ![Top Down Overview](docs/screenshots/overview_topdown.png)
 ![In-Scene Angle](docs/screenshots/overview_ingame_angle.png)
 ![Layer Visibility UI](docs/screenshots/layers_visibility.png)
-
-## Documentation
-
-- [QUICK_START.md](QUICK_START.md)
-- [LEAGUE_TOOLS_GUIDE.md](LEAGUE_TOOLS_GUIDE.md)
-- [MATERIALS_GUIDE.md](MATERIALS_GUIDE.md)
-- [POINT_LIGHT_GUIDE.md](POINT_LIGHT_GUIDE.md)
-- [TROYBIN_README.md](TROYBIN_README.md)
 
 ## License
 
