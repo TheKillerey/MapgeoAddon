@@ -21,8 +21,11 @@ Import, edit, and export League of Legends maps in Blender, including map geomet
 ## Credits
 
 Original code for importing League files by LeagueToolkit: https://github.com/LeagueToolkit/LeagueToolkit
+
 Inspired by LolMaya now included in LtMAO: https://github.com/tarngaina/LtMAO
+
 We use also files from CommunityDragon: https://raw.communitydragon.org
+
 
 ## Requirements
 
