@@ -18,6 +18,12 @@ Import, edit, and export League of Legends maps in Blender, including map geomet
 - Project Manager workflow for variant loading and export
 - League Tools suite (Troybin, WAD, SCO/SCB, SKN/SKL, PropertyBin, CFGBin)
 
+## Credits
+
+Original code for importing League files by LeagueToolkit: https://github.com/LeagueToolkit/LeagueToolkit
+Inspired by LolMaya now included in LtMAO: https://github.com/tarngaina/LtMAO
+We use also files from CommunityDragon: https://raw.communitydragon.org
+
 ## Requirements
 
 - Blender 5.0+
@@ -93,3 +99,5 @@ Use Project Manager for split-file editing:
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+
