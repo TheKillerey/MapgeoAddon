@@ -896,8 +896,14 @@ class MaterialLoader:
                 return resolved
             _log().warning("GrassTint", f"Dragon variant {flag_name} texture not found", detail=alt_path)
         
-        # Use base grass tint texture (filename only, lives in levels_folder)
+        # Modern Riot bins often store the base tint as an ASSETS path, while
+        # older files stored only a filename that lives under levels/.../info.
         if base_name:
+            if str(base_name).upper().startswith('ASSETS/'):
+                resolved = self._resolve_assets_path(base_name)
+                if resolved:
+                    _log().info("GrassTint", f"Using base ASSETS path: {os.path.basename(resolved)}")
+                    return resolved
             resolved = self._resolve_base_grass_tint(base_name)
             if resolved:
                 return resolved
@@ -906,30 +912,46 @@ class MaterialLoader:
     
     def _resolve_assets_path(self, asset_path: str) -> str:
         """Resolve an ASSETS/ prefixed path to a real file."""
-        if not asset_path or not self.assets_folder:
+        if not asset_path:
             return ''
-        rel_path = asset_path
+        rel_path = str(asset_path).replace('\\', '/')
         if rel_path.upper().startswith('ASSETS/'):
             rel_path = rel_path[7:]
-        full_path = os.path.join(self.assets_folder, rel_path.replace('/', os.sep))
-        if os.path.exists(full_path):
-            return full_path
-        found = self._find_file_case_insensitive(self.assets_folder, rel_path)
-        return found or ''
+
+        search_roots = []
+        if self.prioritize_custom:
+            search_roots.extend([self.custom_assets_folder, self.assets_folder])
+        else:
+            search_roots.extend([self.assets_folder, self.custom_assets_folder])
+
+        for root in search_roots:
+            if not root:
+                continue
+            full_path = os.path.join(root, rel_path.replace('/', os.sep))
+            if os.path.exists(full_path):
+                return full_path
+            found = self._find_file_case_insensitive(root, rel_path)
+            if found:
+                return found
+        return ''
     
     def _resolve_base_grass_tint(self, base_name: str) -> str:
         """
         Resolve a base grass tint filename (no path) to a real file.
         Base texture lives in levels_folder (e.g. levels/map11/info/)
         
-        Example: "GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
-                 -> "levels/map11/info/GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
+        Example legacy value:
+            "GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
+            -> "levels/map11/info/GrassTint_SRX.SRT_2024_Strategy_Differentiation_Preseason.dds"
         """
         _log().info("GrassTint", f"Resolving base: {base_name}")
         _log().info("GrassTint", f"levels_folder: {self.levels_folder}")
         
         if not base_name:
             return ''
+
+        if str(base_name).upper().startswith('ASSETS/'):
+            return self._resolve_assets_path(base_name)
         
         # Extract stem and extension using proper splitext (handles multi-dot names)
         name_stem, name_ext = os.path.splitext(base_name)

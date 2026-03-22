@@ -483,8 +483,14 @@ def import_particles_from_materials(
     cube_size=0.5,
     root_collection_name=None,
     log=None,
+    vfx_filter=None,
+    import_map_particles=True,
 ):
     """Import VfxSystemDefinitionData and MapParticle entries from .py or .bin.
+
+    vfx_filter: if a set/list of names is provided, only import VFX definitions
+                whose name is in the set; None means import all.
+    import_map_particles: if False, skip MapParticle / container items.
 
     Creates:
       root_Particles/
@@ -499,9 +505,17 @@ def import_particles_from_materials(
 
     parsed = parse_materials_full(materials_path)
     is_bin = materials_path.lower().endswith('.bin')
+
+    # Apply vfx_filter — filter definitions before computing counts
+    if vfx_filter is not None:
+        parsed['vfx_definitions'] = [
+            vd for vd in parsed['vfx_definitions']
+            if vd.get('name', '') in vfx_filter
+        ]
+
     vfx_count = len(parsed['vfx_definitions'])
     container_count = len(parsed['containers'])
-    item_count = sum(len(c['items']) for c in parsed['containers'])
+    item_count = sum(len(c['items']) for c in parsed['containers']) if import_map_particles else 0
 
     if vfx_count == 0 and item_count == 0:
         if log:
@@ -662,98 +676,99 @@ def import_particles_from_materials(
                 log.info("Particles", f"VFX definitions: {vfx_count} imported")
 
         # --- 2) MapParticles grouped by container (use Empties — fast) ---
-        for container in parsed['containers']:
-            cname = container['container_name']
-            short_cname = cname.rsplit('/', 1)[-1] if '/' in cname else cname
-            safe_cname = re.sub(r'[^A-Za-z0-9_]+', '_', short_cname)
+        if import_map_particles:
+            for container in parsed['containers']:
+                cname = container['container_name']
+                short_cname = cname.rsplit('/', 1)[-1] if '/' in cname else cname
+                safe_cname = re.sub(r'[^A-Za-z0-9_]+', '_', short_cname)
 
-            sub_col_name = f"{particles_col_name}_{safe_cname}"
-            sub_col = bpy.data.collections.get(sub_col_name)
-            if sub_col is None:
-                sub_col = bpy.data.collections.new(sub_col_name)
-                particles_col.children.link(sub_col)
+                sub_col_name = f"{particles_col_name}_{safe_cname}"
+                sub_col = bpy.data.collections.get(sub_col_name)
+                if sub_col is None:
+                    sub_col = bpy.data.collections.new(sub_col_name)
+                    particles_col.children.link(sub_col)
 
-            for item in container['items']:
-                system = item.get('system', '')
-                stem = system.rsplit('/', 1)[-1] if system else item['entry_hash']
-                safe_stem = re.sub(r'[^A-Za-z0-9_]+', '_', stem).strip('_') or stem
-                eh_short = item['entry_hash'][2:6].upper() if len(item['entry_hash']) > 5 else item['entry_hash']
-                obj_name = f"MP_{safe_stem}_{eh_short}"
+                for item in container['items']:
+                    system = item.get('system', '')
+                    stem = system.rsplit('/', 1)[-1] if system else item['entry_hash']
+                    safe_stem = re.sub(r'[^A-Za-z0-9_]+', '_', stem).strip('_') or stem
+                    eh_short = item['entry_hash'][2:6].upper() if len(item['entry_hash']) > 5 else item['entry_hash']
+                    obj_name = f"MP_{safe_stem}_{eh_short}"
 
-                # Empty objects are much faster than mesh objects for bulk import
-                obj = bpy.data.objects.new(obj_name, None)
-                obj.empty_display_type = 'SPHERE'
-                obj.empty_display_size = cube_size
-                obj.location = extract_particle_location_from_transform(
-                    item.get('transform_values', [])
-                )
-                raw_scale = extract_particle_scale_from_transform(
-                    item.get('transform_values', [])
-                )
-                obj.scale = (50.0, 50.0, 50.0)
-                obj.rotation_euler = extract_particle_rotation_from_transform(
-                    item.get('transform_values', [])
-                )
+                    # Empty objects are much faster than mesh objects for bulk import
+                    obj = bpy.data.objects.new(obj_name, None)
+                    obj.empty_display_type = 'SPHERE'
+                    obj.empty_display_size = cube_size
+                    obj.location = extract_particle_location_from_transform(
+                        item.get('transform_values', [])
+                    )
+                    raw_scale = extract_particle_scale_from_transform(
+                        item.get('transform_values', [])
+                    )
+                    obj.scale = (50.0, 50.0, 50.0)
+                    obj.rotation_euler = extract_particle_rotation_from_transform(
+                        item.get('transform_values', [])
+                    )
 
-                sub_col.objects.link(obj)
+                    sub_col.objects.link(obj)
 
-                # Store original transform for dirty tracking
-                obj["_original_transform"] = json.dumps(
-                    item.get('transform_values', [])
-                )
+                    # Store original transform for dirty tracking
+                    obj["_original_transform"] = json.dumps(
+                        item.get('transform_values', [])
+                    )
 
-                obj["is_particle_system"] = True
-                obj["particle_source"] = "materials_bin" if is_bin else "materials_py"
-                obj["particle_materials_path"] = materials_path
-                obj["particle_entry_hash"] = item['entry_hash']
-                obj["particle_entry_kind"] = item['entry_kind']
-                obj["particle_system"] = system
-                obj["particle_name_kind"] = item['name_kind']
-                obj["particle_name_value"] = item['name_value']
-                obj["particle_block_text"] = item['block_text']
-                obj["particle_container"] = cname
-                if container.get('container_hash'):
-                    obj["particle_container_hash"] = str(container['container_hash']).lower()
-                obj["particle_container_short"] = short_cname
+                    obj["is_particle_system"] = True
+                    obj["particle_source"] = "materials_bin" if is_bin else "materials_py"
+                    obj["particle_materials_path"] = materials_path
+                    obj["particle_entry_hash"] = item['entry_hash']
+                    obj["particle_entry_kind"] = item['entry_kind']
+                    obj["particle_system"] = system
+                    obj["particle_name_kind"] = item['name_kind']
+                    obj["particle_name_value"] = item['name_value']
+                    obj["particle_block_text"] = item['block_text']
+                    obj["particle_container"] = cname
+                    if container.get('container_hash'):
+                        obj["particle_container_hash"] = str(container['container_hash']).lower()
+                    obj["particle_container_short"] = short_cname
 
-                visibility_flags = item.get('visibility_flags')
-                visibility_controller = item.get('visibility_controller', '')
-                if visibility_flags is not None:
-                    obj["particle_visibility_flags"] = int(visibility_flags)
-                    obj["visibility_layer"] = int(visibility_flags)
+                    visibility_flags = item.get('visibility_flags')
+                    visibility_controller = item.get('visibility_controller', '')
+                    if visibility_flags is not None:
+                        obj["particle_visibility_flags"] = int(visibility_flags)
+                        obj["visibility_layer"] = int(visibility_flags)
 
-                if visibility_controller:
-                    ctrl_clean = visibility_controller.strip().lower()
-                    if ctrl_clean.startswith("0x"):
-                        ctrl_clean = ctrl_clean[2:]
-                    obj["particle_visibility_controller"] = ctrl_clean.upper()
-                    obj["baron_hash"] = ctrl_clean.upper()
+                    if visibility_controller:
+                        ctrl_clean = visibility_controller.strip().lower()
+                        if ctrl_clean.startswith("0x"):
+                            ctrl_clean = ctrl_clean[2:]
+                        obj["particle_visibility_controller"] = ctrl_clean.upper()
+                        obj["baron_hash"] = ctrl_clean.upper()
 
-                    if baron_parser:
-                        if ctrl_clean in baron_decode_cache:
-                            decoded = baron_decode_cache[ctrl_clean]
-                        else:
-                            try:
-                                decoded = baron_parser.decode_baron_hash(ctrl_clean)
-                            except Exception:
-                                decoded = None
-                            baron_decode_cache[ctrl_clean] = decoded
+                        if baron_parser:
+                            if ctrl_clean in baron_decode_cache:
+                                decoded = baron_decode_cache[ctrl_clean]
+                            else:
+                                try:
+                                    decoded = baron_parser.decode_baron_hash(ctrl_clean)
+                                except Exception:
+                                    decoded = None
+                                baron_decode_cache[ctrl_clean] = decoded
 
-                        if decoded is not None:
-                            if getattr(decoded, 'baron_layers', None):
-                                obj["baron_layers_decoded"] = str(sorted(list(decoded.baron_layers)))
-                            if getattr(decoded, 'dragon_layers', None):
-                                obj["baron_dragon_layers_decoded"] = str(sorted(list(decoded.dragon_layers)))
-                            obj["baron_parent_mode"] = int(getattr(decoded, 'parent_mode', 1) or 1)
+                            if decoded is not None:
+                                if getattr(decoded, 'baron_layers', None):
+                                    obj["baron_layers_decoded"] = str(sorted(list(decoded.baron_layers)))
+                                if getattr(decoded, 'dragon_layers', None):
+                                    obj["baron_dragon_layers_decoded"] = str(sorted(list(decoded.dragon_layers)))
+                                obj["baron_parent_mode"] = int(getattr(decoded, 'parent_mode', 1) or 1)
 
-                imported += 1
-                if imported % 100 == 0 or imported == total:
-                    if log:
-                        log.info("Particles", f"Progress: {imported}/{total}")
-                    wm.progress_update(imported)
+                    imported += 1
+                    if imported % 100 == 0 or imported == total:
+                        if log:
+                            log.info("Particles", f"Progress: {imported}/{total}")
+                        wm.progress_update(imported)
 
-            if log:
-                log.info("Particles", f"  Container '{short_cname}': {len(container['items'])} items")
+                if log:
+                    log.info("Particles", f"  Container '{short_cname}': {len(container['items'])} items")
 
     finally:
         wm.progress_end()

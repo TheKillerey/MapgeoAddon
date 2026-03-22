@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 3, 1),
+    "version": (0, 3, 2),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -48,6 +48,8 @@ from . import (
     legacy_map_ui,
     project_manager,
     map_porter,
+    map_patcher,
+    character_bin_updater,
     map_objects_import,
     utils,
 )
@@ -452,6 +454,12 @@ class MapgeoSettings(PropertyGroup):
         default="",
         subtype='DIR_PATH'
     )
+
+    texture_import_assets_path: StringProperty(
+        name="Texture Import Path",
+        description="Project-relative destination for newly imported sampler textures",
+        default="assets/maps/kitpieces/custom"
+    )
     
     prioritize_custom_assets: BoolProperty(
         name="Prioritize Custom Assets",
@@ -469,14 +477,14 @@ class MapgeoSettings(PropertyGroup):
     legacy_map_folder: StringProperty(
         name="Legacy Map Folder",
         description="Path to legacy LEVELS/Map folder (e.g. K:/LeagueSandbox/League_Sandbox_Client/LEVELS/Map1)",
-        default=r"K:\LeagueSandbox\League_Sandbox_Client\LEVELS\Map1",
+        default=r"",
         subtype='DIR_PATH'
     )
 
     legacy_shader_hlsl_folder: StringProperty(
         name="Legacy HLSL Folder",
         description="Path to legacy shader HLSL root (HeightBlending + Environment expected)",
-        default=r"K:\LeagueSandbox\League_Sandbox_Client\DATA\Shaders\HLSL",
+        default=r"",
         subtype='DIR_PATH'
     )
 
@@ -661,7 +669,12 @@ classes = (
     MapgeoSettings,
     import_mapgeo.IMPORT_SCENE_OT_mapgeo,
     export_mapgeo.EXPORT_SCENE_OT_mapgeo,
+    ui_panel.MAPGEO_ParticleVfxItem,
+    ui_panel.MAPGEO_OT_particle_select_all_vfx,
+    ui_panel.MAPGEO_OT_particle_select_none_vfx,
     ui_panel.MAPGEO_OT_setup_mesh,
+    ui_panel.MAPGEO_OT_reverse_selected_faces,
+    ui_panel.MAPGEO_OT_enable_decal_transparency_overlap,
     ui_panel.MAPGEO_OT_initialize_custom_mesh,
     ui_panel.MAPGEO_OT_assign_layer,
     ui_panel.MAPGEO_OT_set_quality,
@@ -703,6 +716,7 @@ classes = (
     ui_panel.MAPGEO_OT_export_lightmaps,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
+    ui_panel.VIEW3D_PT_mapgeo_experimental_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
     ui_panel.VIEW3D_PT_mapgeo_export_panel,
     ui_panel.VIEW3D_PT_mapgeo_properties_panel,
@@ -727,6 +741,9 @@ def register():
 
     # Register properties
     bpy.types.Scene.mapgeo_settings = bpy.props.PointerProperty(type=MapgeoSettings)
+    bpy.types.Scene.mapgeo_particle_vfx_items = bpy.props.CollectionProperty(
+        type=ui_panel.MAPGEO_ParticleVfxItem,
+    )
 
     # Register material editor UI
     try:
@@ -793,7 +810,19 @@ def register():
         map_porter.register()
     except Exception as e:
         print(f"[Map Porter] Registration failed: {e}")
-    
+
+    # Register map patcher
+    try:
+        map_patcher.register()
+    except Exception as e:
+        print(f"[Map Patcher] Registration failed: {e}")
+
+    # Register character bin updater
+    try:
+        character_bin_updater.register()
+    except Exception as e:
+        print(f"[Character Bin Updater] Registration failed: {e}")
+
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -802,6 +831,18 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister character bin updater
+    try:
+        character_bin_updater.unregister()
+    except Exception as e:
+        print(f"[Character Bin Updater] Unregister failed: {e}")
+
+    # Unregister map patcher
+    try:
+        map_patcher.unregister()
+    except Exception as e:
+        print(f"[Map Patcher] Unregister failed: {e}")
+
     # Unregister map porter
     try:
         map_porter.unregister()
@@ -873,6 +914,8 @@ def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     
     # Unregister properties
+    if hasattr(bpy.types.Scene, "mapgeo_particle_vfx_items"):
+        del bpy.types.Scene.mapgeo_particle_vfx_items
     del bpy.types.Scene.mapgeo_settings
     
     # Unregister classes (in reverse order)

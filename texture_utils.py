@@ -2,6 +2,7 @@
 Texture Utilities for Mapgeo Addon
 Handles Riot .tex format — converts to DDS in-memory, writes a temp file,
 loads via Blender's native DDS support, packs into .blend, then cleans up.
+Also supports converting supported DDS files into Riot TEX files.
 """
 
 import struct
@@ -30,6 +31,44 @@ def _should_defer_packing():
     Blender 5.1.0+ has issues with deferred image packing causing hangs.
     """
     return bpy.app.version < (5, 1, 0)
+
+
+def _mip_layout(width: int, height: int, tex_fmt: int, mip_count: int):
+    """Return byte sizes for each mip level from largest to smallest."""
+    if tex_fmt == 0x0a:
+        block_size, bytes_per_block = 4, 8
+    elif tex_fmt == 0x0c:
+        block_size, bytes_per_block = 4, 16
+    elif tex_fmt == 0x14:
+        block_size, bytes_per_block = 1, 4
+    elif tex_fmt == 0x15:
+        block_size, bytes_per_block = 1, 8
+    else:
+        raise ValueError(f"Unsupported TEX/DDS format: 0x{tex_fmt:02x}")
+
+    sizes = []
+    cur_w = max(1, int(width))
+    cur_h = max(1, int(height))
+    for _ in range(max(1, int(mip_count or 1))):
+        bw = (cur_w + block_size - 1) // block_size
+        bh = (cur_h + block_size - 1) // block_size
+        sizes.append(bw * bh * bytes_per_block)
+        if cur_w == 1 and cur_h == 1:
+            break
+        cur_w = max(1, cur_w // 2)
+        cur_h = max(1, cur_h // 2)
+    return sizes
+
+
+def convert_dds_to_tex_file(dds_path: str, tex_path: str) -> str:
+    """Convert a supported DDS file to Riot TEX format and write it to disk."""
+    with open(dds_path, 'rb') as fh:
+        dds_data = fh.read()
+    tex_data = TexConverter.dds_to_tex(dds_data)
+    os.makedirs(os.path.dirname(tex_path) or '.', exist_ok=True)
+    with open(tex_path, 'wb') as fh:
+        fh.write(tex_data)
+    return tex_path
 
 
 class TexConverter:
@@ -206,6 +245,71 @@ class TexConverter:
     # ------------------------------------------------------------------ #
     #  TEX → DDS conversion                                               #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def dds_to_tex(data: bytes) -> bytes:
+        """Build a Riot TEX file from a supported DDS file.
+
+        Supports BC1/DXT1, BC3/DXT5, BGRA8, and DX10 RGBA16F.
+        Preserves mip chains when present by reordering them into TEX layout
+        (smallest mip first, largest mip last).
+        """
+        if len(data) < 128 or data[:4] != b'DDS ':
+            raise ValueError("Invalid DDS header")
+
+        header_size = struct.unpack('<I', data[4:8])[0]
+        if header_size != 124:
+            raise ValueError(f"Unsupported DDS header size: {header_size}")
+
+        flags, height, width, _pitch, _depth, mip_count = struct.unpack('<6I', data[8:32])
+        pf_size, pf_flags, fourcc, rgb_bits, rmask, gmask, bmask, amask = struct.unpack('<II4sIIIII', data[76:108])
+        if pf_size != 32:
+            raise ValueError(f"Unsupported DDS pixel format size: {pf_size}")
+
+        data_offset = 128
+        tex_fmt = None
+        if fourcc == b'DXT1':
+            tex_fmt = 0x0a
+        elif fourcc == b'DXT5':
+            tex_fmt = 0x0c
+        elif fourcc == b'DX10':
+            if len(data) < 148:
+                raise ValueError("DDS DX10 header missing")
+            dxgi_format = struct.unpack('<I', data[128:132])[0]
+            data_offset = 148
+            if dxgi_format == 13:
+                tex_fmt = 0x15
+            else:
+                raise ValueError(f"Unsupported DDS DX10 format: {dxgi_format}")
+        elif (pf_flags & 0x40) and rgb_bits == 32 and rmask == 0x00ff0000 and gmask == 0x0000ff00 and bmask == 0x000000ff and amask == 0xff000000:
+            tex_fmt = 0x14
+        else:
+            raise ValueError(f"Unsupported DDS format: fourcc={fourcc!r} rgb_bits={rgb_bits}")
+
+        payload = data[data_offset:]
+        has_mipmaps = int(mip_count or 0) > 1
+        if has_mipmaps:
+            mip_sizes = _mip_layout(width, height, tex_fmt, mip_count)
+            total_size = sum(mip_sizes)
+            if total_size > len(payload):
+                # Fall back to largest mip only if the chain is malformed.
+                has_mipmaps = False
+            else:
+                chunks = []
+                offset = 0
+                for size in mip_sizes:
+                    chunks.append(payload[offset:offset + size])
+                    offset += size
+                payload = b''.join(reversed(chunks))
+
+        if not has_mipmaps:
+            largest_size = _mip_layout(width, height, tex_fmt, 1)[0]
+            if len(payload) < largest_size:
+                raise ValueError("DDS payload shorter than expected")
+            payload = payload[:largest_size]
+
+        flags_out = 0x01 if has_mipmaps else 0x00
+        return struct.pack('<4sHHBBBB', b'TEX\0', width, height, 0, tex_fmt, 0, flags_out) + payload
 
     @staticmethod
     def _tex_to_dds(data: bytes) -> bytes:

@@ -915,6 +915,8 @@ class VIEW3D_PT_propbin_panel(Panel):
     bl_category = 'League Tools'
     bl_label = "PropertyBin Editor"
     bl_idname = "VIEW3D_PT_propbin_panel"
+    bl_order = 20
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
