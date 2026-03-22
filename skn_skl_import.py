@@ -1623,6 +1623,8 @@ class VIEW3D_PT_skn_skl_panel(Panel):
     bl_category = 'League Tools'
     bl_label = "SKN/SKL Skinned Mesh"
     bl_idname = "VIEW3D_PT_skn_skl_panel"
+    bl_order = 40
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout

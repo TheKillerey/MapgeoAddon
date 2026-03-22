@@ -736,6 +736,7 @@ class VIEW3D_PT_cfgbin_editor_panel(Panel):
     bl_category = 'League Tools'
     bl_label = "CFGBin / Inibin Editor"
     bl_idname = "VIEW3D_PT_cfgbin_editor_panel"
+    bl_order = 30
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):

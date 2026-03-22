@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy.props import (
     StringProperty, IntProperty, FloatProperty, BoolProperty,
@@ -20,10 +21,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
-    from texture_utils import TexConverter, resolve_texture_path
+    from texture_utils import TexConverter, resolve_texture_path, convert_dds_to_tex_file
 except ImportError:
     TexConverter = None
     resolve_texture_path = None
+    convert_dds_to_tex_file = None
 
 try:
     from league_material_enums import (
@@ -360,15 +362,23 @@ def _apply_pass_material_settings(mat, pass_data):
         elif hasattr(mat, "blend_method"):
             mat.blend_method = 'BLEND'
 
-    # Transparency Overlap: only for Indicator_Faelights with 6/7/6/7 blend factors
-    if hasattr(mat, "use_transparency_overlap"):
-        overlap_on = (
+    # Transparency Overlap: always on for decal shaders, plus existing Faelights special-case.
+    # Use try/except to support Blender builds where this property is unavailable.
+    shader_name_l = shader_name.lower()
+    is_decal_shader = "decal" in shader_name_l
+    overlap_on = (
+        is_decal_shader or
+        (
             blend_enabled and
             src_color == 6 and dst_color == 7 and
             src_alpha == 6 and dst_alpha == 7 and
             shader_name == 'Indicator_Faelights'
         )
+    )
+    try:
         mat.use_transparency_overlap = overlap_on
+    except Exception:
+        pass
 
     # Show transparent back for glass/additive shaders
     if hasattr(mat, "show_transparent_back"):
@@ -2214,6 +2224,138 @@ def _get_assets_folders_from_context():
     return assets_folder, custom_assets_folder, prioritize_custom
 
 
+def _get_wad_cache_root():
+    return os.path.join(bpy.utils.resource_path("USER"), "mapgeo_addon", "wad_cache")
+
+
+def _is_wad_cache_path(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        norm_path = os.path.normcase(os.path.abspath(path))
+        norm_cache = os.path.normcase(os.path.abspath(_get_wad_cache_root()))
+        return norm_path.startswith(norm_cache)
+    except Exception:
+        return False
+
+
+def _find_project_root_from_path(start_path: str) -> str:
+    """Walk upward and return a likely project root containing assets/ or data/."""
+    if not start_path:
+        return ""
+
+    cur = os.path.abspath(start_path)
+    if os.path.isfile(cur):
+        cur = os.path.dirname(cur)
+
+    while True:
+        if os.path.isdir(os.path.join(cur, "assets")) or os.path.isdir(os.path.join(cur, "data")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def _get_texture_import_destination(context):
+    """Return (project_root, import_dir) for new texture imports.
+
+    This intentionally avoids Riot WAD cache folders so imported textures always
+    land in the real project.
+    """
+    scene = getattr(context, "scene", None)
+    settings = getattr(scene, "mapgeo_settings", None)
+    if not settings:
+        return "", ""
+
+    preferred = []
+    custom_assets = (getattr(settings, "custom_assets_folder", "") or "").strip()
+    original_assets = (getattr(settings, "assets_folder", "") or "").strip()
+    materials_path = (getattr(settings, "materials_file_path", "") or "").strip()
+    map_path = (getattr(settings, "map_py_path", "") or "").strip()
+
+    for candidate in (custom_assets, original_assets):
+        if candidate and not _is_wad_cache_path(candidate):
+            preferred.append(candidate)
+
+    project_root = ""
+    for candidate in preferred:
+        abs_candidate = os.path.abspath(candidate)
+        if os.path.basename(abs_candidate).lower() == "assets":
+            project_root = os.path.dirname(abs_candidate)
+        else:
+            project_root = _find_project_root_from_path(abs_candidate)
+        if project_root:
+            break
+
+    if not project_root:
+        for candidate in (materials_path, map_path):
+            if candidate and not _is_wad_cache_path(candidate):
+                project_root = _find_project_root_from_path(candidate)
+                if project_root:
+                    break
+
+    if not project_root:
+        return "", ""
+
+    rel_import_path = (getattr(settings, "texture_import_assets_path", "") or "").strip().replace("\\", "/")
+    if not rel_import_path:
+        rel_import_path = "assets/maps/kitpieces/custom"
+    rel_import_path = rel_import_path.lstrip("/")
+    if not rel_import_path.lower().startswith("assets/"):
+        rel_import_path = f"assets/{rel_import_path}"
+
+    import_dir = os.path.join(project_root, rel_import_path.replace("/", os.sep))
+    return project_root, import_dir
+
+
+def _import_texture_to_project(context, source_path: str):
+    """Copy a selected texture into project assets and return League-style path.
+
+    Returns (ok: bool, message_or_path: str). On success the second value is
+    an ASSETS/... path suitable for sampler texturePath.
+    """
+    src = os.path.abspath(source_path)
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in (".dds", ".tex"):
+        return False, "Only .dds and .tex are supported"
+    if not os.path.isfile(src):
+        return False, f"Texture file not found: {src}"
+
+    project_root, imports_dir = _get_texture_import_destination(context)
+    if not project_root or not imports_dir:
+        return False, "Could not determine project root for texture import"
+
+    project_root = os.path.abspath(project_root)
+    os.makedirs(imports_dir, exist_ok=True)
+
+    base_name = os.path.basename(src)
+    name_root, name_ext = os.path.splitext(base_name)
+    dest_ext = '.tex' if ext == '.dds' else name_ext
+    dst = os.path.join(imports_dir, f"{name_root}{dest_ext}")
+    suffix = 1
+    while os.path.exists(dst) and not os.path.samefile(src, dst):
+        dst = os.path.join(imports_dir, f"{name_root}_{suffix}{dest_ext}")
+        suffix += 1
+
+    if not (os.path.exists(dst) and os.path.samefile(src, dst)):
+        if ext == '.dds':
+            if not convert_dds_to_tex_file:
+                return False, "DDS to TEX converter is not available"
+            try:
+                convert_dds_to_tex_file(src, dst)
+            except Exception as exc:
+                return False, f"DDS to TEX conversion failed: {exc}"
+        else:
+            shutil.copy2(src, dst)
+
+    rel = os.path.relpath(dst, project_root).replace("\\", "/")
+    if not rel.lower().startswith("assets/"):
+        return False, f"Imported texture path must live under assets/: {dst}"
+    league_path = rel.replace("assets/", "ASSETS/", 1)
+    return True, league_path
+
+
 def _fmt(v, width=6):
     """Format a float to 4 decimals."""
     return f"{v:.4f}"
@@ -2511,7 +2653,7 @@ class MAPGEO_OT_create_material_from_template(Operator):
         items=_SHADER_TEMPLATE_ITEMS,
         description="Select a shader — material will be pre-populated with its typical samplers, parameters, switches, and macros",
     )
-    new_name: StringProperty(name="Material Name", default="New_Material")
+    new_name: StringProperty(name="Material Name", default="Maps/KitPieces/Custom/Materials/Default/New_Material")
     include_low_freq: BoolProperty(
         name="Include Rare Properties",
         default=False,
@@ -2602,6 +2744,9 @@ class MAPGEO_OT_create_material_from_template(Operator):
             f"({len(samplers)} samplers, {len(params)} params, {len(switches)} switches)",
         )
         return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=580)
 
 
 class MAPGEO_OT_create_staticmesh_shader_previews(Operator):
@@ -3010,8 +3155,10 @@ class MAPGEO_OT_add_sampler(Operator):
             return {'CANCELLED'}
         tex_name = self.custom_name if self.sampler_type == "CUSTOM" else self.sampler_type
         tex_path = self.texture_path
-        if tex_path and not tex_path.lower().endswith(('.tex', '.dds', '.png')):
-            tex_path += '.tex'
+        if tex_path:
+            if not tex_path.lower().endswith(('.tex', '.dds')):
+                self.report({'ERROR'}, "Sampler texture path must be .tex or .dds")
+                return {'CANCELLED'}
         samplers = json.loads(mat.get("samplers", "[]"))
         samplers.append({
             "textureName": tex_name,
@@ -3052,6 +3199,9 @@ class MAPGEO_OT_edit_sampler(Operator):
         layout = self.layout
         layout.prop(self, "texture_name")
         layout.prop(self, "texture_path", icon='FILE_IMAGE')
+        conv = layout.row()
+        op = conv.operator("mapgeo.convert_sampler_dds_to_tex", text="Convert Current DDS to TEX", icon='FILE_REFRESH')
+        op.sampler_index = self.sampler_index
         row = layout.row(align=True)
         row.label(text="Address Mode:")
         row.prop(self, "address_u")
@@ -3061,6 +3211,9 @@ class MAPGEO_OT_edit_sampler(Operator):
     def execute(self, context):
         mat = context.material
         if not mat:
+            return {'CANCELLED'}
+        if self.texture_path and not self.texture_path.lower().endswith(('.tex', '.dds')):
+            self.report({'ERROR'}, "Sampler texture path must be .tex or .dds")
             return {'CANCELLED'}
         samplers = json.loads(mat.get("samplers", "[]"))
         if not (0 <= self.sampler_index < len(samplers)):
@@ -3124,13 +3277,27 @@ class MAPGEO_OT_browse_sampler_texture(Operator):
 
     sampler_index: IntProperty()
     filepath: StringProperty(subtype='FILE_PATH')
-    filter_glob: StringProperty(default="*.tex;*.dds;*.png;*.tga;*.jpg", options={'HIDDEN'})
+    filter_glob: StringProperty(default="*.tex;*.dds", options={'HIDDEN'})
 
     def execute(self, context):
         mat = context.material
         if not mat:
             return {'CANCELLED'}
-        ok, msg = _sync_sampler_texture(mat, self.sampler_index, self.filepath)
+
+        selected = os.path.abspath(self.filepath)
+        ext = os.path.splitext(selected)[1].lower()
+        if ext not in ('.tex', '.dds'):
+            self.report({'ERROR'}, "Only .dds and .tex are allowed")
+            return {'CANCELLED'}
+
+        ok_copy, path_or_msg = _import_texture_to_project(context, selected)
+        if not ok_copy:
+            self.report({'ERROR'}, path_or_msg)
+            return {'CANCELLED'}
+
+        ok, msg = _sync_sampler_texture(mat, self.sampler_index, path_or_msg)
+        if ext == '.dds' and ok:
+            msg += " | imported and converted DDS to TEX"
         _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
         _tag_redraw(context)
         self.report({'INFO'} if ok else {'WARNING'}, msg)
@@ -3139,6 +3306,105 @@ class MAPGEO_OT_browse_sampler_texture(Operator):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_convert_dds_to_project_tex(Operator):
+    """Convert a DDS file into project TEX format using the configured import path"""
+    bl_idname = "mapgeo.convert_dds_to_project_tex"
+    bl_label = "Convert DDS to TEX"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.dds", options={'HIDDEN'})
+
+    def execute(self, context):
+        selected = os.path.abspath(self.filepath)
+        if os.path.splitext(selected)[1].lower() != '.dds':
+            self.report({'ERROR'}, "Select a .dds file")
+            return {'CANCELLED'}
+
+        ok, path_or_msg = _import_texture_to_project(context, selected)
+        if not ok:
+            self.report({'ERROR'}, path_or_msg)
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Converted DDS to TEX: {path_or_msg}")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class MAPGEO_OT_convert_sampler_dds_to_tex(Operator):
+    """Convert the selected sampler's DDS texture path to project TEX and update sampler path"""
+    bl_idname = "mapgeo.convert_sampler_dds_to_tex"
+    bl_label = "Convert Sampler DDS to TEX"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    sampler_index: IntProperty()
+
+    def execute(self, context):
+        mat = context.material
+        if not mat:
+            self.report({'ERROR'}, "No active material")
+            return {'CANCELLED'}
+
+        try:
+            samplers = json.loads(mat.get("samplers", "[]"))
+        except Exception:
+            self.report({'ERROR'}, "Failed to read samplers")
+            return {'CANCELLED'}
+
+        if not (0 <= self.sampler_index < len(samplers)):
+            self.report({'ERROR'}, "Invalid sampler index")
+            return {'CANCELLED'}
+
+        tex_path = str(samplers[self.sampler_index].get("texturePath", "") or "").strip()
+        if not tex_path:
+            self.report({'ERROR'}, "Sampler has no texture path")
+            return {'CANCELLED'}
+
+        if tex_path.lower().endswith('.tex'):
+            self.report({'INFO'}, "Sampler already uses .tex")
+            return {'FINISHED'}
+        if not tex_path.lower().endswith('.dds'):
+            self.report({'ERROR'}, "Sampler texture must be .dds to convert")
+            return {'CANCELLED'}
+
+        source_path = ""
+        if os.path.isabs(tex_path) and os.path.isfile(tex_path):
+            source_path = tex_path
+        else:
+            assets_folder, custom_assets_folder, prioritize_custom = _get_assets_folders_from_context()
+            if resolve_texture_path:
+                source_path = resolve_texture_path(tex_path, assets_folder, custom_assets_folder, prioritize_custom) or ""
+
+        if not source_path:
+            self.report({'ERROR'}, f"Could not resolve sampler path: {tex_path}")
+            return {'CANCELLED'}
+
+        if source_path.lower().endswith('.tex'):
+            # Source already resolves to TEX (likely previously converted).
+            tex_target = tex_path[:-4] + '.tex'
+            ok, msg = _sync_sampler_texture(mat, self.sampler_index, tex_target)
+            _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
+            _tag_redraw(context)
+            self.report({'INFO'} if ok else {'WARNING'}, msg)
+            return {'FINISHED'}
+
+        ok_copy, path_or_msg = _import_texture_to_project(context, source_path)
+        if not ok_copy:
+            self.report({'ERROR'}, path_or_msg)
+            return {'CANCELLED'}
+
+        ok, msg = _sync_sampler_texture(mat, self.sampler_index, path_or_msg)
+        if ok:
+            msg += " | converted DDS to TEX"
+        _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
+        _tag_redraw(context)
+        self.report({'INFO'} if ok else {'WARNING'}, msg)
+        return {'FINISHED'}
 
 
 # ============================================================================
@@ -3872,6 +4138,7 @@ class MATERIAL_PT_league_samplers(Panel):
                 header.label(text=s.get("textureName", "?"), icon='TEXTURE')
                 header.operator("mapgeo.edit_sampler", text="", icon='GREASEPENCIL').sampler_index = i
                 header.operator("mapgeo.browse_sampler_texture", text="", icon='FILEBROWSER').sampler_index = i
+                header.operator("mapgeo.convert_sampler_dds_to_tex", text="", icon='FILE_REFRESH').sampler_index = i
                 header.operator("mapgeo.remove_sampler", text="", icon='TRASH').sampler_index = i
                 # Path
                 path = s.get("texturePath", "")
@@ -4889,6 +5156,8 @@ material_editor_classes = (
     MAPGEO_OT_edit_sampler,
     MAPGEO_OT_remove_sampler,
     MAPGEO_OT_browse_sampler_texture,
+    MAPGEO_OT_convert_sampler_dds_to_tex,
+    MAPGEO_OT_convert_dds_to_project_tex,
     # Parameter operators
     MAPGEO_OT_add_parameter,
     MAPGEO_OT_edit_parameter,

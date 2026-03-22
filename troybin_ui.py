@@ -792,6 +792,8 @@ class VIEW3D_PT_league_tools_panel(Panel):
     bl_category = 'League Tools'
     bl_label = "Troybin Particle Editor"
     bl_idname = "VIEW3D_PT_league_tools_panel"
+    bl_order = 60
+    bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
         layout = self.layout

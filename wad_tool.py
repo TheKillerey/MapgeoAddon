@@ -1508,7 +1508,8 @@ class VIEW3D_PT_wad_tool(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "League Tools"
-    bl_order = 60
+    bl_order = 10
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout

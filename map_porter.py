@@ -21,6 +21,7 @@ from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import StringProperty, BoolProperty, EnumProperty
 
 from . import propertybin_parser
+from . import mapgeo_parser
 
 # ============================================================================
 # Constants
@@ -290,6 +291,22 @@ def _derive_map_name_from_materials(materials_path: str) -> str:
             return name[: len(name) - len(suffix)]
     # Fallback
     return os.path.splitext(os.path.splitext(name)[0])[0]
+
+
+def _extract_mapgeo_material_names(mapgeo_path: str) -> set[str]:
+    """Extract all material names referenced by primitives in a .mapgeo file."""
+    names = set()
+    if not mapgeo_path or not os.path.isfile(mapgeo_path):
+        return names
+
+    parser = mapgeo_parser.MapgeoParser()
+    mapgeo = parser.read(mapgeo_path)
+    for mesh in mapgeo.meshes:
+        for prim in mesh.primitives:
+            mat = (prim.material or "").strip()
+            if mat:
+                names.add(mat)
+    return names
 
 
 # ============================================================================
@@ -628,6 +645,7 @@ def merge_materials_bin(
     source_materials_path: str,
     target_materials_path: str,
     output_path: str,
+    required_material_names: set[str] | None = None,
 ) -> dict:
     """
     Merge two materials.bin files:
@@ -748,6 +766,58 @@ def merge_materials_bin(
     if "patch_entries" in src_data:
         merged_data["patch_entries"] = src_data["patch_entries"]
 
+    # ── Defensive material coverage pass ──
+    # Some maps can crash if any mapgeo primitive material string has no
+    # matching StaticMaterialDef. Ensure required names resolve in output.
+    injected_missing_materials = 0
+    unresolved_material_names = []
+    if required_material_names:
+        merged_name_set = set()
+        merged_path_set = set(e.get("path_hash", "") for e in src_entries)
+
+        for e in src_entries:
+            if _type_hash_int(e) != 0xff9d3409:
+                continue
+            for f in e.get("fields", []):
+                if f.get("name_hash") == "0x8d39bde6" or f.get("name_hash_int") == 0x8d39bde6:
+                    merged_name_set.add(str(f.get("value", "")).strip().lower())
+                    break
+
+        # Build lookup from both source and target by material name
+        lookup_by_name = {}
+        for e in list(src_data.get("entries", [])) + list(tgt_data.get("entries", [])):
+            if _type_hash_int(e) != 0xff9d3409:
+                continue
+            mat_name = ""
+            for f in e.get("fields", []):
+                if f.get("name_hash") == "0x8d39bde6" or f.get("name_hash_int") == 0x8d39bde6:
+                    mat_name = str(f.get("value", "")).strip()
+                    break
+            if mat_name:
+                lookup_by_name.setdefault(mat_name.lower(), e)
+
+        for mat_name in sorted(required_material_names):
+            key = mat_name.strip().lower()
+            if not key or key in merged_name_set:
+                continue
+            candidate = lookup_by_name.get(key)
+            if candidate is None:
+                unresolved_material_names.append(mat_name)
+                continue
+            p_hash = candidate.get("path_hash", "")
+            if p_hash and p_hash in merged_path_set:
+                # Hash already present; skip duplicate insertion.
+                continue
+
+            src_entries.append(_copy.deepcopy(candidate))
+            injected_missing_materials += 1
+            merged_name_set.add(key)
+            if p_hash:
+                merged_path_set.add(p_hash)
+
+        merged_data["entries"] = src_entries
+        merged_data["entry_count"] = len(src_entries)
+
     # Write output
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     propertybin_parser.write_bin(merged_data, output_path)
@@ -770,6 +840,8 @@ def merge_materials_bin(
         "skin_report": skin_report,
         "chunks_merged": chunks_merged,
         "chunks_added": chunks_added,
+        "injected_missing_materials": injected_missing_materials,
+        "unresolved_material_names": unresolved_material_names,
     }
 
 
@@ -810,10 +882,25 @@ class MAPPORTER_OT_port_map(Operator):
         target_map_name = _derive_map_name_from_materials(tgt_materials)
         report_lines = [f"Map Porter: porting '{source_map_name}' → '{target_map_name}'"]
 
+        required_material_names = set()
+        if src_mapgeo and os.path.isfile(src_mapgeo):
+            try:
+                required_material_names = _extract_mapgeo_material_names(src_mapgeo)
+                report_lines.append(
+                    f"Source mapgeo materials: {len(required_material_names)}"
+                )
+            except Exception as e:
+                report_lines.append(f"WARNING: Could not scan source mapgeo materials: {e}")
+
         # --- 1. Merge materials.bin ---
         try:
             out_materials = os.path.join(out_dir, f"{target_map_name}.materials.bin")
-            summary = merge_materials_bin(src_materials, tgt_materials, out_materials)
+            summary = merge_materials_bin(
+                src_materials,
+                tgt_materials,
+                out_materials,
+                required_material_names=required_material_names,
+            )
             mc_status = "swapped" if summary["mc_swapped"] else "NOT FOUND in target"
             report_lines.append(
                 f"Materials.bin: {summary['total_entries']} entries, "
@@ -837,6 +924,18 @@ class MAPPORTER_OT_port_map(Operator):
                     f"  • mapContainer chunks: {cm} redirected to source, "
                     f"{ca} source-only added"
                 )
+            im = summary.get("injected_missing_materials", 0)
+            if im:
+                report_lines.append(
+                    f"  • Injected {im} missing material definition(s) required by source mapgeo"
+                )
+            unresolved = summary.get("unresolved_material_names", [])
+            if unresolved:
+                report_lines.append(
+                    f"  • WARNING unresolved materials ({len(unresolved)}):"
+                )
+                for m in unresolved[:25]:
+                    report_lines.append(f"    - {m}")
             if summary["type_summary"]:
                 for label, count in sorted(summary["type_summary"].items()):
                     report_lines.append(f"  • {label}: {count}")
@@ -1063,7 +1162,8 @@ class VIEW3D_PT_map_porter(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "League Tools"
-    bl_order = 55
+    bl_order = 80
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout

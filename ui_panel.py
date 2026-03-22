@@ -19,7 +19,9 @@ def _operator_exists(op_idname: str) -> bool:
     try:
         cat, opname = op_idname.split('.', 1)
         ops_cat = getattr(bpy.ops, cat, None)
-        return ops_cat is not None and hasattr(ops_cat, opname)
+        # `hasattr` on bpy.ops can be a false positive because operator access is dynamic.
+        # `dir()` reflects currently registered operators for that category.
+        return ops_cat is not None and opname in dir(ops_cat)
     except Exception:
         return False
 
@@ -488,9 +490,102 @@ class MAPGEO_OT_setup_mesh(bpy.types.Operator):
         self.report({'INFO'}, f"Applied mapgeo settings to {count} mesh objects")
         return {'FINISHED'}
 
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=420)
 
+class MAPGEO_OT_reverse_selected_faces(bpy.types.Operator):
+    """Reverse face orientation for selected mesh objects"""
+    bl_idname = "mapgeo.reverse_selected_faces"
+    bl_label = "Reverse Face Orientation"
+    bl_description = "Reverse all face winding/normals on selected mesh objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import bmesh
+
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH' and obj.data]
+        if not selected_meshes:
+            self.report({'ERROR'}, "Select at least one mesh object")
+            return {'CANCELLED'}
+
+        previous_mode = context.mode
+        if previous_mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+        reversed_count = 0
+        for obj in selected_meshes:
+            mesh = obj.data
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(mesh)
+                if not bm.faces:
+                    continue
+                bmesh.ops.reverse_faces(bm, faces=list(bm.faces))
+                bm.normal_update()
+                bm.to_mesh(mesh)
+                mesh.update()
+                reversed_count += 1
+            finally:
+                bm.free()
+
+        if previous_mode == 'EDIT_MESH' and context.active_object and context.active_object.type == 'MESH':
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+            except Exception:
+                pass
+
+        self.report({'INFO'}, f"Reversed face orientation on {reversed_count} mesh object(s)")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_enable_decal_transparency_overlap(bpy.types.Operator):
+    """Enable Transparency Overlap for materials that use decal shaders"""
+    bl_idname = "mapgeo.enable_decal_transparency_overlap"
+    bl_label = "Enable Decal Transparency Overlap"
+    bl_description = "Turns on Transparency Overlap for all materials whose shader path contains 'decal'"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @staticmethod
+    def _is_decal_material(mat) -> bool:
+        try:
+            techniques = json.loads(mat.get("techniques", "[]"))
+        except Exception:
+            return False
+
+        for tech in techniques:
+            for pass_data in tech.get("passes", []):
+                shader = str(pass_data.get("shader", "") or "").lower()
+                if "decal" in shader:
+                    return True
+        return False
+
+    def execute(self, context):
+        decal_count = 0
+        updated_count = 0
+        unsupported_count = 0
+        for mat in bpy.data.materials:
+            if not mat or not self._is_decal_material(mat):
+                continue
+
+            decal_count += 1
+            try:
+                if not bool(mat.use_transparency_overlap):
+                    mat.use_transparency_overlap = True
+                    updated_count += 1
+            except Exception:
+                unsupported_count += 1
+
+        if decal_count == 0:
+            self.report({'WARNING'}, "No materials with 'decal' shader found")
+            return {'CANCELLED'}
+
+        if unsupported_count == decal_count:
+            self.report({'WARNING'}, "Transparency Overlap is not available on this Blender build")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Enabled Transparency Overlap on {updated_count}/{decal_count} decal material(s)")
+        return {'FINISHED'}
 
 class VIEW3D_PT_mapgeo_panel(Panel):
     """Main Mapgeo Tools Panel"""
@@ -517,6 +612,8 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         col.operator("import_scene.mapgeo", text="Import Mapgeo", icon='IMPORT')
         col.operator("export_scene.mapgeo", text="Export Mapgeo", icon='EXPORT')
         col.operator("mapgeo.setup_mesh", text="Setup Wizard", icon='PREFERENCES')
+        if _operator_exists("mapgeo.reverse_selected_faces"):
+            col.operator("mapgeo.reverse_selected_faces", text="Reverse Faces", icon='MOD_NORMALEDIT')
         
         # Info section
         layout.separator()
@@ -697,7 +794,7 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         col.operator("mapgeo.toggle_bucket_grid_selectable", text="Toggle Selectable", icon='RESTRICT_SELECT_OFF')
         col.separator()
         col.operator("mapgeo.create_bucket_grid", text="Create Custom Bucket Grid", icon='ADD')
-        
+
         # Show bucket grid info
         bg_count = 0
         for col_item in bpy.data.collections:
@@ -706,43 +803,55 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
                 break
         if bg_count > 0:
             box.label(text=f"Grids in scene: {bg_count}", icon='INFO')
-        
-        # Point Light Section (Custom Feature)
-        layout.separator()
+
+
+class VIEW3D_PT_mapgeo_experimental_panel(Panel):
+    """Experimental / research features"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "Experimental"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 9
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+
         box = layout.box()
         box.label(text="Point Lights (Custom Feature)", icon='LIGHT_POINT')
-        
-        # Warning box
+
         warning_box = box.box()
         warning_box.alert = True
-        warning_box.label(text="⚠️ NOT used in official maps!", icon='ERROR')
+        warning_box.label(text="NOT used in official maps!", icon='ERROR')
         warning_box.label(text="For custom/modded maps only")
-        
-        # Info about new light manager
+
         info_box = box.box()
-        info_box.label(text="💡 Use Light Manager for full control", icon='INFO')
+        info_box.label(text="Use Light Manager for full control", icon='INFO')
         info_box.label(text="See panel below for all light types")
-        
+
         col = box.column(align=True)
         col.operator("mapgeo.add_point_light", text="Add Point Light to Selected", icon='LIGHT_POINT')
         col.operator("mapgeo.remove_point_light_from_selected", text="Remove from Selected", icon='X')
         col.separator()
         col.operator("mapgeo.export_point_lights", text="Export Lights to JSON", icon='EXPORT')
-        
-        # Show point light count
-        light_count = sum(1 for obj in context.scene.objects if obj.type == 'MESH' and obj.get("point_light_enabled", False))
+
+        light_count = sum(
+            1 for obj in context.scene.objects
+            if obj.type == 'MESH' and obj.get("point_light_enabled", False)
+        )
         if light_count > 0:
             box.label(text=f"Meshes with lights: {light_count}", icon='INFO')
-        
+
         box.label(text="Research: stationary_light field unused", icon='INFO')
 
 
 class VIEW3D_PT_mapgeo_import_panel(Panel):
-    """Import Settings Panel"""
+    """Import Map Settings Panel"""
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
-    bl_label = "Setup Map"
+    bl_label = "Import Map"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
     bl_order = 0
     bl_options = {'DEFAULT_CLOSED'}
@@ -804,6 +913,7 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
         col.label(text="Assets Folders:", icon='FILE_FOLDER')
         col.prop(settings, "assets_folder", text="Original (Riot)")
         col.prop(settings, "custom_assets_folder", text="Custom")
+        col.prop(settings, "texture_import_assets_path", text="Import To")
         
         # Priority toggle
         if settings.assets_folder and settings.custom_assets_folder:
@@ -823,6 +933,7 @@ class VIEW3D_PT_mapgeo_import_panel(Panel):
 
         col.separator()
         col.operator("mapgeo.import_materials_file", text="Import Materials File", icon='IMPORT')
+        col.operator("mapgeo.enable_decal_transparency_overlap", text="Enable Decal Transparency Overlap", icon='SHADING_RENDERED')
         
         if (settings.assets_folder or settings.custom_assets_folder) and settings.materials_file_path:
             box.label(text="✓ Materials enabled", icon='CHECKMARK')
@@ -1125,11 +1236,11 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
 
 
 class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
-    """LightGrid Panel for light baking"""
+    """Lighting & Baking Panel — LightGrid + Lightmap baking"""
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'LoL Mapgeo'
-    bl_label = "LightGrid"
+    bl_label = "Lighting & Baking"
     bl_idname = "VIEW3D_PT_mapgeo_lightgrid_panel"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
     bl_order = 3
@@ -2939,35 +3050,99 @@ class MAPGEO_OT_cleanup_unused_materials(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _ext_mesh_shader_items(self, context):
+    """Return shader template enum items at runtime."""
+    try:
+        from . import material_editor_ui
+        items = material_editor_ui._SHADER_TEMPLATE_ITEMS
+        return items if items else [("Shaders/StaticMesh/DefaultEnv_Flat", "DefaultEnv_Flat", "Default")]
+    except Exception:
+        return [("Shaders/StaticMesh/DefaultEnv_Flat", "DefaultEnv_Flat", "Default")]
+
+
 class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
-    """Import external mesh file (gltf/fbx/obj) without material setup"""
+    """Import external mesh file (gltf/fbx/obj) with automatic mesh and material setup"""
     bl_idname = "mapgeo.import_external_mesh"
     bl_label = "Import External Mesh"
-    bl_description = "Import mesh from gltf/fbx/obj file without material setup"
+    bl_description = "Import mesh from gltf/fbx/obj file with automatic mesh and material setup"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(default="*.gltf;*.glb;*.fbx;*.obj", options={'HIDDEN'})
-    
+
+    # Mesh settings
+    visibility_layer: bpy.props.IntProperty(
+        name="Visibility Layer",
+        default=255,
+        min=0, max=255,
+        description="Visibility layer bitmask (255 = all layers visible)",
+    )
+    quality: bpy.props.IntProperty(
+        name="Quality",
+        default=31,
+        min=0, max=255,
+        description="Quality bitmask (31 = all quality levels)",
+    )
+
+    # Material settings
+    create_material: bpy.props.BoolProperty(
+        name="Create League Material",
+        default=True,
+        description="Automatically create a League shader material from the selected template",
+    )
+    shader_template: bpy.props.EnumProperty(
+        name="Shader",
+        items=_ext_mesh_shader_items,
+        description="Shader template to base the new material on",
+    )
+    material_name: bpy.props.StringProperty(
+        name="Material Name",
+        default="Maps/KitPieces/Custom/Materials/Default/New_Material",
+        description="Full path-style name for the League material",
+    )
+
+    # Internal phase: FILE → show file browser; CONFIRM → show settings dialog
+    _dialog_phase: bpy.props.StringProperty(default='FILE', options={'HIDDEN', 'SKIP_SAVE'})
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Mesh Settings", icon='MESH_DATA')
+        box = layout.box()
+        col = box.column(align=True)
+        col.prop(self, "visibility_layer")
+        col.prop(self, "quality")
+
+        layout.separator()
+        layout.label(text="Material Setup", icon='MATERIAL')
+        box2 = layout.box()
+        box2.prop(self, "create_material")
+        sub = box2.column(align=True)
+        sub.enabled = self.create_material
+        sub.prop(self, "shader_template")
+        sub.prop(self, "material_name", text="Name")
+
     def execute(self, context):
+        if self._dialog_phase == 'FILE':
+            # Phase 1: show settings dialog
+            self._dialog_phase = 'CONFIRM'
+            return context.window_manager.invoke_props_dialog(self, width=500)
+
+        # Phase 2: perform the import
         import_path = self.filepath
         file_ext = os.path.splitext(import_path)[1].lower()
-        
+
         # Find or create main mesh collection
         mesh_collection = None
         for col in bpy.data.collections:
             if "_Meshes" in col.name or "Meshes" in col.name:
                 mesh_collection = col
                 break
-        
         if not mesh_collection:
             mesh_collection = bpy.data.collections.new("Imported_Meshes")
             context.scene.collection.children.link(mesh_collection)
-        
-        # Store current objects to identify new ones
+
         existing_objects = set(bpy.data.objects)
-        
-        # Import based on file type
+
         try:
             if file_ext in ['.gltf', '.glb']:
                 bpy.ops.import_scene.gltf(filepath=import_path)
@@ -2977,38 +3152,59 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
                 bpy.ops.wm.obj_import(filepath=import_path)
             else:
                 self.report({'ERROR'}, f"Unsupported file format: {file_ext}")
+                self._dialog_phase = 'FILE'
                 return {'CANCELLED'}
         except Exception as e:
             self.report({'ERROR'}, f"Import failed: {e}")
+            self._dialog_phase = 'FILE'
             return {'CANCELLED'}
-        
-        # Find newly imported objects
+
         new_objects = set(bpy.data.objects) - existing_objects
         imported_count = 0
-        
+
+        # Create League material if requested
+        league_mat = None
+        if self.create_material:
+            try:
+                from . import material_editor_ui
+                mat_name = self.material_name.strip() or "Maps/KitPieces/Custom/Materials/Default/New_Material"
+                league_mat = bpy.data.materials.new(name=mat_name)
+                league_mat.use_nodes = True
+                material_editor_ui._apply_template_to_material(
+                    league_mat, self.shader_template, 10, True,
+                )
+                material_editor_ui._sync_material_preview_from_data(
+                    league_mat, 0, 0,
+                    *material_editor_ui._get_assets_folders_from_context(),
+                )
+            except Exception as e:
+                self.report({'WARNING'}, f"Material creation failed: {e}")
+                league_mat = None
+
         for obj in new_objects:
             if obj.type == 'MESH':
-                # Remove materials (no material setup)
                 obj.data.materials.clear()
-                
-                # Move to mesh collection
-                for col in obj.users_collection:
+                if league_mat:
+                    obj.data.materials.append(league_mat)
+
+                for col in list(obj.users_collection):
                     col.objects.unlink(obj)
                 mesh_collection.objects.link(obj)
-                
-                # Initialize mapgeo properties
-                obj["visibility_layer"] = 255  # All layers
-                obj["quality"] = 31  # All quality levels
+
+                obj["visibility_layer"] = self.visibility_layer
+                obj["quality"] = self.quality
                 obj["layer_transition_behavior"] = 0
                 obj["render_flags"] = 0
                 obj["disable_backface_culling"] = 0
-                
+
                 imported_count += 1
-        
+
+        self._dialog_phase = 'FILE'  # reset for next invocation
         self.report({'INFO'}, f"Imported {imported_count} mesh(es) from {os.path.basename(import_path)}")
         return {'FINISHED'}
-    
+
     def invoke(self, context, event):
+        self._dialog_phase = 'FILE'
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -3033,6 +3229,30 @@ def _build_particle_snippet(entry_hash, entry_kind, location, scale, system_link
     )
 
 
+class MAPGEO_OT_particle_select_all_vfx(bpy.types.Operator):
+    """Select all VFX definitions for import"""
+    bl_idname = "mapgeo.particle_select_all_vfx"
+    bl_label = "Select All VFX"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        for item in context.scene.mapgeo_particle_vfx_items:
+            item.selected = True
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_particle_select_none_vfx(bpy.types.Operator):
+    """Deselect all VFX definitions"""
+    bl_idname = "mapgeo.particle_select_none_vfx"
+    bl_label = "Select None"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        for item in context.scene.mapgeo_particle_vfx_items:
+            item.selected = False
+        return {'FINISHED'}
+
+
 class MAPGEO_OT_import_particles_map(bpy.types.Operator):
     """Import VFX definitions + MapParticle entries from a materials file"""
     bl_idname = "mapgeo.import_particles_map"
@@ -3046,27 +3266,83 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
         name="Preview Size",
         default=0.5,
         min=0.01,
-        description="Size of imported particle preview cubes"
+        description="Size of imported particle preview cubes",
     )
+    import_map_particles: bpy.props.BoolProperty(
+        name="Import MapParticle Entries",
+        default=True,
+        description="Import placed MapParticle / container items in addition to VFX definitions",
+    )
+    # Internal phase tracker — 'SCAN' on first execute, 'CONFIRM' after dialog
+    _dialog_phase: bpy.props.StringProperty(default='SCAN', options={'HIDDEN', 'SKIP_SAVE'})
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "cube_size")
+        layout.prop(self, "import_map_particles")
+        layout.separator()
+        layout.label(text="VFX Definitions to Import:", icon='PARTICLES')
+        items = getattr(context.scene, "mapgeo_particle_vfx_items", None)
+        if items:
+            box = layout.box()
+            col = box.column(align=True)
+            for item in items:
+                col.prop(item, "selected", text=item.name or "(unnamed)")
+            row = layout.row(align=True)
+            row.operator("mapgeo.particle_select_all_vfx", text="Select All", icon='CHECKBOX_HLT')
+            row.operator("mapgeo.particle_select_none_vfx", text="Select None", icon='CHECKBOX_DEHLT')
+        else:
+            layout.label(text="(no VFX definitions found in file)", icon='INFO')
 
     def execute(self, context):
-        if not self.filepath or not os.path.exists(self.filepath):
-            self.report({'ERROR'}, "Select a valid materials file (.py or .bin)")
-            return {'CANCELLED'}
+        if self._dialog_phase == 'SCAN':
+            # Phase 1: parse file, populate VFX list, show selection dialog
+            if not self.filepath or not os.path.exists(self.filepath):
+                self.report({'ERROR'}, "Select a valid materials file (.materials.bin)")
+                return {'CANCELLED'}
 
-        imported_count = particles_materials.import_particles_from_materials(
-            context,
-            self.filepath,
-            cube_size=self.cube_size,
-        )
-        if not imported_count:
-            self.report({'WARNING'}, "No VFX or MapParticle entries found")
-            return {'CANCELLED'}
+            parsed = particles_materials.parse_materials_full(self.filepath)
 
-        self.report({'INFO'}, f"Imported {imported_count} particle object(s) from {os.path.basename(self.filepath)}")
-        return {'FINISHED'}
+            items = context.scene.mapgeo_particle_vfx_items
+            items.clear()
+            for vfx_def in parsed.get('vfx_definitions', []):
+                name = vfx_def.get('name', '')
+                if name:
+                    item = items.add()
+                    item.name = name
+                    item.selected = True
+
+            self._dialog_phase = 'CONFIRM'
+            return context.window_manager.invoke_props_dialog(self, width=560)
+
+        else:
+            # Phase 2: import using the checked selection
+            if not self.filepath or not os.path.exists(self.filepath):
+                self.report({'ERROR'}, "Materials file not found")
+                return {'CANCELLED'}
+
+            items = context.scene.mapgeo_particle_vfx_items
+            vfx_filter = {item.name for item in items if item.selected} if items else None
+
+            imported_count = particles_materials.import_particles_from_materials(
+                context,
+                self.filepath,
+                cube_size=self.cube_size,
+                vfx_filter=vfx_filter,
+                import_map_particles=self.import_map_particles,
+            )
+
+            self._dialog_phase = 'SCAN'  # reset for next use
+
+            if not imported_count:
+                self.report({'WARNING'}, "No VFX or MapParticle entries found / selected")
+                return {'CANCELLED'}
+
+            self.report({'INFO'}, f"Imported {imported_count} particle object(s) from {os.path.basename(self.filepath)}")
+            return {'FINISHED'}
 
     def invoke(self, context, event):
+        self._dialog_phase = 'SCAN'
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -4252,14 +4528,26 @@ class VIEW3D_PT_mapgeo_debug_panel(Panel):
                 box.label(text=f"... and {len(issues) - 30} more", icon='THREE_DOTS')
 
 
+class MAPGEO_ParticleVfxItem(bpy.types.PropertyGroup):
+    """One VFX definition entry for the particle import selection dialog."""
+    name: bpy.props.StringProperty(name="VFX Name")
+    selected: bpy.props.BoolProperty(name="Import", default=True)
+
+
 classes = (
+    MAPGEO_ParticleVfxItem,
+    MAPGEO_OT_particle_select_all_vfx,
+    MAPGEO_OT_particle_select_none_vfx,
+    MAPGEO_OT_setup_mesh,
+    MAPGEO_OT_reverse_selected_faces,
+    MAPGEO_OT_enable_decal_transparency_overlap,
     VIEW3D_PT_mapgeo_panel,
     VIEW3D_PT_mapgeo_layers_panel,
+    VIEW3D_PT_mapgeo_experimental_panel,
     VIEW3D_PT_mapgeo_import_panel,
     VIEW3D_PT_mapgeo_export_panel,
     VIEW3D_PT_mapgeo_properties_panel,
     VIEW3D_PT_mapgeo_utilities_panel,
-    MAPGEO_OT_setup_mesh,
     MAPGEO_OT_initialize_custom_mesh,
     MAPGEO_OT_assign_layer,
     MAPGEO_OT_set_quality,
@@ -4306,8 +4594,13 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.mapgeo_particle_vfx_items = bpy.props.CollectionProperty(
+        type=MAPGEO_ParticleVfxItem,
+    )
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "mapgeo_particle_vfx_items"):
+        del bpy.types.Scene.mapgeo_particle_vfx_items
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

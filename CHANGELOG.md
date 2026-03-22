@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.3.2] - 2026-03-22
+
+### 🔧 Character Bin Updater (NEW)
+- **New League Tools panel** — Scan project folder for character `.bin` files and update them using CommunityDragon patch diffs
+- **Per-file selection** — Checkbox list of all `Map*/data/characters/**/*.bin` files found in the project
+- **Old/New patch channels** — Select source and target CDragon patch channels (e.g. `16.3` → `latest`)
+- **Diff-based patching** — Downloads old and new versions from CDragon, computes diff, applies only changed entries
+- **Automatic backups** — Creates timestamped `.bak_YYYYMMDD_HHMMSS` before overwriting
+- **Per-file status** — Each file reports `Updated`, `No changes`, or error after the update run
+
+### 🗺️ Map Patcher
+- **Map Patcher panel** — Swap MapSkin fields in `.bin` files to activate particles, grass tint, VFX, and sound banks between patch versions
+- **CommunityDragon diff** — Downloads old/new patch bins from CDragon, generates structural diff, applies cleanly to local file
+
+### 🎨 UI Overhaul
+- **League Tools panels** — All panels collapsed by default (`DEFAULT_CLOSED`) with consistent ordering: WAD Tool → PropertyBin → CfgBin → SKN/SKL → SCO/SCB → TroyBin → Legacy Materials → Map Porter → Map Patcher → Character Bin Updater
+- **"Setup Map" renamed** to **"Import Map"**
+- **"LightGrid" renamed** to **"Lighting & Baking"**
+- **Particle VFX import dialog** — Per-VFX-definition checkboxes + `Import Map Particles` toggle before importing
+- **Import Mesh dialog** — Choose shader template, visibility layer, quality, and material name before importing external meshes
+- **Material create dialog** — Default material name pre-filled; dialog always opens for editing before creation
+- **Legacy Map cleanup** — Removed HLSL Root field and Shader Coverage box from Legacy Map panel
+
+### 🧪 Experimental Panel
+- **Point Lights operators** moved from Layer Management to a new **Experimental** panel with a warning box
+
+---
+
 ## [0.3.1] - 2026-03-14
 
 ### 🗂️ Project Manager (NEW)

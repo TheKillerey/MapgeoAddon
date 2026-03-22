@@ -3932,6 +3932,8 @@ class VIEW3D_PT_league_tools_legacy_materials(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'League Tools'
+    bl_order = 70
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout

@@ -869,18 +869,6 @@ class VIEW3D_PT_mapgeo_legacy_panel(bpy.types.Panel):
         box.label(text="Legacy Source", icon='FILE_FOLDER')
         col = box.column(align=True)
         col.prop(settings, "legacy_map_folder", text="LEVELS/Map Folder")
-        col.prop(settings, "legacy_shader_hlsl_folder", text="HLSL Root")
-
-        shader_box = layout.box()
-        shader_box.label(text="Legacy Shader Coverage", icon='SHADING_RENDERED')
-        hlsl_root = Path(settings.legacy_shader_hlsl_folder) if settings.legacy_shader_hlsl_folder else None
-        if hlsl_root and hlsl_root.exists():
-            hb = hlsl_root / "HeightBlending"
-            env = hlsl_root / "Environment"
-            shader_box.label(text=f"HeightBlending: {'found' if hb.exists() else 'missing'}", icon='CHECKMARK' if hb.exists() else 'ERROR')
-            shader_box.label(text=f"Environment: {'found' if env.exists() else 'missing'}", icon='CHECKMARK' if env.exists() else 'ERROR')
-        else:
-            shader_box.label(text="Set HLSL root folder", icon='INFO')
 
         options_box = layout.box()
         options_box.label(text="Import Options", icon='PREFERENCES')

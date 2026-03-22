@@ -986,6 +986,8 @@ class VIEW3D_PT_sco_scb_panel(Panel):
     bl_category = 'League Tools'
     bl_label = "SCO/SCB Mesh Tools"
     bl_idname = "VIEW3D_PT_sco_scb_panel"
+    bl_order = 50
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
