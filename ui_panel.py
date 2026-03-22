@@ -600,7 +600,13 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         settings = context.scene.mapgeo_settings
         
         # Version info
-        addon_version = "0.3.1"
+        import addon_utils
+        addon_version = next(
+            (".".join(str(v) for v in mod.bl_info["version"])
+             for mod in addon_utils.modules()
+             if mod.bl_info.get("name") == "Rey's Mapgeo Blender Addon"),
+            "0.3.2"
+        )
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
         
