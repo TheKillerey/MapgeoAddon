@@ -2,7 +2,7 @@
 
 [![Blender](https://img.shields.io/badge/Blender-5.0%2B-orange.svg)](https://www.blender.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.3.2-blue)
+![Version](https://img.shields.io/badge/version-0.3.3-blue)
 
 Import, edit, and export League of Legends maps in Blender, including map geometry, materials, particles, and map objects.
 

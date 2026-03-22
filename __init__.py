@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 3, 2),
+    "version": (0, 3, 3),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -50,6 +50,7 @@ from . import (
     map_porter,
     map_patcher,
     character_bin_updater,
+    project_checker,
     map_objects_import,
     utils,
 )
@@ -823,6 +824,12 @@ def register():
     except Exception as e:
         print(f"[Character Bin Updater] Registration failed: {e}")
 
+    # Register project integrity checker
+    try:
+        project_checker.register()
+    except Exception as e:
+        print(f"[Project Checker] Registration failed: {e}")
+
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -837,6 +844,11 @@ def unregister():
     except Exception as e:
         print(f"[Character Bin Updater] Unregister failed: {e}")
 
+    # Unregister project integrity checker
+    try:
+        project_checker.unregister()
+    except Exception as e:
+        print(f"[Project Checker] Unregister failed: {e}")
     # Unregister map patcher
     try:
         map_patcher.unregister()

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.3.3] - 2026-03-22
+
+### 🔍 Project Integrity Checker (NEW)
+- **New sub-panel** inside Project Manager — "Project Integrity" collapsible section
+- **Check Project button** — runs all checks with a single click, stores results on the scene
+- **Mapgeo → Materials** — verifies every mesh primitive material name resolves to a matching entry in materials.bin (FNV-1a hash lookup)
+- **Materials → Textures** — checks every sampler `texturePath` exists in the project `assets/` folder or Riot WAD cache
+- **Texture overrides (v17+)** — validates per-mesh texture override paths against the asset roots too
+- **Visibility controllers** — confirms every `visibility_controller_path_hash` (mesh & bucket grid, v15+) has a matching entry in materials.bin
+- **Custom bucket grid warning** — compares local bucket grid hashes against Riot base; flags custom grids with a known-issue warning
+- **Linked bin files** — checks all `linked_files` from the materials.bin header (including soundbanks `.bnk`/`.wpk`)
+- **VFX / MapParticle cross-links** — walks `MapPlaceableContainer` and `MapParticle` TYPE_LINK fields, flags dangling references
+- **Lightmap textures** — validates `baked_light` and `stationary_light` texture paths against project + LEVELS WAD cache
+- **Shipping map bin** — parses the map's shipping `.bin` and checks its `linked_files` too
+- **WAD hash resolution** — if WAD hash tables are loaded, reports unresolvable TYPE_FILE (XXHash64) references
+- **Filter bar** — filter results by All / Errors / Warnings / Info
+- **Detail view** — select any issue to see its full detail and a "Show File" button to reveal the source file in Explorer
+- **Summary header** — panel header shows error/warning/OK icon at a glance
+
+---
+
 ## [0.3.2] - 2026-03-22
 
 ### 🔧 Character Bin Updater (NEW)
