@@ -4140,6 +4140,16 @@ class MATERIAL_PT_league_samplers(Panel):
                 header.operator("mapgeo.browse_sampler_texture", text="", icon='FILEBROWSER').sampler_index = i
                 header.operator("mapgeo.convert_sampler_dds_to_tex", text="", icon='FILE_REFRESH').sampler_index = i
                 header.operator("mapgeo.remove_sampler", text="", icon='TRASH').sampler_index = i
+
+                # Texture preview — look up the image from shader nodes
+                img = None
+                if mat.use_nodes and mat.node_tree:
+                    node = mat.node_tree.nodes.get(f"MAPGEO_SAMPLER_{i}")
+                    if node and hasattr(node, 'image') and node.image:
+                        img = node.image
+                if img:
+                    box.template_icon(icon_value=img.preview.icon_id, scale=5.0)
+
                 # Path
                 path = s.get("texturePath", "")
                 box.label(text=path if path else "(no path)", icon='FILE_IMAGE')

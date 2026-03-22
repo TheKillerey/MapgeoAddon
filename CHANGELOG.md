@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.3.4] - 2026-03-22
+
+### 🎨 Material Texture Previews
+- **Texture thumbnails in the Samplers panel** — Each sampler in the Material Properties now shows a visual preview of its loaded texture image directly in the UI (sourced from the shader node graph)
+
+### 🔧 Mapgeo Debug Tool (NEW)
+- **Export Mapgeo as JSON** operator — Converts any `.mapgeo` file to a human-readable `.mapgeo.json` for diffing and debugging
+- **Standalone CLI** — Also works outside Blender: `python mapgeo_debug.py original.mapgeo exported.mapgeo`
+- **Full bucket grid serialization** — Every field including vertices, indices, bucket data, face visibility flags, path hashes (hex), and v18 unknown floats (hex + float)
+- **Debug button** added to the Project Manager Export section
+
+---
+
 ## [0.3.3] - 2026-03-22
 
 ### 🔍 Project Integrity Checker (NEW)

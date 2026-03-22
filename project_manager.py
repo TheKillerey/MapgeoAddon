@@ -4670,6 +4670,13 @@ class VIEW3D_PT_project_manager(Panel):
             export_row.scale_y = 1.5
             export_row.operator("project.export_all", text="Export to Project", icon='EXPORT')
         
+        # ── Debug Tools ──
+        if settings.loaded_variant:
+            box = layout.box()
+            box.label(text="Debug", icon='CONSOLE')
+            box.operator("mapgeo.export_debug_json",
+                         text="Export Mapgeo as JSON", icon='FILE_TEXT')
+        
         # ── Status ──
         if settings.status_message:
             box = layout.box()
