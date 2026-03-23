@@ -69,8 +69,8 @@ Bucket grids subdivide map geometry for efficient spatial queries:
 
 ```
 BucketGrid {
-    path_hash: uint32              # Typically render_region hash
-    unknown_v18_float: float       # v18+ visibility_controller hash or baron hash
+    path_hash: uint32              # Baron/visibility_controller hash (or 0 for render regions)
+    unknown_v18_float: float       # Render region hash (or 0 for baron/VC grids)
     flags: uint32                  # Bit 1 = has face_visibility_flags
     buckets: 2D array              # Per-bucket vertex/index subsets
     face_visibility_flags: bytes   # Per-face visibility bitmask
@@ -83,8 +83,8 @@ The placement of hashes in `path_hash` vs `unknown_v18_float` depends on grid ty
 
 | Grid Type | path_hash | unknown_v18_float | flags |
 |-----------|-----------|------------------|-------|
-| Render Region | Region hash | 0 | Variable |
-| Baron/VC | 0 | Baron or VC hash | Variable |
+| Render Region | 0 | Region hash | Variable |
+| Baron/VC | Baron or VC hash | 0 | Variable |
 | Master | 0 | 0 | 1 (always has faces) |
 
 **Important:** The master grid must:
@@ -186,8 +186,8 @@ custom_grids["hash_type"] = "render_region"  # or "baron", "master"
 ```
 
 Supported `hash_type` values:
-- `"render_region"` — path_hash contains region hash, v18 = 0
-- `"baron"` — v18 contains baron/VC hash, path_hash = 0
+- `"render_region"` — unknown_v18_float contains region hash, path_hash = 0
+- `"baron"` — path_hash contains baron/VC hash, unknown_v18_float = 0
 - `"master"` — Both hashes 0, flags = 1, covers full map
 
 ---
@@ -243,8 +243,8 @@ When creating custom grids, meshes are grouped by hash type:
 
 | Group | Path Hash | V18 Float | Purpose |
 |-------|-----------|-----------|---------|
-| **render_region** | Region hash | 0 | Render culling by region |
-| **baron/visibility_controller** | 0 | Hash value | Visibility system control |
+| **render_region** | 0 | Region hash | Render culling by region |
+| **baron/visibility_controller** | Hash value | 0 | Visibility system control |
 | **base/master** | 0 | 0 | Coverage grid (all faces) |
 
 **Important:** Each group must have exactly one grid. The master grid must cover the entire map.
