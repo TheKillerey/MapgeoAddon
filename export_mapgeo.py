@@ -1213,6 +1213,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         scene_col_names = {c.name for c in self._get_all_collections(context)}
         for col in bpy.data.collections:
             if col.get("is_bucket_grid_collection") and col.get("bucket_data_json"):
+                # Skip custom bucket grid collections — those are handled by collect_custom_bucket_grids
+                if col.get("is_custom_bucket_grid"):
+                    continue
                 # Verify collection is actually linked to the scene (not orphaned)
                 if col.name in scene_col_names:
                     bucket_grid_collections.append(col)
@@ -1222,6 +1225,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             return
         
         total_grids = 0
+        seen_hashes = set()  # Track non-zero hashes to prevent duplicates
+        skipped = 0
         for col in bucket_grid_collections:
             try:
                 bucket_data_json = col.get("bucket_data_json", "[]")
@@ -1236,10 +1241,19 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             for grid_data in bucket_grids_data:
                 grid = self._reconstruct_grid_from_json(grid_data)
                 if grid is not None:
+                    # Deduplicate by non-zero path_hash
+                    if grid.path_hash != 0:
+                        if grid.path_hash in seen_hashes:
+                            print(f"  Skipping duplicate bucket grid (hash: {hex(grid.path_hash)})")
+                            skipped += 1
+                            continue
+                        seen_hashes.add(grid.path_hash)
                     mapgeo.bucket_grids.append(grid)
                     total_grids += 1
                     print(f"  Exported bucket grid (hash: {hex(grid.path_hash)})")
         
+        if skipped:
+            print(f"WARNING: Skipped {skipped} duplicate bucket grid(s)")
         print(f"Total bucket grids exported from scene: {total_grids}")
     
     def _get_all_collections(self, context):
@@ -1262,8 +1276,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         
         Custom grids are created by the "Create Custom Bucket Grid" operator
         which already sets the correct hash field placement:
-        - render_region hash → v18 field (path_hash=0)
-        - baron/visibility hash → path_hash field (v18=0)
+        - render_region hash → path_hash field (v18=0)
+        - baron/visibility hash → v18 field (path_hash=0)
         """
         scene_col_names = {c.name for c in self._get_all_collections(context)}
         
@@ -1277,37 +1291,41 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 try:
                     bucket_data_json = col.get("bucket_data_json", "[]")
                     grids_data = json.loads(bucket_data_json)
-                    
-                    # Detect render_region collections (hash_type property or _RR in name)
                     col_hash_type = col.get("hash_type", "")
-                    is_render_region_col = (col_hash_type == 'render_region' 
-                                            or '_RR' in col.name)
                     
                     for grid_data in grids_data:
                         grid = self._reconstruct_grid_from_json(grid_data)
                         if grid is None:
                             continue
-                        
-                        # Fix field placement for render_region grids.
-                        # Riot format: render_region hash → v18 field (path_hash=0).
-                        # Old custom grids may have stored the hash in path_hash instead.
-                        if is_render_region_col and grid.path_hash != 0 and grid.unknown_v18_float == 0.0:
-                            # Move hash from path_hash to v18
-                            grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
+
+                        # Normalize hash field placement based on collection type.
+                        # This protects export correctness even if legacy/stale custom
+                        # collections have path_hash/v18 swapped in stored JSON.
+                        v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
+                        if col_hash_type == 'render_region':
+                            if grid.path_hash == 0 and v18_uint != 0:
+                                grid.path_hash = v18_uint
+                                grid.unknown_v18_float = 0.0
+                                v18_uint = 0
+                        elif col_hash_type == 'baron':
+                            if grid.path_hash != 0 and v18_uint == 0:
+                                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
+                                grid.path_hash = 0
+                                v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
+                        elif col_hash_type == 'master':
                             grid.path_hash = 0
+                            grid.unknown_v18_float = 0.0
+                            v18_uint = 0
                         
                         # Determine identifier: path_hash if non-zero, else v18
                         cid = grid.path_hash
                         if cid == 0:
-                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
-                            cid_v18 = struct.unpack('<I', v18_bytes)[0]
+                            cid_v18 = v18_uint
                             if cid_v18 != 0:
                                 cid = cid_v18
                         
                         custom_grids.append((cid, grid))
-                        
-                        v18_bytes = struct.pack('<f', grid.unknown_v18_float)
-                        v18_uint = struct.unpack('<I', v18_bytes)[0]
+
                         print(f"  Custom grid: hash={cid:08X} "
                               f"(path_hash={grid.path_hash:08X} v18={v18_uint:08X}) "
                               f"flags={grid.flags} bps={grid.buckets_per_side} "
@@ -1319,12 +1337,26 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             # Ensure a valid master grid exists.
             # League expects one grid with path_hash=0 and v18=0 that has
             # flags bit 0 set and face_visibility_flags for every face.
+            # Pick the zero-zero grid with the LARGEST bounds area as master,
+            # since multiple visibility_layer groups can produce zero-zero grids.
             master_grid = None
+            zero_zero_ids = set()  # Track all zero-zero grid ids to skip extras
+            master_candidates = []
             for cid, cgrid in custom_grids:
                 v18_uint = struct.unpack('<I', struct.pack('<f', cgrid.unknown_v18_float))[0]
                 if cgrid.path_hash == 0 and v18_uint == 0:
-                    master_grid = cgrid
-                    break
+                    bounds_area = (cgrid.max_x - cgrid.min_x) * (cgrid.max_z - cgrid.min_z)
+                    master_candidates.append((bounds_area, id(cgrid), cgrid))
+                    zero_zero_ids.add(id(cgrid))
+            
+            if master_candidates:
+                # Sort by bounds area descending, pick largest
+                master_candidates.sort(key=lambda x: x[0], reverse=True)
+                _, _, master_grid = master_candidates[0]
+                zero_zero_ids.discard(id(master_grid))  # Don't skip the chosen master
+                if len(master_candidates) > 1:
+                    print(f"  Found {len(master_candidates)} zero-zero grids, "
+                          f"picked largest (area={master_candidates[0][0]:.0f}) as master")
 
             if master_grid is None and custom_grids:
                 # No explicit zero-id grid: synthesize master from largest custom grid
@@ -1367,7 +1399,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             # Export custom grids directly — they contain your scene's geometry.
             # Keep master grid first for Riot-style ordering.
             exported_count = 0
-            exported_ids = set()
+            exported_ids = set()   # Python object identity (prevent same object twice)
+            seen_cids = set()     # Hash-based dedup (prevent duplicate identifiers)
+            skipped_dupes = 0
             if master_grid is not None:
                 mapgeo.bucket_grids.append(master_grid)
                 exported_ids.add(id(master_grid))
@@ -1376,9 +1410,26 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             for cid, cgrid in custom_grids:
                 if id(cgrid) in exported_ids:
                     continue
+                # Skip duplicate zero-zero grids (only master should have path_hash=0/v18=0)
+                if id(cgrid) in zero_zero_ids:
+                    print(f"  Skipping non-master zero-zero grid "
+                          f"(bounds={cgrid.min_x:.0f},{cgrid.min_z:.0f}-{cgrid.max_x:.0f},{cgrid.max_z:.0f})")
+                    skipped_dupes += 1
+                    continue
+                # Deduplicate by identifier (non-zero hashes only)
+                if cid != 0 and cid in seen_cids:
+                    v18_uint = struct.unpack('<I', struct.pack('<f', cgrid.unknown_v18_float))[0]
+                    print(f"  Skipping duplicate bucket grid (id={cid:#010x}, "
+                          f"path_hash={cgrid.path_hash:#010x}, v18={v18_uint:#010x})")
+                    skipped_dupes += 1
+                    continue
+                if cid != 0:
+                    seen_cids.add(cid)
                 mapgeo.bucket_grids.append(cgrid)
                 exported_count += 1
             
+            if skipped_dupes:
+                print(f"WARNING: Skipped {skipped_dupes} duplicate bucket grid(s)")
             print(f"Total bucket grids exported: {exported_count} (custom)")
             return
         
@@ -1409,9 +1460,17 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     print(f"  ERROR parsing imported bucket_data_json: {e}")
         
         if imported_grids:
+            seen_hashes = set()
+            deduped_count = 0
             for grid in imported_grids:
+                if grid.path_hash != 0:
+                    if grid.path_hash in seen_hashes:
+                        print(f"  Skipping duplicate imported grid (hash: {hex(grid.path_hash)})")
+                        continue
+                    seen_hashes.add(grid.path_hash)
                 mapgeo.bucket_grids.append(grid)
-            print(f"Total bucket grids exported: {len(imported_grids)} (imported fallback)")
+                deduped_count += 1
+            print(f"Total bucket grids exported: {deduped_count} (imported fallback)")
         else:
             print("WARNING: No bucket grids found (no custom or imported grids)")
     

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.0] - 2026-03-23
+
+### ✨ Custom Bucket Grid Creation & Export (FULL RELEASE)
+- **Create Custom Bucket Grid operator** — Enable custom map geometry optimization by subdividing meshes into bucket grids directly in Blender
+- **Multi-hash type support** — Organize grids by render_region hashes, baron/visibility_controller hashes, or master (coverage) grids
+- **Proper hash field placement** — Automatically normalize hash placement (render_region → path_hash, baron/VC → unknown_v18_float)
+- **Master grid generation** — Auto-select largest bounds grid as master, with proper deduplication and coverage verification
+- **Bucket grid export** — Full integration with mapgeo export pipeline; custom grids exported alongside Riot base grids
+- **Metadata parity** — Custom bucket grid objects store bucket_count, path_hash, unknown_v18_float, flags, and face_visibility_flags_hex matching imported grids
+- **Export normalization** — Safeguard that auto-corrects any hash field inversions during export to ensure binary compatibility
+- **Verified crash-free** — Custom bucket grids now run in-game without engine crashes; full geometry validation
+
 ## [0.3.4] - 2026-03-22
 
 ### 🎨 Material Texture Previews

@@ -1925,7 +1925,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             
             baron_hash = obj.get("baron_hash", "")
             if baron_hash and baron_hash != "00000000":
-                # Baron visibility hash
+                # Baron/visibility controller hash → v18 field
                 try:
                     hash_val = int(baron_hash, 16)
                     objects_by_hash_type[('baron', hash_val)].append(obj)
@@ -1933,9 +1933,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 except ValueError:
                     pass
             
-            # Fall back to visibility_layer (dragon layers)
-            visibility_layer = obj.get("visibility_layer", 0)
-            objects_by_hash_type[('visibility_layer', visibility_layer)].append(obj)
+            # Base mesh (no render_region or baron hash) → master grid
+            objects_by_hash_type[('master', 0)].append(obj)
         
         if not objects_by_hash_type:
             self.report({'WARNING'}, "No valid mesh objects found to create bucket grid from")
@@ -1969,23 +1968,24 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
             
             # Determine path_hash/v18 and layer suffix based on hash type
-            # Riot's format: render_region hash → grid.unknown_v18_float (path_hash=0)
-            #                baron/visibility hash → grid.path_hash (v18=0)
+            # Riot's format: render_region hash → path_hash (v18=0)
+            #                baron/visibility hash → v18 (path_hash=0)
             v18_hash = 0  # unknown_v18_float stored as uint32 bit pattern
-            if hash_type == 'render_region':
-                path_hash = 0  # render_region uses v18, NOT path_hash
-                v18_hash = hash_value
+            if hash_type == 'master':
+                path_hash = 0
+                v18_hash = 0
+                layer_suffix = "_Master"
+                visibility_layer = 0
+            elif hash_type == 'render_region':
+                path_hash = hash_value  # render_region uses path_hash
+                v18_hash = 0
                 layer_suffix = f"_RR{hash_value:08X}"
                 visibility_layer = 0  # Render regions don't use dragon layers
             elif hash_type == 'baron':
-                path_hash = hash_value
-                layer_suffix = f"_Baron{path_hash:08X}"
-                visibility_layer = 0  # Baron uses its own hash system
-            else:  # visibility_layer (dragon layers)
-                visibility_layer = hash_value
-                # Try to get path_hash from layer_to_hash mapping
-                path_hash = layer_to_hash.get(visibility_layer, 0)
-                layer_suffix = f"_L{visibility_layer}"
+                path_hash = 0
+                v18_hash = hash_value  # baron/visibility controller uses v18
+                layer_suffix = f"_VC{hash_value:08X}"
+                visibility_layer = 0
             
             # Height range clamp
             z_min = min(self.height_min, self.height_max)
@@ -2263,13 +2263,13 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             bg_collection["visibility_layer"] = visibility_layer
             bg_collection["hash_type"] = hash_type  # Store hash type for reference
             
-            # Use identifiers determined earlier (from render_region, baron, or visibility_layer mapping)
-            # For display: use whichever is non-zero (path_hash or v18_hash)
+            # Use identifiers determined earlier (from render_region, baron, or master)
+            # Display hash is whichever is non-zero, for naming purposes only
             display_hash = path_hash if path_hash != 0 else v18_hash
-            path_hash_str = f"{display_hash:08X}"
+            display_hash_str = f"{display_hash:08X}"
             
             # Create bucket grid object with proper naming (matches import structure)
-            grid_name = f"BucketGrid_{path_hash_str}"
+            grid_name = f"BucketGrid_{display_hash_str}"
             grid_obj = bpy.data.objects.new(grid_name, grid_mesh)
             bg_collection.objects.link(grid_obj)
             
@@ -2312,9 +2312,13 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             grid_obj["visibility_layer"] = visibility_layer
             grid_obj["stickout_x"] = global_max_stickout_x
             grid_obj["stickout_z"] = global_max_stickout_z
+            bucket_count = sum(len(row) for row in bucket_data) if bucket_data else 0
+            grid_obj["bucket_count"] = bucket_count
             
-            # Store path_hash (already determined above based on hash_type)
-            grid_obj["path_hash"] = path_hash_str
+            # Store path_hash and unknown_v18_float matching import format
+            grid_obj["path_hash"] = f"{path_hash:08X}"
+            grid_obj["unknown_v18_float"] = f"{v18_hash:08X}"
+            grid_obj["flags"] = 1 if hash_type == 'master' else 0
             
             # Store detailed bucket grid data as JSON on the collection level (matches import structure)
             # This includes full vertex/index data for round-trip export
@@ -2329,13 +2333,13 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 'bucket_size_z': bucket_size_z,
                 'buckets_per_side': buckets_per_side,
                 'is_disabled': False,
-                'flags': 0,
+                'flags': 1 if hash_type == 'master' else 0,
                 'unknown_v18_float': f"{v18_hash:08X}",  # Stored as hex string
                 'max_stickout_x': global_max_stickout_x,
                 'max_stickout_z': global_max_stickout_z,
                 'vertices': [(v.x, v.z, v.y) for v in final_vertices],  # Blender→mapgeo coord swap
                 'indices': final_indices,  # Local indices (relative to per-bucket base_vertex)
-                'face_visibility_flags': [],
+                'face_visibility_flags': [255] * (len(final_indices) // 3) if hash_type == 'master' else [],
                 'buckets': []
             }
             
@@ -2353,6 +2357,10 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                         'sticking_out_face_count': bucket['sticking_out_face_count']
                     })
                 bucket_grid_data['buckets'].append(row)
+
+            # Keep custom metadata parity with imported bucket grid objects.
+            if bucket_grid_data['face_visibility_flags']:
+                grid_obj["face_visibility_flags_hex"] = bytes(bucket_grid_data['face_visibility_flags']).hex()
             
             # Store on collection level for export (matches imported bucket grid format)
             import json
@@ -2438,12 +2446,12 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             hash_type_counts[hash_type] += 1
         
         report_parts = []
+        if hash_type_counts['master'] > 0:
+            report_parts.append("1 master")
         if hash_type_counts['render_region'] > 0:
             report_parts.append(f"{hash_type_counts['render_region']} render region")
         if hash_type_counts['baron'] > 0:
-            report_parts.append(f"{hash_type_counts['baron']} baron")
-        if hash_type_counts['visibility_layer'] > 0:
-            report_parts.append(f"{hash_type_counts['visibility_layer']} dragon layer")
+            report_parts.append(f"{hash_type_counts['baron']} visibility controller")
         
         self.report({'INFO'}, 
             f"✓ Created {total_grids_created} custom bucket grid(s): "

@@ -1495,6 +1495,16 @@ class ProjectSettings(PropertyGroup):
         min=13,
         max=18,
     )
+    bucket_grid_mode: EnumProperty(
+        name="Bucket Grid",
+        description="Which bucket grid to include in export",
+        items=[
+            ('NONE', "None", "Do not export bucket grids"),
+            ('ORIGINAL', "Original", "Use Riot's original imported bucket grids"),
+            ('CUSTOM', "Custom", "Use custom-created bucket grids from the scene"),
+        ],
+        default='ORIGINAL',
+    )
 
 
 # ============================================================================
@@ -3450,7 +3460,7 @@ class PROJECT_OT_export_mapgeo(Operator):
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         try:
-            bpy.ops.export_scene.mapgeo('EXEC_DEFAULT', filepath=output_path, export_version=settings.export_version, bucket_grid_mode='ORIGINAL')
+            bpy.ops.export_scene.mapgeo('EXEC_DEFAULT', filepath=output_path, export_version=settings.export_version, bucket_grid_mode=settings.bucket_grid_mode)
         except Exception as e:
             self.report({'ERROR'}, f"Mapgeo export failed: {e}")
             return {'CANCELLED'}
@@ -4629,6 +4639,7 @@ class VIEW3D_PT_project_manager(Panel):
             row.prop(settings, "export_materials", toggle=True, icon='MATERIAL')
             
             col.prop(settings, "export_version", text="Mapgeo Version")
+            col.prop(settings, "bucket_grid_mode", text="Bucket Grid")
             
             # Show target paths
             detail = box.column(align=True)

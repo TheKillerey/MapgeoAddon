@@ -52,7 +52,12 @@ def _mapgeo_to_dict(filepath: str) -> dict:
         return {"byte_count": len(vb.data)}
 
     def _ib(ib):
-        return {"index_count": len(ib.indices), "first_10": ib.indices[:10]}
+        import struct
+        fmt_char = 'H' if ib.format == 0 else 'I'
+        fmt_size = 2 if ib.format == 0 else 4
+        count = len(ib.data) // fmt_size
+        indices = list(struct.unpack(f'<{count}{fmt_char}', ib.data[:count * fmt_size]))
+        return {"index_count": count, "first_10": indices[:10]}
 
     def _mesh(m):
         d = {
@@ -193,15 +198,26 @@ try:
         filter_glob: StringProperty(default="*.mapgeo", options={'HIDDEN'})
 
         def invoke(self, context, event):
+            # If no filepath set yet, try to pre-fill from loaded project
+            if not self.filepath:
+                settings = getattr(context.scene, 'project_settings', None)
+                if settings and settings.loaded_mapgeo_path:
+                    self.filepath = bpy.path.abspath(settings.loaded_mapgeo_path)
             context.window_manager.fileselect_add(self)
             return {'RUNNING_MODAL'}
 
         def execute(self, context):
-            if not self.filepath or not os.path.isfile(self.filepath):
+            path = self.filepath
+            # Fallback: use the loaded mapgeo from project settings
+            if not path or not os.path.isfile(path):
+                settings = getattr(context.scene, 'project_settings', None)
+                if settings and settings.loaded_mapgeo_path:
+                    path = bpy.path.abspath(settings.loaded_mapgeo_path)
+            if not path or not os.path.isfile(path):
                 self.report({'ERROR'}, "No valid .mapgeo file selected.")
                 return {'CANCELLED'}
             try:
-                out = mapgeo_to_json_file(self.filepath)
+                out = mapgeo_to_json_file(path)
                 self.report({'INFO'}, f"JSON written: {out}")
             except Exception as e:
                 self.report({'ERROR'}, f"Failed: {e}")
