@@ -1968,8 +1968,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
             
             # Determine path_hash/v18 and layer suffix based on hash type
-            # Riot's format: render_region hash → path_hash (v18=0)
-            #                baron/visibility hash → v18 (path_hash=0)
+            # Correct format: render_region hash → unknown_v18_float (path_hash=0)
+            #                baron/visibility hash → path_hash (v18=0)
             v18_hash = 0  # unknown_v18_float stored as uint32 bit pattern
             if hash_type == 'master':
                 path_hash = 0
@@ -1977,13 +1977,13 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 layer_suffix = "_Master"
                 visibility_layer = 0
             elif hash_type == 'render_region':
-                path_hash = hash_value  # render_region uses path_hash
-                v18_hash = 0
+                path_hash = 0
+                v18_hash = hash_value  # render_region uses v18
                 layer_suffix = f"_RR{hash_value:08X}"
                 visibility_layer = 0  # Render regions don't use dragon layers
             elif hash_type == 'baron':
-                path_hash = 0
-                v18_hash = hash_value  # baron/visibility controller uses v18
+                path_hash = hash_value  # baron/visibility controller uses path_hash
+                v18_hash = 0
                 layer_suffix = f"_VC{hash_value:08X}"
                 visibility_layer = 0
             
