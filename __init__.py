@@ -689,6 +689,7 @@ classes = (
     ui_panel.MAPGEO_OT_show_all,
     ui_panel.MAPGEO_OT_show_not_used,
     ui_panel.MAPGEO_OT_toggle_bucket_grid_selectable,
+    ui_panel.MAPGEO_OT_clear_all_bucket_grids,
     ui_panel.MAPGEO_OT_create_bucket_grid,
     ui_panel.MAPGEO_OT_add_point_light,
     ui_panel.MAPGEO_OT_remove_point_light_from_selected,
