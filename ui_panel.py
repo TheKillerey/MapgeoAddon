@@ -798,6 +798,7 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         col.prop(settings, "show_bucket_grid", text="Show Bucket Grid", toggle=True, icon='HIDE_OFF' if settings.show_bucket_grid else 'HIDE_ON')
         col.separator()
         col.operator("mapgeo.toggle_bucket_grid_selectable", text="Toggle Selectable", icon='RESTRICT_SELECT_OFF')
+        col.operator("mapgeo.clear_all_bucket_grids", text="Clean All Bucket Grids", icon='TRASH')
         col.separator()
         col.operator("mapgeo.create_bucket_grid", text="Create Custom Bucket Grid", icon='ADD')
 
@@ -1804,6 +1805,43 @@ class MAPGEO_OT_toggle_bucket_grid_selectable(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MAPGEO_OT_clear_all_bucket_grids(bpy.types.Operator):
+    """Remove all bucket grid collections and objects from the current scene"""
+    bl_idname = "mapgeo.clear_all_bucket_grids"
+    bl_label = "Clean All Bucket Grids"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        removed_collections = 0
+        removed_objects = 0
+
+        # Remove any collection marked as bucket grid collection (imported + custom)
+        to_remove = []
+        for col in bpy.data.collections:
+            if col.get("is_bucket_grid_collection"):
+                to_remove.append(col)
+
+        for col in to_remove:
+            for obj in list(col.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed_objects += 1
+            bpy.data.collections.remove(col)
+            removed_collections += 1
+
+        # Fallback cleanup for orphan bucket grid objects that may not be inside tagged collections
+        for obj in list(bpy.data.objects):
+            if obj.get("is_bucket_grid"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed_objects += 1
+
+        if removed_collections == 0 and removed_objects == 0:
+            self.report({'INFO'}, "No bucket grids found to clean")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Cleaned bucket grids: {removed_collections} collections, {removed_objects} objects")
+        return {'FINISHED'}
+
+
 class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
     """Create a custom bucket grid from the current mesh objects in the scene"""
     bl_idname = "mapgeo.create_bucket_grid"
@@ -1817,25 +1855,25 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
     height_min: bpy.props.FloatProperty(
         name="Min Height (Z)",
         description="Minimum height (Z coordinate) for bucket grid bounding box",
-        default=-10000.0
+        default=-120.0
     )
     
     height_max: bpy.props.FloatProperty(
         name="Max Height (Z)",
         description="Maximum height (Z coordinate) for bucket grid bounding box",
-        default=10000.0
+        default=5000.0
     )
 
     use_selected_only: bpy.props.BoolProperty(
         name="Use Selected Only",
         description="Only include currently selected mesh objects (falls back to all meshes if none selected)",
-        default=True
+        default=False
     )
 
     include_render_regions: bpy.props.BoolProperty(
         name="Include Render Regions",
         description="Include meshes with render_region_hash (unknown_version18_int) in bucket grid generation",
-        default=False
+        default=True
     )
     
     def invoke(self, context, event):
@@ -4573,6 +4611,7 @@ classes = (
     MAPGEO_OT_show_all,
     MAPGEO_OT_show_not_used,
     MAPGEO_OT_toggle_bucket_grid_selectable,
+    MAPGEO_OT_clear_all_bucket_grids,
     MAPGEO_OT_create_bucket_grid,
     MAPGEO_OT_add_point_light,
     MAPGEO_OT_remove_point_light_from_selected,
