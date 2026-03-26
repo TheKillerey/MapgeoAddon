@@ -664,6 +664,43 @@ class MapgeoSettings(PropertyGroup):
         update=update_bucket_grid_visibility
     )
 
+    # Addon update checker
+    enable_auto_update_check: BoolProperty(
+        name="Auto Update Check",
+        description="Automatically check GitHub releases on startup",
+        default=True
+    )
+
+    update_available: BoolProperty(
+        name="Update Available",
+        description="Internal flag set when a newer addon release is available",
+        default=False
+    )
+
+    update_latest_version: StringProperty(
+        name="Latest Version",
+        description="Latest version tag reported by GitHub",
+        default=""
+    )
+
+    update_release_url: StringProperty(
+        name="Release URL",
+        description="GitHub release URL for the latest version",
+        default=""
+    )
+
+    update_last_checked_utc: StringProperty(
+        name="Last Update Check",
+        description="UTC timestamp of the last update check",
+        default=""
+    )
+
+    update_status_message: StringProperty(
+        name="Update Status",
+        description="Human-readable status of last update check",
+        default="Not checked yet"
+    )
+
 # Classes to register
 classes = (
     MAPGEO_OT_clear_texture_cache,
@@ -674,6 +711,8 @@ classes = (
     ui_panel.MAPGEO_ParticleVfxItem,
     ui_panel.MAPGEO_OT_particle_select_all_vfx,
     ui_panel.MAPGEO_OT_particle_select_none_vfx,
+    ui_panel.MAPGEO_OT_check_addon_updates,
+    ui_panel.MAPGEO_OT_open_addon_release_page,
     ui_panel.MAPGEO_OT_setup_mesh,
     ui_panel.MAPGEO_OT_reverse_selected_faces,
     ui_panel.MAPGEO_OT_enable_decal_transparency_overlap,
@@ -838,6 +877,12 @@ def register():
     except Exception as e:
         print(f"[Mapgeo Debug] Registration failed: {e}")
 
+    # Schedule startup update check
+    try:
+        ui_panel.schedule_auto_update_check()
+    except Exception as e:
+        print(f"[Updater] Failed to schedule startup check: {e}")
+
     # Add menu entries
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
@@ -939,6 +984,11 @@ def unregister():
     # Remove menu entries
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+
+    try:
+        ui_panel.cancel_auto_update_check()
+    except Exception as e:
+        print(f"[Updater] Failed to cancel startup timer: {e}")
     
     # Unregister properties
     if hasattr(bpy.types.Scene, "mapgeo_particle_vfx_items"):

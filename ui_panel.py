@@ -8,10 +8,123 @@ import json
 import os
 import math
 import re
+import datetime
+import webbrowser
+import urllib.request
+import urllib.error
 from bpy.types import Panel, UIList
 
 from .texture_utils import TexConverter, resolve_texture_path
 from . import particles_materials
+
+
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/TheKillerey/MapgeoAddon/releases/latest"
+GITHUB_RELEASES_URL = "https://github.com/TheKillerey/MapgeoAddon/releases"
+
+
+def _parse_version_tag(tag: str):
+    if not tag:
+        return (0, 0, 0)
+    clean = tag.strip().lower().lstrip("v")
+    parts = clean.split(".")
+    vals = []
+    for p in parts[:3]:
+        m = re.match(r"^(\d+)", p)
+        vals.append(int(m.group(1)) if m else 0)
+    while len(vals) < 3:
+        vals.append(0)
+    return tuple(vals)
+
+
+def _current_addon_version_tuple():
+    try:
+        import addon_utils
+        for mod in addon_utils.modules():
+            if mod.bl_info.get("name") == "Rey's Mapgeo Blender Addon":
+                ver = mod.bl_info.get("version", (0, 0, 0))
+                return tuple(ver[:3])
+    except Exception:
+        pass
+    return (0, 0, 0)
+
+
+def _check_for_addon_updates(settings, force=False):
+    now = datetime.datetime.utcnow()
+    if not force and settings.update_last_checked_utc:
+        try:
+            prev = datetime.datetime.fromisoformat(settings.update_last_checked_utc)
+            if (now - prev).total_seconds() < 86400:
+                return settings.update_available
+        except Exception:
+            pass
+
+    req = urllib.request.Request(
+        GITHUB_LATEST_RELEASE_API,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "MapgeoAddon-Updater"
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        latest_tag = payload.get("tag_name", "")
+        latest_tuple = _parse_version_tag(latest_tag)
+        current_tuple = _current_addon_version_tuple()
+        is_new = latest_tuple > current_tuple
+
+        settings.update_latest_version = latest_tag or "unknown"
+        settings.update_release_url = payload.get("html_url") or GITHUB_RELEASES_URL
+        settings.update_available = bool(is_new)
+        settings.update_last_checked_utc = now.isoformat(timespec="seconds")
+
+        if is_new:
+            settings.update_status_message = (
+                f"Update available: {latest_tag} (current: {'.'.join(str(v) for v in current_tuple)})"
+            )
+        else:
+            settings.update_status_message = "Addon is up to date"
+        return bool(is_new)
+
+    except urllib.error.URLError as e:
+        settings.update_last_checked_utc = now.isoformat(timespec="seconds")
+        settings.update_status_message = f"Update check failed: {e.reason}"
+        return False
+    except Exception as e:
+        settings.update_last_checked_utc = now.isoformat(timespec="seconds")
+        settings.update_status_message = f"Update check failed: {e}"
+        return False
+
+
+def _auto_update_check_timer():
+    try:
+        scene = getattr(bpy.context, "scene", None)
+        if scene is None or not hasattr(scene, "mapgeo_settings"):
+            return 3.0
+        settings = scene.mapgeo_settings
+        if settings.enable_auto_update_check:
+            _check_for_addon_updates(settings, force=False)
+    except Exception:
+        pass
+    return None
+
+
+def schedule_auto_update_check():
+    try:
+        if not bpy.app.timers.is_registered(_auto_update_check_timer):
+            bpy.app.timers.register(_auto_update_check_timer, first_interval=3.0)
+    except Exception:
+        pass
+
+
+def cancel_auto_update_check():
+    try:
+        if bpy.app.timers.is_registered(_auto_update_check_timer):
+            bpy.app.timers.unregister(_auto_update_check_timer)
+    except Exception:
+        pass
 
 
 def _operator_exists(op_idname: str) -> bool:
@@ -609,6 +722,17 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         )
         layout.label(text=f"Version {addon_version}", icon='INFO')
         layout.separator()
+
+        # Addon updates
+        box = layout.box()
+        box.label(text="Addon Updates", icon='FILE_REFRESH')
+        box.prop(settings, "enable_auto_update_check", text="Auto Check on Startup")
+        row = box.row(align=True)
+        row.operator("mapgeo.check_addon_updates", text="Check for Updates", icon='VIEWZOOM')
+        row.operator("mapgeo.open_addon_release_page", text="Open Releases", icon='URL')
+        if settings.update_status_message:
+            status_icon = 'ERROR' if "failed" in settings.update_status_message.lower() else 'INFO'
+            box.label(text=settings.update_status_message, icon=status_icon)
         
         # Quick Actions
         box = layout.box()
@@ -1803,6 +1927,40 @@ class MAPGEO_OT_toggle_bucket_grid_selectable(bpy.types.Operator):
         status = "selectable" if new_state else "locked"
         self.report({'INFO'}, f"Bucket grid objects now {status} ({count} objects)")
         return {'FINISHED'}
+
+
+class MAPGEO_OT_check_addon_updates(bpy.types.Operator):
+    """Check GitHub for a newer addon release"""
+    bl_idname = "mapgeo.check_addon_updates"
+    bl_label = "Check Addon Updates"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        has_update = _check_for_addon_updates(settings, force=True)
+        if has_update:
+            self.report({'INFO'}, f"New version available: {settings.update_latest_version}")
+        else:
+            self.report({'INFO'}, settings.update_status_message or "No updates found")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_open_addon_release_page(bpy.types.Operator):
+    """Open the GitHub releases page in your browser"""
+    bl_idname = "mapgeo.open_addon_release_page"
+    bl_label = "Open Addon Release Page"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        url = settings.update_release_url or GITHUB_RELEASES_URL
+        try:
+            webbrowser.open(url)
+            self.report({'INFO'}, "Opened release page")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to open browser: {e}")
+            return {'CANCELLED'}
 
 
 class MAPGEO_OT_clear_all_bucket_grids(bpy.types.Operator):
@@ -4590,6 +4748,8 @@ classes = (
     MAPGEO_ParticleVfxItem,
     MAPGEO_OT_particle_select_all_vfx,
     MAPGEO_OT_particle_select_none_vfx,
+    MAPGEO_OT_check_addon_updates,
+    MAPGEO_OT_open_addon_release_page,
     MAPGEO_OT_setup_mesh,
     MAPGEO_OT_reverse_selected_faces,
     MAPGEO_OT_enable_decal_transparency_overlap,

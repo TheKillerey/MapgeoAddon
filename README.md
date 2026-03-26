@@ -53,6 +53,20 @@ Pillow is generally not required to install manually in current versions.
 5. Edit in scene.
 6. Export with Export to Project, or use .prey Save All workflow.
 
+## Auto Updater
+
+- The addon can check GitHub for new releases on startup.
+- You can disable this in the LoL Mapgeo panel under `Addon Updates` by unchecking `Auto Check on Startup`.
+- Manual checks are available with `Check for Updates`.
+
+## Release Automation
+
+Use the included release script to automate version bump, changelog update, tag, zip build, and GitHub release publish:
+
+```bash
+python release_addon.py --version 0.4.2 --notes "Bug fixes\nUI improvements"
+```
+
 ## Map Objects (GdsMapObject)
 
 GdsMapObject items are imported from MapPlaceableContainer entries in materials data.
