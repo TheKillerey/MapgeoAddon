@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.1] - 2026-03-26
+
+### 🧩 Bucket Grid Workflow Fixes
+- **New Clean All Bucket Grids button** in the Bucket Grid panel for quick cleanup of imported/custom bucket grid collections and objects
+- **Create Custom Bucket Grid defaults updated**:
+  - Height Range Z Min: `-120`
+  - Height Range Z Max: `5000`
+  - Use Selected Only: `Off`
+  - Include Render Regions: `On`
+- **Operator registration fix** for `mapgeo.clear_all_bucket_grids` to resolve Blender warning `unknown operator 'mapgeo.clear_all_bucket_grids'`
+
+### 🔧 Hash Placement Correction
+- Corrected custom bucket grid hash placement logic and export normalization:
+  - Render region grids use `unknown_v18_float`
+  - Baron/visibility-controller grids use `path_hash`
+- Updated developer documentation and wiki pages with expanded feature explanations and practical examples
+
 ## [0.4.0] - 2026-03-23
 
 ### ✨ Custom Bucket Grid Creation & Export (FULL RELEASE)
