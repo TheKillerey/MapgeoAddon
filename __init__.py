@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 4, 1),
+    "version": (0, 4, 2),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -338,6 +338,23 @@ class MapgeoLayerItem(PropertyGroup):
         max=255
     )
 
+def _baron_editor_name_update(self, context):
+    """Auto-compute FNV-1a hash when baron editor name changes"""
+    name = self.baron_editor_name
+    if name:
+        h = 0x811c9dc5
+        for c in name.lower():
+            h ^= ord(c)
+            h = (h * 0x01000193) & 0xFFFFFFFF
+        # Avoid recursion — only set if different
+        computed = f"{h:08X}"
+        if self.get("baron_editor_computed_hash", "") != computed:
+            self["baron_editor_computed_hash"] = computed
+    else:
+        if self.get("baron_editor_computed_hash", "") != "":
+            self["baron_editor_computed_hash"] = ""
+
+
 class MapgeoSettings(PropertyGroup):
     """Main settings for mapgeo addon"""
     
@@ -648,6 +665,48 @@ class MapgeoSettings(PropertyGroup):
         update=update_environment_visibility
     )
     
+    # ── Baron Hash Editor ──
+    baron_editor_hash: StringProperty(
+        name="Hash",
+        description="Baron hash hex value (8 characters, no 0x prefix)",
+        default="",
+        maxlen=8
+    )
+    baron_editor_name: StringProperty(
+        name="Name / Path",
+        description="Enter a controller path name to auto-compute its FNV-1a hash",
+        default="",
+        update=_baron_editor_name_update
+    )
+    baron_editor_computed_hash: StringProperty(
+        name="Computed Hash",
+        description="Auto-computed FNV-1a hash from the name above",
+        default=""
+    )
+    baron_editor_parent_mode: EnumProperty(
+        name="Parent Mode",
+        description="Visibility logic: Visible = show on listed layers, Not Visible = hide on listed layers",
+        items=[
+            ('1', "Visible", "Mesh is visible on the checked layers"),
+            ('3', "Not Visible", "Mesh is hidden on the checked layers"),
+        ],
+        default='1'
+    )
+    # Baron pit layers
+    baron_editor_base: BoolProperty(name="Base", description="Baron Base state (bit 1)", default=False)
+    baron_editor_cup: BoolProperty(name="Cup", description="Baron Cup state (bit 2)", default=False)
+    baron_editor_tunnel: BoolProperty(name="Tunnel", description="Baron Tunnel state (bit 4)", default=False)
+    baron_editor_upgraded: BoolProperty(name="Upgraded", description="Baron Upgraded state (bit 8)", default=False)
+    # Dragon layers
+    baron_editor_dragon_base: BoolProperty(name="Base", description="Dragon Base layer (bit 1)", default=False)
+    baron_editor_dragon_inferno: BoolProperty(name="Inferno", description="Dragon Inferno layer (bit 2)", default=False)
+    baron_editor_dragon_mountain: BoolProperty(name="Mountain", description="Dragon Mountain layer (bit 4)", default=False)
+    baron_editor_dragon_ocean: BoolProperty(name="Ocean", description="Dragon Ocean layer (bit 8)", default=False)
+    baron_editor_dragon_cloud: BoolProperty(name="Cloud", description="Dragon Cloud layer (bit 16)", default=False)
+    baron_editor_dragon_hextech: BoolProperty(name="Hextech", description="Dragon Hextech layer (bit 32)", default=False)
+    baron_editor_dragon_chemtech: BoolProperty(name="Chemtech", description="Dragon Chemtech layer (bit 64)", default=False)
+    baron_editor_dragon_void: BoolProperty(name="Void", description="Dragon Void layer (bit 128)", default=False)
+
     # Render region visibility toggle
     show_render_regions: BoolProperty(
         name="Show Render Regions",
@@ -722,6 +781,10 @@ classes = (
     ui_panel.MAPGEO_OT_toggle_bush,
     ui_panel.MAPGEO_OT_assign_bush,
     ui_panel.MAPGEO_OT_assign_baron_hash,
+    ui_panel.MAPGEO_OT_baron_load_selected,
+    ui_panel.MAPGEO_OT_baron_apply_selected,
+    ui_panel.MAPGEO_OT_baron_remove_selected,
+    ui_panel.MAPGEO_OT_baron_create_new,
     ui_panel.MAPGEO_OT_assign_render_region_hash,
     ui_panel.MAPGEO_OT_set_diffuse_texture,
     # ui_panel.MAPGEO_OT_set_test_paths,  # removed

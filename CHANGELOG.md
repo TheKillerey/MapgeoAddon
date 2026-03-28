@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.2] - 2026-03-28
+
+### 🔧 Materials Export Fix (prey format)
+- **Fixed wrong technique pass field hashes** — The prey→bin writer was using FNV-1a hashes of CamelCase property names instead of the actual Riot bin-level hashes for `blendEnable`, `cullEnable`, `srcColorBlendFactor`, `srcAlphaBlendFactor`, `dstColorBlendFactor`, `dstAlphaBlendFactor`, and `writeMask`. This caused materials with custom technique/blend settings to break in-game.
+- **Fixed wrong `StaticMaterialChildTechniqueDef` class hash** — Was `0xfecf5099`, corrected to `0x735b4c95`.
+- **Fixed `cullEnable: bool = false` not being written** — When `blendEnable` is true, `cullEnable` is now always written alongside it matching the working binary format.
+- **Fixed `defaultTechnique` field missing/displaced** — Added proper read/write handling for the `defaultTechnique` string field (`0x28da4278`). Now correctly preserved at the right field position during round-trip.
+
+### 🧩 Baron Hash Editor
+- **New fully editable Baron Hash Editor** replacing the simple "Assign Baron Hash" button in the Utilities panel
+- Load baron hash data from selected object into the editor
+- Edit hash, parent mode (Visible/Not Visible), baron layers (Base/Cup/Tunnel/Upgraded), and dragon layers
+- Apply settings to all selected objects
+- Remove baron hash from selected objects  
+- Create new baron hash from name via FNV-1a auto-hashing
+- All operations trigger visibility system update
+
+### 🔧 Bucket Grid Hash Placement (continued)
+- **Fixed reversed hash field placement** in both export normalization and Create Bucket Grid operator:
+  - Render region → `path_hash` (v18=0)
+  - Baron/visibility → `v18_float` (path_hash=0)
+
 ## [0.4.1] - 2026-03-26
 
 ### 🧩 Bucket Grid Workflow Fixes

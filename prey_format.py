@@ -68,16 +68,18 @@ FIELD_NAMES = {
     # Switch fields
     0x61342fd0: "on",
     0x5fb91e8c: "group",
-    # Technique/Pass fields
+    # Technique/Pass fields (bin-level hashes inside StaticMaterialPassDef)
     0x623cd25c: "passes",
     0xc5ac22aa: "shader",
-    0x38579b90: "blendEnable",
-    0x2346bd76: "cullEnable",
-    0x1ebe0e59: "srcColorBlendFactor",
-    0x0dbbba93: "srcAlphaBlendFactor",
-    0x6df4a57b: "dstColorBlendFactor",
-    0x7cf711b1: "dstAlphaBlendFactor",
-    0x78d0a46c: "writeMask",
+    0x23b75597: "blendEnable",
+    0x4b0f55ce: "cullEnable",
+    0x22c0c7d0: "srcColorBlendFactor",
+    0xa0958d01: "srcAlphaBlendFactor",
+    0xbe0abbf5: "dstColorBlendFactor",
+    0x7385e534: "dstAlphaBlendFactor",
+    0x917e428e: "writeMask",
+    # DefaultTechnique
+    0x28da4278: "defaultTechnique",
     # Child technique
     0xb696a5fe: "parentName",
     # MapSunProperties
@@ -146,6 +148,7 @@ def _bin_material_to_prey(entry: dict) -> dict:
     KNOWN_FIELD_HASHES = {
         0x8d39bde6, 0x5127f14d, 0x0a6f0eb5, 0xd0ab46b8,
         0xdd7ddb9d, 0xe6d67ded, 0x844f384e, 0x9330e6b6,
+        0x28da4278,  # defaultTechnique
     }
 
     def _fld(hash_val):
@@ -280,8 +283,14 @@ def _bin_material_to_prey(entry: dict) -> dict:
         "params": params,
         "switches": switches,
     }
+    # defaultTechnique
+    default_tech_f = _fld(0x28da4278)
+    default_technique = default_tech_f['value'] if default_tech_f else None
+
     if shader_macros:
         result["shaderMacros"] = shader_macros
+    if default_technique is not None:
+        result["defaultTechnique"] = default_technique
     if raw_techniques:
         result["_rawTechniques"] = raw_techniques
         # Also store parsed techniques for editable round-trip
@@ -324,6 +333,11 @@ def _prey_material_to_bin(mat: dict) -> dict:
     # materialType (u32) — always write if it was present in original
     if f"0x{0x5127f14d:08x}" in present or mat.get("type", 0) != 0:
         fields.append(_mkfield(0x5127f14d, 7, mat.get("type", 0)))
+
+    # defaultTechnique (string) — write before samplers/techniques to match original field order
+    dt_hash = f"0x{0x28da4278:08x}"
+    if mat.get("defaultTechnique") is not None or dt_hash in present:
+        fields.append(_mkfield(0x28da4278, 16, mat.get("defaultTechnique", "normal")))
 
     # samplerValues (list of embedded)
     sampler_hash = f"0x{0x0a6f0eb5:08x}"
@@ -410,15 +424,16 @@ def _prey_material_to_bin(mat: dict) -> dict:
                     shader_hash = "0x%08x" % _fnv1a_32(shader_path)
                     pf.append(_mkfield(_HASH_SHADER_LINK, 132, shader_hash))
                 if p.get("blendEnable"):
-                    pf.append(_mkfield(_HASH_BLEND_ENABLE, 1, True))
-                    pf.append(_mkfield(_HASH_SRC_COLOR_BLEND, 7, p.get("srcColorBlendFactor", 1)))
-                    pf.append(_mkfield(_HASH_DST_COLOR_BLEND, 7, p.get("dstColorBlendFactor", 0)))
-                    pf.append(_mkfield(_HASH_SRC_ALPHA_BLEND, 7, p.get("srcAlphaBlendFactor", 1)))
-                    pf.append(_mkfield(_HASH_DST_ALPHA_BLEND, 7, p.get("dstAlphaBlendFactor", 0)))
-                if p.get("cullEnable"):
-                    pf.append(_mkfield(_HASH_CULL_ENABLE, 1, True))
+                    pf.append(_mkfield(_BIN_PASS_BLEND, 1, True))
+                    pf.append(_mkfield(_BIN_PASS_CULL, 1, bool(p.get("cullEnable", False))))
+                    pf.append(_mkfield(_BIN_PASS_SRC_COLOR, 7, p.get("srcColorBlendFactor", 1)))
+                    pf.append(_mkfield(_BIN_PASS_SRC_ALPHA, 7, p.get("srcAlphaBlendFactor", 1)))
+                    pf.append(_mkfield(_BIN_PASS_DST_COLOR, 7, p.get("dstColorBlendFactor", 0)))
+                    pf.append(_mkfield(_BIN_PASS_DST_ALPHA, 7, p.get("dstAlphaBlendFactor", 0)))
+                elif "cullEnable" in p:
+                    pf.append(_mkfield(_BIN_PASS_CULL, 1, bool(p["cullEnable"])))
                 if p.get("writeMask") is not None:
-                    pf.append(_mkfield(_HASH_WRITE_MASK, 7, p["writeMask"]))
+                    pf.append(_mkfield(_BIN_PASS_WRITE_MASK, 7, p["writeMask"]))
                 if p.get("shaderMacros"):
                     macro_pairs = []
                     for mk, mv in p["shaderMacros"].items():
@@ -471,7 +486,7 @@ def _prey_material_to_bin(mat: dict) -> dict:
                     "type": 0x86, "key_type": 16, "value_type": 16,
                     "pairs": macro_pairs,
                 })
-            child_values.append(_mkembed("0xfecf5099", cf))
+            child_values.append(_mkembed("0x735b4c95", cf))
         fields.append({
             "name_hash": "0x%08x" % _HASH_CHILD_TECHNIQUES,
             "type": 0x80, "value_type": 0x83,
@@ -2488,7 +2503,6 @@ def _extract_techniques_from_raw(raw_techniques: dict) -> list:
                     pass_data = {
                         'shader': '',
                         'blendEnable': False,
-                        'cullEnable': False,
                         'srcColorBlendFactor': 1,
                         'srcAlphaBlendFactor': 1,
                         'dstColorBlendFactor': 0,
@@ -2704,13 +2718,13 @@ _HASH_ADDRESS_U = 0x111ec6d2
 _HASH_ADDRESS_V = 0x101ec53f
 _HASH_ADDRESS_W = 0x0f1ec3ac
 _HASH_CHILD_TECHNIQUES = 0x9330e6b6
-_HASH_BLEND_ENABLE = 0x38579b90
-_HASH_CULL_ENABLE = 0x2346bd76
-_HASH_SRC_COLOR_BLEND = 0x1ebe0e59
-_HASH_SRC_ALPHA_BLEND = 0x0dbbba93
-_HASH_DST_COLOR_BLEND = 0x6df4a57b
-_HASH_DST_ALPHA_BLEND = 0x7cf711b1
-_HASH_WRITE_MASK = 0x78d0a46c
+_HASH_BLEND_ENABLE = 0x23b75597   # bin-level: blendEnable
+_HASH_CULL_ENABLE = 0x4b0f55ce    # bin-level: cullEnable
+_HASH_SRC_COLOR_BLEND = 0x22c0c7d0  # bin-level: srcColorBlendFactor
+_HASH_SRC_ALPHA_BLEND = 0xa0958d01  # bin-level: srcAlphaBlendFactor
+_HASH_DST_COLOR_BLEND = 0xbe0abbf5  # bin-level: dstColorBlendFactor
+_HASH_DST_ALPHA_BLEND = 0x7385e534  # bin-level: dstAlphaBlendFactor
+_HASH_WRITE_MASK = 0x917e428e       # bin-level: writeMask
 _HASH_PARENT_NAME = 0xb696a5fe
 
 # Old shader prefix → new prefix
@@ -2925,10 +2939,13 @@ def _build_technique_bin(shader_path: str, blend: dict) -> dict:
     ]
     if blend.get("blendEnable"):
         pass_fields.append(_mkfield(_HASH_BLEND_ENABLE, 1, True))
+        pass_fields.append(_mkfield(_HASH_CULL_ENABLE, 1, bool(blend.get("cullEnable", False))))
         pass_fields.append(_mkfield(_HASH_SRC_COLOR_BLEND, 7, blend.get("srcColorBlendFactor", 1)))
         pass_fields.append(_mkfield(_HASH_DST_COLOR_BLEND, 7, blend.get("dstColorBlendFactor", 0)))
         pass_fields.append(_mkfield(_HASH_SRC_ALPHA_BLEND, 7, blend.get("srcAlphaBlendFactor", 1)))
         pass_fields.append(_mkfield(_HASH_DST_ALPHA_BLEND, 7, blend.get("dstAlphaBlendFactor", 0)))
+    elif "cullEnable" in blend:
+        pass_fields.append(_mkfield(_HASH_CULL_ENABLE, 1, bool(blend["cullEnable"])))
 
     pass_struct = _mkembed("0x8537d0c2", pass_fields)
     technique = _mkembed("0x060a4413", [
@@ -2954,7 +2971,7 @@ def _build_child_techniques_bin(child_names: list) -> dict:
             _mkfield(_HASH_NAME, 16, cn),
             _mkfield(_HASH_PARENT_NAME, 16, "normal"),
         ]
-        children.append(_mkembed("0xfecf5099", child_fields))
+        children.append(_mkembed("0x735b4c95", child_fields))
     return {
         "name_hash": "0x%08x" % _HASH_CHILD_TECHNIQUES,
         "type": 0x80, "value_type": 0x83,

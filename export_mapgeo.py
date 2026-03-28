@@ -1301,18 +1301,18 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                         # Normalize hash field placement based on collection type.
                         # This protects export correctness even if legacy/stale custom
                         # collections have path_hash/v18 incorrectly placed.
-                        # Correct format: render_region → v18 (path_hash=0), baron → path_hash (v18=0)
+                        # Correct format: render_region → path_hash (v18=0), baron → v18 (path_hash=0)
                         v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
                         if col_hash_type == 'render_region':
-                            if grid.path_hash != 0 and v18_uint == 0:
-                                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
-                                grid.path_hash = 0
-                                v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
-                        elif col_hash_type == 'baron':
                             if grid.path_hash == 0 and v18_uint != 0:
                                 grid.path_hash = v18_uint
                                 grid.unknown_v18_float = 0.0
                                 v18_uint = 0
+                        elif col_hash_type == 'baron':
+                            if grid.path_hash != 0 and v18_uint == 0:
+                                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
+                                grid.path_hash = 0
+                                v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
                         elif col_hash_type == 'master':
                             grid.path_hash = 0
                             grid.unknown_v18_float = 0.0

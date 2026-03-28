@@ -895,12 +895,76 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         
         layout.separator()
         
-        # Baron Hash Assignment
+        # ── Baron Hash Editor ──
         box = layout.box()
-        box.label(text="Baron Hash Assignment", icon='LIGHTPROBE_VOLUME')
-        
+        box.label(text="Baron Hash Editor", icon='LIGHTPROBE_VOLUME')
+
+        # Show active object info
+        obj = context.active_object
+        has_baron = obj and obj.type == 'MESH' and "baron_hash" in obj
+
+        if obj and obj.type == 'MESH':
+            row = box.row()
+            row.label(text=f"Active: {obj.name}", icon='OBJECT_DATA')
+            if has_baron:
+                row = box.row()
+                row.label(text=f"Hash: {obj.get('baron_hash', '—')}", icon='KEYTYPE_JITTER_VEC')
+                mode_val = obj.get("baron_parent_mode", 1)
+                mode_label = "Not Visible" if mode_val == 3 else "Visible"
+                row.label(text=f"Mode: {mode_label}")
+            else:
+                box.label(text="No baron hash set", icon='INFO')
+        else:
+            box.label(text="No mesh selected", icon='INFO')
+
         col = box.column(align=True)
-        col.operator("mapgeo.assign_baron_hash", text="Assign Baron Hash to Selected", icon='ADD')
+        row = col.row(align=True)
+        row.operator("mapgeo.baron_load_selected", text="Load from Selected", icon='IMPORT')
+        row.operator("mapgeo.baron_remove_selected", text="Remove", icon='TRASH')
+
+        box.separator()
+
+        # Editor fields
+        col = box.column(align=True)
+        col.prop(settings, "baron_editor_hash", text="Hash")
+        col.prop(settings, "baron_editor_parent_mode")
+
+        # Baron layers
+        sub_box = box.box()
+        sub_box.label(text="Baron Layers", icon='LAYER_ACTIVE')
+        grid = sub_box.grid_flow(columns=4, align=True)
+        grid.prop(settings, "baron_editor_base")
+        grid.prop(settings, "baron_editor_cup")
+        grid.prop(settings, "baron_editor_tunnel")
+        grid.prop(settings, "baron_editor_upgraded")
+
+        # Dragon layers
+        sub_box = box.box()
+        sub_box.label(text="Dragon Layers (override)", icon='LIGHT_SUN')
+        grid = sub_box.grid_flow(columns=4, align=True)
+        grid.prop(settings, "baron_editor_dragon_base")
+        grid.prop(settings, "baron_editor_dragon_inferno")
+        grid.prop(settings, "baron_editor_dragon_mountain")
+        grid.prop(settings, "baron_editor_dragon_ocean")
+        grid.prop(settings, "baron_editor_dragon_cloud")
+        grid.prop(settings, "baron_editor_dragon_hextech")
+        grid.prop(settings, "baron_editor_dragon_chemtech")
+        grid.prop(settings, "baron_editor_dragon_void")
+
+        col = box.column(align=True)
+        col.operator("mapgeo.baron_apply_selected", text="Apply to Selected", icon='CHECKMARK')
+
+        box.separator()
+
+        # Create new hash from name
+        sub_box = box.box()
+        sub_box.label(text="Create New Baron Hash", icon='ADD')
+        col = sub_box.column(align=True)
+        col.prop(settings, "baron_editor_name", text="Name")
+        if settings.baron_editor_computed_hash:
+            col.label(text=f"Computed Hash: {settings.baron_editor_computed_hash}", icon='KEYTYPE_JITTER_VEC')
+        col.separator()
+        col.operator("mapgeo.baron_create_new", text="Create & Assign to Selected", icon='PLUS')
         
         layout.separator()
         
@@ -1779,6 +1843,213 @@ class MAPGEO_OT_assign_baron_hash(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self)
 
 
+# ── Baron Hash Editor Helpers ──
+
+_BARON_LAYER_BITS = [
+    ("baron_editor_base", 1),
+    ("baron_editor_cup", 2),
+    ("baron_editor_tunnel", 4),
+    ("baron_editor_upgraded", 8),
+]
+_DRAGON_LAYER_BITS = [
+    ("baron_editor_dragon_base", 1),
+    ("baron_editor_dragon_inferno", 2),
+    ("baron_editor_dragon_mountain", 4),
+    ("baron_editor_dragon_ocean", 8),
+    ("baron_editor_dragon_cloud", 16),
+    ("baron_editor_dragon_hextech", 32),
+    ("baron_editor_dragon_chemtech", 64),
+    ("baron_editor_dragon_void", 128),
+]
+
+
+def _baron_editor_settings_to_layers(settings):
+    """Read checkbox properties → return (baron_bits_list, dragon_bits_list, parent_mode_int)"""
+    baron_layers = [bit for prop, bit in _BARON_LAYER_BITS if getattr(settings, prop)]
+    dragon_layers = [bit for prop, bit in _DRAGON_LAYER_BITS if getattr(settings, prop)]
+    parent_mode = int(settings.baron_editor_parent_mode)
+    return baron_layers, dragon_layers, parent_mode
+
+
+def _baron_editor_load_from_object(settings, obj):
+    """Populate editor properties from a Blender object's custom properties."""
+    import ast
+    settings.baron_editor_hash = obj.get("baron_hash", "")
+    settings.baron_editor_parent_mode = str(obj.get("baron_parent_mode", 1))
+
+    # Baron layers
+    baron_raw = obj.get("baron_layers_decoded", "[]")
+    try:
+        baron_layers = set(ast.literal_eval(baron_raw)) if baron_raw else set()
+    except (ValueError, SyntaxError):
+        baron_layers = set()
+    for prop, bit in _BARON_LAYER_BITS:
+        setattr(settings, prop, bit in baron_layers)
+
+    # Dragon layers
+    dragon_raw = obj.get("baron_dragon_layers_decoded", "[]")
+    try:
+        dragon_layers = set(ast.literal_eval(dragon_raw)) if dragon_raw else set()
+    except (ValueError, SyntaxError):
+        dragon_layers = set()
+    for prop, bit in _DRAGON_LAYER_BITS:
+        setattr(settings, prop, bit in dragon_layers)
+
+    # Clear name/computed fields
+    settings.baron_editor_name = ""
+
+
+class MAPGEO_OT_baron_load_selected(bpy.types.Operator):
+    """Load the active object's baron hash data into the editor"""
+    bl_idname = "mapgeo.baron_load_selected"
+    bl_label = "Load from Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'WARNING'}, "No active mesh object")
+            return {'CANCELLED'}
+
+        settings = context.scene.mapgeo_settings
+        _baron_editor_load_from_object(settings, obj)
+
+        baron_hash = obj.get("baron_hash", "")
+        if baron_hash:
+            self.report({'INFO'}, f"Loaded baron hash {baron_hash} from {obj.name}")
+        else:
+            self.report({'INFO'}, f"No baron hash on {obj.name} — editor cleared")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_baron_apply_selected(bpy.types.Operator):
+    """Apply the current editor settings to all selected mesh objects"""
+    bl_idname = "mapgeo.baron_apply_selected"
+    bl_label = "Apply to Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+        baron_layers, dragon_layers, parent_mode = _baron_editor_settings_to_layers(settings)
+
+        # Determine hash to write
+        editor_hash = settings.baron_editor_hash.strip().upper()
+        if not editor_hash:
+            self.report({'ERROR'}, "No baron hash set in the editor. Load one or create a new one first")
+            return {'CANCELLED'}
+        if len(editor_hash) != 8:
+            self.report({'ERROR'}, "Baron hash must be exactly 8 hex characters")
+            return {'CANCELLED'}
+        try:
+            int(editor_hash, 16)
+        except ValueError:
+            self.report({'ERROR'}, "Invalid hex format in baron hash")
+            return {'CANCELLED'}
+
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            obj["baron_hash"] = editor_hash
+            obj["baron_layers_decoded"] = str(sorted(baron_layers))
+            obj["baron_parent_mode"] = parent_mode
+            if dragon_layers:
+                obj["baron_dragon_layers_decoded"] = str(sorted(dragon_layers))
+            elif "baron_dragon_layers_decoded" in obj:
+                del obj["baron_dragon_layers_decoded"]
+            count += 1
+
+        # Trigger visibility update
+        if count and hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+
+        self.report({'INFO'}, f"Applied baron hash {editor_hash} to {count} objects")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_baron_remove_selected(bpy.types.Operator):
+    """Remove baron hash and all decoded data from selected objects"""
+    bl_idname = "mapgeo.baron_remove_selected"
+    bl_label = "Remove Baron Hash"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            removed = False
+            for key in ("baron_hash", "baron_layers_decoded",
+                        "baron_dragon_layers_decoded", "baron_parent_mode"):
+                if key in obj:
+                    del obj[key]
+                    removed = True
+            if removed:
+                count += 1
+
+        settings = context.scene.mapgeo_settings
+        if count and hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+
+        self.report({'INFO'}, f"Removed baron hash from {count} objects")
+        return {'FINISHED'}
+
+
+class MAPGEO_OT_baron_create_new(bpy.types.Operator):
+    """Create a new baron hash and assign it to selected objects.
+Uses the computed hash from the Name field, or a manually entered hash"""
+    bl_idname = "mapgeo.baron_create_new"
+    bl_label = "Create & Assign"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.mapgeo_settings
+
+        # Prefer the computed hash from name, fall back to manual editor hash
+        computed = settings.baron_editor_computed_hash.strip().upper()
+        manual = settings.baron_editor_hash.strip().upper()
+        use_hash = computed if computed else manual
+
+        if not use_hash:
+            self.report({'ERROR'}, "Enter a Name to auto-hash, or type a Hash manually")
+            return {'CANCELLED'}
+        if len(use_hash) != 8:
+            self.report({'ERROR'}, "Hash must be exactly 8 hex characters")
+            return {'CANCELLED'}
+        try:
+            int(use_hash, 16)
+        except ValueError:
+            self.report({'ERROR'}, "Invalid hex format")
+            return {'CANCELLED'}
+
+        # Write computed back into the editor hash field so the UI stays in sync
+        settings.baron_editor_hash = use_hash
+
+        baron_layers, dragon_layers, parent_mode = _baron_editor_settings_to_layers(settings)
+
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            obj["baron_hash"] = use_hash
+            obj["baron_layers_decoded"] = str(sorted(baron_layers))
+            obj["baron_parent_mode"] = parent_mode
+            if dragon_layers:
+                obj["baron_dragon_layers_decoded"] = str(sorted(dragon_layers))
+            elif "baron_dragon_layers_decoded" in obj:
+                del obj["baron_dragon_layers_decoded"]
+            count += 1
+
+        if count and hasattr(settings, 'dragon_layer_filter'):
+            from . import update_environment_visibility
+            update_environment_visibility(settings, context)
+
+        self.report({'INFO'}, f"Created baron hash {use_hash} and assigned to {count} objects")
+        return {'FINISHED'}
+
+
 class MAPGEO_OT_assign_render_region_hash(bpy.types.Operator):
     """Assign render region hash to selected objects"""
     bl_idname = "mapgeo.assign_render_region_hash"
@@ -2164,8 +2435,8 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         for (hash_type, hash_value), mesh_objects in sorted(objects_by_hash_type.items()):
             
             # Determine path_hash/v18 and layer suffix based on hash type
-            # Correct format: render_region hash → unknown_v18_float (path_hash=0)
-            #                baron/visibility hash → path_hash (v18=0)
+            # Correct format: render_region hash → path_hash (v18=0)
+            #                 baron/visibility hash → v18 (path_hash=0)
             v18_hash = 0  # unknown_v18_float stored as uint32 bit pattern
             if hash_type == 'master':
                 path_hash = 0
@@ -2173,13 +2444,13 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 layer_suffix = "_Master"
                 visibility_layer = 0
             elif hash_type == 'render_region':
-                path_hash = 0
-                v18_hash = hash_value  # render_region uses v18
+                path_hash = hash_value  # render_region uses path_hash
+                v18_hash = 0
                 layer_suffix = f"_RR{hash_value:08X}"
                 visibility_layer = 0  # Render regions don't use dragon layers
             elif hash_type == 'baron':
-                path_hash = hash_value  # baron/visibility controller uses path_hash
-                v18_hash = 0
+                path_hash = 0
+                v18_hash = hash_value  # baron/visibility controller uses v18
                 layer_suffix = f"_VC{hash_value:08X}"
                 visibility_layer = 0
             
@@ -4766,6 +5037,10 @@ classes = (
     MAPGEO_OT_toggle_bush,
     MAPGEO_OT_assign_bush,
     MAPGEO_OT_assign_baron_hash,
+    MAPGEO_OT_baron_load_selected,
+    MAPGEO_OT_baron_apply_selected,
+    MAPGEO_OT_baron_remove_selected,
+    MAPGEO_OT_baron_create_new,
     MAPGEO_OT_assign_render_region_hash,
     MAPGEO_OT_set_diffuse_texture,
     MAPGEO_OT_show_all,
