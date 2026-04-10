@@ -499,16 +499,15 @@ def _ensure_riot_wad_cache(league_path: str, map_id: str) -> str:
         return ""
     
     cache_dir = os.path.join(_get_wad_cache_root(), map_id_title)
+    marker = os.path.join(cache_dir, ".extraction_done")
     
-    # Detect incomplete cache: directory exists but lacks the expected data subdir
-    if os.path.isdir(cache_dir):
-        expected_subdir = os.path.join(cache_dir, "data", "maps", "mapgeometry")
-        if not os.path.isdir(expected_subdir):
-            print(f"[Project Manager] WAD cache looks incomplete, re-extracting: {cache_dir}")
-            try:
-                _rmtree_long_path(cache_dir)
-            except Exception as e:
-                print(f"[Project Manager] Failed to clean incomplete cache: {e}")
+    # Detect incomplete cache: directory exists but extraction never finished
+    if os.path.isdir(cache_dir) and not os.path.isfile(marker):
+        print(f"[Project Manager] WAD cache looks incomplete, re-extracting: {cache_dir}")
+        try:
+            _rmtree_long_path(cache_dir)
+        except Exception as e:
+            print(f"[Project Manager] Failed to clean incomplete cache: {e}")
     
     if not os.path.isdir(cache_dir):
         try:
@@ -517,6 +516,10 @@ def _ensure_riot_wad_cache(league_path: str, map_id: str) -> str:
             import tempfile
             wad_path = wad_candidates[0]
             print(f"[Project Manager] Extracting Riot base WAD: {wad_path}")
+            
+            # Ensure WAD hashes are loaded so entries get proper paths
+            if not wad_tool._wad_hashes:
+                wad_tool.load_wad_hashes()
             
             tmp_wad = None
             try:
@@ -528,6 +531,13 @@ def _ensure_riot_wad_cache(league_path: str, map_id: str) -> str:
                 wad = wad_tool.parse_wad(tmp_wad)
             
             wad_tool.extract_wad(wad, cache_dir)
+            
+            # Write marker so we don't re-extract on next call
+            try:
+                with open(os.path.join(cache_dir, ".extraction_done"), "w") as mf:
+                    mf.write("ok")
+            except OSError:
+                pass
             
             # Clean up temporary WAD copy
             if tmp_wad and os.path.isfile(tmp_wad):
@@ -573,17 +583,15 @@ def _ensure_riot_levels_wad_cache(league_path: str, map_id: str) -> str:
         return ""
     
     cache_dir = os.path.join(_get_wad_cache_root(), f"{map_id_title}LEVELS")
+    marker = os.path.join(cache_dir, ".extraction_done")
     
-    # Detect incomplete cache: directory exists but lacks the levels subdir
-    if os.path.isdir(cache_dir):
-        expected_subdir = os.path.join(cache_dir, "levels")
-        data_subdir = os.path.join(cache_dir, "data", "levels")
-        if not os.path.isdir(expected_subdir) and not os.path.isdir(data_subdir):
-            print(f"[Project Manager] LEVELS cache looks incomplete, re-extracting: {cache_dir}")
-            try:
-                _rmtree_long_path(cache_dir)
-            except Exception as e:
-                print(f"[Project Manager] Failed to clean incomplete LEVELS cache: {e}")
+    # Detect incomplete cache: directory exists but extraction never finished
+    if os.path.isdir(cache_dir) and not os.path.isfile(marker):
+        print(f"[Project Manager] LEVELS cache looks incomplete, re-extracting: {cache_dir}")
+        try:
+            _rmtree_long_path(cache_dir)
+        except Exception as e:
+            print(f"[Project Manager] Failed to clean incomplete LEVELS cache: {e}")
     
     if not os.path.isdir(cache_dir):
         try:
@@ -606,6 +614,14 @@ def _ensure_riot_levels_wad_cache(league_path: str, map_id: str) -> str:
                 wad = wad_tool.parse_wad(tmp_wad)
             
             wad_tool.extract_wad(wad, cache_dir)
+            
+            # Write marker so we don't re-extract on next call
+            try:
+                with open(os.path.join(cache_dir, ".extraction_done"), "w") as mf:
+                    mf.write("ok")
+            except OSError:
+                pass
+            
             print(f"[Project Manager] LEVELS WAD extracted to: {cache_dir}")
             
             # Clean up temporary WAD copy
@@ -1463,6 +1479,11 @@ class ProjectSettings(PropertyGroup):
         name="Rebuild from .prey on Export",
         description="When exporting, rebuild .materials.bin from .prey files first, then merge Blender edits on top",
         default=True,
+    )
+    prey_collections_root: StringProperty(
+        name="Prey Collections Root",
+        description="Name of the root Blender collection for prey categories",
+        default="",
     )
     materials_update_reference_path: StringProperty(
         name="Reference Materials Bin",
@@ -2743,6 +2764,34 @@ def _export_materials_bin_merge(source_bin_path: str, output_bin_path: str) -> i
 
     # ── Update / inject map settings (sun, fog, bake, lighting) ──
     _update_bin_map_settings(entries)
+
+    # ── Remove StaticMaterialDef entries not used by any mesh in the scene ──
+    used_material_names = set()
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH' or not obj.data:
+            continue
+        for slot in obj.material_slots:
+            if slot.material:
+                league_name = slot.material.get('league_material_name')
+                if league_name:
+                    used_material_names.add(league_name)
+
+    if used_material_names:
+        smd_hash = f"0x{HASH_STATIC_MATERIAL_DEF:08x}"
+        before_count = len(entries)
+        kept = []
+        removed_count = 0
+        for entry in entries:
+            if entry.get('type_hash') == smd_hash:
+                name_field = _get_field_by_hash(entry.get('fields', []), HASH_NAME)
+                mat_name = name_field['value'] if name_field else ''
+                if mat_name and mat_name not in used_material_names:
+                    removed_count += 1
+                    continue
+            kept.append(entry)
+        if removed_count:
+            data['entries'] = kept
+            print(f"[Project Export] Removed {removed_count} unused material(s) from bin ({before_count} -> {len(kept)} entries)")
 
     propertybin_parser.write_bin(data, output_bin_path)
 
@@ -4080,6 +4129,21 @@ class PROJECT_OT_save_all_to_prey(Operator):
         except Exception as e:
             print(f"[Save All] Warning: vfx definition save failed: {e}")
 
+        # 5. Save prey category collections (lighting, visibility, etc.)
+        cats_changed = 0
+        try:
+            from . import prey_collections
+            root_name = base.replace('.', '_')
+            root_col = prey_collections.get_prey_root_collection(root_name)
+            if root_col:
+                counts = prey_collections.save_prey_categories(prey_dir, base, root_name)
+                prey_collections.update_manifest_from_categories(prey_dir, base, root_name)
+                cats_changed = sum(counts.values())
+                if cats_changed:
+                    saved.append(f'categories ({cats_changed})')
+        except Exception as e:
+            print(f"[Save All] Warning: category save failed: {e}")
+
         if saved:
             self.report({'INFO'}, f"Saved to .prey: {', '.join(saved)}")
         else:
@@ -4672,6 +4736,11 @@ class VIEW3D_PT_project_manager(Panel):
                     save_row.scale_y = 1.3
                     save_row.operator("project.save_all_to_prey",
                                       text="Save All to .prey", icon='FILE_TICK')
+                    
+                    build_row = prey_box.row(align=True)
+                    build_row.scale_y = 1.3
+                    build_row.operator("project.build_materials_bin",
+                                       text="Build .materials.bin", icon='FILE_BLEND')
                 else:
                     prey_box.operator("project.convert_to_prey", text="Convert to .prey", icon='FILE_TEXT')
             
@@ -4695,6 +4764,396 @@ class VIEW3D_PT_project_manager(Panel):
                 box.label(text=f"Loaded: {settings.loaded_variant}", icon='CHECKMARK')
             else:
                 box.label(text=settings.status_message, icon='INFO')
+
+
+# ============================================================================
+# Prey Collections — Operators
+# ============================================================================
+
+class PROJECT_OT_load_prey_categories(Operator):
+    """Load prey category entries into Blender collections for editing"""
+    bl_idname = "project.load_prey_categories"
+    bl_label = "Load Categories"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.project_settings
+        mat_path = settings.loaded_materials_path
+        if not mat_path:
+            self.report({'ERROR'}, "No materials file loaded")
+            return {'CANCELLED'}
+
+        prey_dir = settings.prey_dir
+        if not prey_dir:
+            prey_dir = _get_prey_dir(mat_path)
+        if not os.path.isdir(prey_dir):
+            self.report({'ERROR'}, "No _prey directory found — convert first")
+            return {'CANCELLED'}
+
+        base = _get_prey_base_name(mat_path)
+        root_name = base.replace('.', '_')
+
+        try:
+            from . import prey_collections
+            counts = prey_collections.load_prey_categories(prey_dir, base, root_name)
+            settings.prey_collections_root = f"{root_name}_{prey_collections._COLLECTION_PREFIX}Categories"
+            total = sum(counts.values())
+            cats_with_entries = sum(1 for c in counts.values() if c > 0)
+            self.report({'INFO'},
+                        f"Loaded {total} entries across {cats_with_entries} categories")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load categories: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+class PROJECT_OT_save_prey_categories(Operator):
+    """Save prey category collections back to .prey.* files"""
+    bl_idname = "project.save_prey_categories"
+    bl_label = "Save Categories"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.project_settings
+        mat_path = settings.loaded_materials_path
+        if not mat_path:
+            self.report({'ERROR'}, "No materials file loaded")
+            return {'CANCELLED'}
+
+        prey_dir = settings.prey_dir
+        if not prey_dir:
+            prey_dir = _get_prey_dir(mat_path)
+        base = _get_prey_base_name(mat_path)
+        root_name = base.replace('.', '_')
+
+        try:
+            from . import prey_collections
+            counts = prey_collections.save_prey_categories(prey_dir, base, root_name)
+            prey_collections.update_manifest_from_categories(prey_dir, base, root_name)
+            total = sum(counts.values())
+            self.report({'INFO'}, f"Saved {total} entries to .prey files")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to save categories: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+class PROJECT_OT_build_materials_bin(Operator):
+    """Build a complete .materials.bin from .prey files (full rebuild, not patch)"""
+    bl_idname = "project.build_materials_bin"
+    bl_label = "Build .materials.bin"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.scene.project_settings
+        mat_path = settings.loaded_materials_path
+
+        prey_dir = settings.prey_dir
+        if not prey_dir:
+            prey_dir = _get_prey_dir(mat_path)
+        base = _get_prey_base_name(mat_path)
+
+        manifest = os.path.join(prey_dir, f"{base}.prey.manifest")
+        if not os.path.isfile(manifest):
+            self.report({'ERROR'}, "Prey manifest not found — convert first")
+            return {'CANCELLED'}
+
+        out_path = mat_path
+        if not out_path.endswith('.materials.bin'):
+            out_path = os.path.splitext(out_path)[0] + '.materials.bin'
+
+        try:
+            # First save all Blender edits to prey files
+            from . import prey_format, prey_collections
+
+            # Save category collections if loaded
+            root_name = base.replace('.', '_')
+            root_col = prey_collections.get_prey_root_collection(root_name)
+            if root_col:
+                prey_collections.save_prey_categories(prey_dir, base, root_name)
+                prey_collections.update_manifest_from_categories(prey_dir, base, root_name)
+
+            # Save material/VFX/scene edits
+            scene_settings = PROJECT_OT_sync_scene_to_prey._read_scene_settings(context)
+            if scene_settings:
+                prey_format.save_prey_map_settings(prey_dir, base, scene_settings)
+
+            try:
+                prey_format.save_prey_materials(prey_dir, base)
+            except Exception:
+                pass
+            try:
+                prey_format.save_prey_vfx_transforms(prey_dir, base)
+            except Exception:
+                pass
+            try:
+                prey_format.save_prey_gds_transforms(prey_dir, base)
+            except Exception:
+                pass
+            try:
+                prey_format.save_prey_vfx_definitions(prey_dir, base)
+            except Exception:
+                pass
+
+            # Full build: prey → bin
+            prey_format.prey_to_bin(prey_dir, base, out_path)
+
+            if out_path != mat_path:
+                settings.loaded_materials_path = out_path
+                settings.loaded_materials_format = 'bin'
+
+            file_size = os.path.getsize(out_path)
+            size_str = f"{file_size / 1024:.1f} KB" if file_size < 1048576 else f"{file_size / 1048576:.1f} MB"
+            self.report({'INFO'},
+                        f"Built {os.path.basename(out_path)} ({size_str}) from .prey files")
+        except Exception as e:
+            self.report({'ERROR'}, f"Build failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
+class PROJECT_OT_add_prey_entry(Operator):
+    """Add a new entry to the selected prey category collection"""
+    bl_idname = "project.add_prey_entry"
+    bl_label = "Add Entry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Determine target category from active object or collection
+        cat = None
+        type_hash = ""
+        type_name = ""
+
+        active = context.active_object
+        if active and active.get("prey_category"):
+            cat = active["prey_category"]
+            type_hash = active.get("prey_type_hash", "")
+            type_name = active.get("prey_type_name", "")
+
+        if not cat:
+            # Try from active collection
+            active_col = context.view_layer.active_layer_collection.collection
+            for managed_cat in ("lighting", "map", "visibility", "banners",
+                                "jungle_camps", "navgrid", "extra"):
+                label = {"lighting": "Lighting", "map": "Map", "visibility": "Visibility",
+                         "banners": "Banners", "jungle_camps": "Jungle Camps",
+                         "navgrid": "Nav Grid", "extra": "Extra"}.get(managed_cat, "")
+                if label and label in active_col.name:
+                    cat = managed_cat
+                    break
+
+        if not cat:
+            self.report({'ERROR'}, "Select a prey category object or collection first")
+            return {'CANCELLED'}
+
+        from . import prey_collections
+
+        # Find the category collection
+        settings = context.scene.project_settings
+        base = _get_prey_base_name(settings.loaded_materials_path)
+        root_name = base.replace('.', '_')
+        cat_col_name = prey_collections._prey_col_name(root_name, cat)
+        cat_col = bpy.data.collections.get(cat_col_name)
+        if not cat_col:
+            self.report({'ERROR'}, f"Category collection '{cat_col_name}' not found")
+            return {'CANCELLED'}
+
+        # Create new entry object
+        new_idx = len(cat_col.objects)
+        label = prey_collections._CAT_LABELS.get(cat, cat)
+        obj_name = f"{label}_New_{new_idx}"
+        obj = bpy.data.objects.new(obj_name, None)
+        obj.empty_display_type = 'PLAIN_AXES'
+        obj.empty_display_size = 0.5
+        cat_col.objects.link(obj)
+
+        obj["prey_category"] = cat
+        obj["prey_type_hash"] = type_hash
+        obj["prey_type_name"] = type_name
+        obj["prey_path_hash"] = f"0x{hash(obj_name) & 0xffffffff:08x}"
+        obj["prey_entry_index"] = new_idx
+        obj["prey_fields_json"] = "[]"
+
+        # Select the new object
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+
+        self.report({'INFO'}, f"Added new {type_name or cat} entry")
+        return {'FINISHED'}
+
+
+class PROJECT_OT_remove_prey_entry(Operator):
+    """Remove the selected prey entry from its category"""
+    bl_idname = "project.remove_prey_entry"
+    bl_label = "Remove Entry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or not obj.get("prey_category"):
+            self.report({'ERROR'}, "Select a prey entry object first")
+            return {'CANCELLED'}
+
+        name = obj.name
+        bpy.data.objects.remove(obj, do_unlink=True)
+        self.report({'INFO'}, f"Removed entry: {name}")
+        return {'FINISHED'}
+
+
+class PROJECT_OT_duplicate_prey_entry(Operator):
+    """Duplicate the selected prey entry"""
+    bl_idname = "project.duplicate_prey_entry"
+    bl_label = "Duplicate Entry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        src = context.active_object
+        if not src or not src.get("prey_category"):
+            self.report({'ERROR'}, "Select a prey entry object first")
+            return {'CANCELLED'}
+
+        cat = src["prey_category"]
+        from . import prey_collections
+
+        settings = context.scene.project_settings
+        base = _get_prey_base_name(settings.loaded_materials_path)
+        root_name = base.replace('.', '_')
+        cat_col_name = prey_collections._prey_col_name(root_name, cat)
+        cat_col = bpy.data.collections.get(cat_col_name)
+        if not cat_col:
+            self.report({'ERROR'}, "Category collection not found")
+            return {'CANCELLED'}
+
+        # Duplicate object
+        new_obj = src.copy()
+        new_obj.name = f"{src.name}_copy"
+        cat_col.objects.link(new_obj)
+
+        # Update entry index and give it a new path hash
+        new_obj["prey_entry_index"] = len(cat_col.objects)
+        new_obj["prey_path_hash"] = f"0x{hash(new_obj.name) & 0xffffffff:08x}"
+
+        bpy.context.view_layer.objects.active = new_obj
+        new_obj.select_set(True)
+
+        self.report({'INFO'}, f"Duplicated: {src.name}")
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Prey Collections — Panel
+# ============================================================================
+
+class VIEW3D_PT_prey_categories(Panel):
+    """Prey category editor for managing materials.bin entries"""
+    bl_label = "Prey Categories"
+    bl_idname = "VIEW3D_PT_prey_categories"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "League Tools"
+    bl_order = 82
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.project_settings
+        return bool(settings.has_prey or settings.loaded_materials_path)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.project_settings
+
+        # ── Load/Save actions ──
+        box = layout.box()
+        box.label(text="Category Collections", icon='OUTLINER')
+
+        if not settings.has_prey:
+            box.label(text="Convert to .prey first", icon='INFO')
+            box.operator("project.convert_to_prey", text="Convert to .prey", icon='FILE_TEXT')
+            return
+
+        row = box.row(align=True)
+        row.operator("project.load_prey_categories", text="Load Categories", icon='IMPORT')
+        row.operator("project.save_prey_categories", text="Save Categories", icon='EXPORT')
+
+        # ── Category overview ──
+        from . import prey_collections
+
+        base = _get_prey_base_name(settings.loaded_materials_path)
+        root_name = base.replace('.', '_')
+        root_col = prey_collections.get_prey_root_collection(root_name)
+
+        if root_col:
+            box = layout.box()
+            box.label(text="Loaded Categories:", icon='COLLAPSEMENU')
+
+            for cat in prey_collections.MANAGED_CATEGORIES:
+                cat_col_name = prey_collections._prey_col_name(root_name, cat)
+                cat_col = bpy.data.collections.get(cat_col_name)
+                if not cat_col:
+                    continue
+
+                count = len(cat_col.objects)
+                icon = prey_collections._CAT_ICONS.get(cat, 'DOT')
+                label = prey_collections._CAT_LABELS.get(cat, cat)
+                row = box.row()
+                row.label(text=f"{label}: {count} entries", icon=icon)
+
+        # ── Entry operations ──
+        box = layout.box()
+        box.label(text="Entry Operations", icon='OBJECT_DATA')
+        row = box.row(align=True)
+        row.operator("project.add_prey_entry", text="Add", icon='ADD')
+        row.operator("project.remove_prey_entry", text="Remove", icon='REMOVE')
+        row.operator("project.duplicate_prey_entry", text="Duplicate", icon='DUPLICATE')
+
+        # ── Selected entry details ──
+        obj = context.active_object
+        if obj and obj.get("prey_category"):
+            box = layout.box()
+            cat = obj["prey_category"]
+            icon = prey_collections._CAT_ICONS.get(cat, 'DOT')
+            box.label(text=f"Selected: {obj.name}", icon=icon)
+
+            col = box.column(align=True)
+            col.label(text=f"Category: {prey_collections._CAT_LABELS.get(cat, cat)}")
+            col.label(text=f"Type: {obj.get('prey_type_name', '?')}")
+            col.label(text=f"Hash: {obj.get('prey_path_hash', '?')}")
+
+            # Show editable field properties
+            field_keys = sorted([k for k in obj.keys() if k.startswith("field_")])
+            if field_keys:
+                box.separator()
+                box.label(text="Fields:", icon='PROPERTIES')
+                for key in field_keys:
+                    prop_name = key[6:]  # strip "field_"
+                    row = box.row()
+                    row.prop(obj, f'["{key}"]', text=prop_name)
+
+            # Container counts
+            container_keys = [k for k in obj.keys() if k.startswith("container_")]
+            if container_keys:
+                box.separator()
+                box.label(text="Containers:", icon='GROUP')
+                for key in container_keys:
+                    col = box.column()
+                    col.label(text=f"{key}: {obj[key]}")
+
+        # ── Build button ──
+        layout.separator()
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator("project.build_materials_bin",
+                     text="Build .materials.bin", icon='FILE_BLEND')
 
 
 # ============================================================================
@@ -4725,8 +5184,15 @@ classes = (
     PROJECT_OT_pick_legacy_target,
     PROJECT_OT_save_all_to_prey,
     PROJECT_OT_sync_scene_to_prey,
+    PROJECT_OT_load_prey_categories,
+    PROJECT_OT_save_prey_categories,
+    PROJECT_OT_build_materials_bin,
+    PROJECT_OT_add_prey_entry,
+    PROJECT_OT_remove_prey_entry,
+    PROJECT_OT_duplicate_prey_entry,
     PROJECT_UL_variant_list,
     VIEW3D_PT_project_manager,
+    VIEW3D_PT_prey_categories,
     VIEW3D_PT_league_tools_legacy_materials,
 )
 

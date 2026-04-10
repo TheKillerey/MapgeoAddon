@@ -652,6 +652,91 @@ class MAPGEO_OT_reverse_selected_faces(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MAPGEO_OT_select_same_oriented_faces(bpy.types.Operator):
+    """Select mesh objects whose overall face orientation matches the active mesh"""
+    bl_idname = "mapgeo.select_same_oriented_faces"
+    bl_label = "Select Same-Oriented Meshes"
+    bl_description = (
+        "In Object Mode, select all mesh objects whose average face normal "
+        "matches the active mesh. Useful for identifying flipped meshes"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    angle_threshold: bpy.props.FloatProperty(
+        name="Angle Threshold",
+        description="Maximum angle (degrees) between average normals to consider meshes as same-oriented",
+        default=90.0,
+        min=0.1,
+        max=180.0,
+        subtype='ANGLE',
+    )
+
+    @staticmethod
+    def _get_average_normal(obj):
+        """Compute the area-weighted average face normal in world space."""
+        import bmesh
+        from mathutils import Vector
+
+        mesh = obj.data
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            if not bm.faces:
+                return None
+            bm.normal_update()
+            world_mat = obj.matrix_world.to_3x3().normalized()
+            avg = Vector((0.0, 0.0, 0.0))
+            for f in bm.faces:
+                avg += world_mat @ f.normal * f.calc_area()
+            if avg.length < 0.0001:
+                return None
+            avg.normalize()
+            return avg
+        finally:
+            bm.free()
+
+    def execute(self, context):
+        import math
+
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Active object must be a mesh")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                self.report({'ERROR'}, "Could not switch to Object Mode")
+                return {'CANCELLED'}
+
+        ref_normal = self._get_average_normal(obj)
+        if ref_normal is None:
+            self.report({'ERROR'}, "Active mesh has no faces or cancelling normals")
+            return {'CANCELLED'}
+
+        threshold = math.cos(self.angle_threshold)
+
+        selected_count = 0
+        for other in context.scene.objects:
+            if other.type != 'MESH' or not other.data:
+                continue
+            avg = self._get_average_normal(other)
+            if avg is None:
+                continue
+            if avg.dot(ref_normal) >= threshold:
+                other.select_set(True)
+                selected_count += 1
+            else:
+                other.select_set(False)
+
+        # Keep the active object unchanged
+        context.view_layer.objects.active = obj
+
+        self.report({'INFO'}, f"Selected {selected_count} mesh(es) with matching orientation")
+        return {'FINISHED'}
+
+
 class MAPGEO_OT_enable_decal_transparency_overlap(bpy.types.Operator):
     """Enable Transparency Overlap for materials that use decal shaders"""
     bl_idname = "mapgeo.enable_decal_transparency_overlap"
@@ -744,6 +829,8 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         col.operator("mapgeo.setup_mesh", text="Setup Wizard", icon='PREFERENCES')
         if _operator_exists("mapgeo.reverse_selected_faces"):
             col.operator("mapgeo.reverse_selected_faces", text="Reverse Faces", icon='MOD_NORMALEDIT')
+        if _operator_exists("mapgeo.select_same_oriented_faces"):
+            col.operator("mapgeo.select_same_oriented_faces", text="Select Same-Oriented Faces", icon='NORMALS_FACE')
         
         # Info section
         layout.separator()
@@ -2352,6 +2439,17 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
         use_selection = self.use_selected_only and len(selected_meshes) > 0
         source_objects = selected_meshes if use_selection else context.scene.objects
 
+        # Build set of objects inside any *_Meshes collection hierarchy
+        meshes_col_set = set()
+        for col in bpy.data.collections:
+            if col.name.endswith("_Meshes"):
+                def _collect(c, out):
+                    for o in c.objects:
+                        out.add(o)
+                    for child in c.children:
+                        _collect(child, out)
+                _collect(col, meshes_col_set)
+
         for obj in source_objects:
             if obj.type != 'MESH':
                 continue
@@ -2365,6 +2463,14 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                     in_bucket_collection = True
                     break
             if in_bucket_collection:
+                continue
+
+            # Skip VFX definitions and particle systems (not part of geometry)
+            if obj.get("is_vfx_definition") or obj.get("is_particle_system"):
+                continue
+
+            # Skip objects not in the _Meshes collection hierarchy (particles, fog, etc.)
+            if not use_selection and meshes_col_set and obj not in meshes_col_set:
                 continue
             
             # Skip bushes
@@ -5023,6 +5129,7 @@ classes = (
     MAPGEO_OT_open_addon_release_page,
     MAPGEO_OT_setup_mesh,
     MAPGEO_OT_reverse_selected_faces,
+    MAPGEO_OT_select_same_oriented_faces,
     MAPGEO_OT_enable_decal_transparency_overlap,
     VIEW3D_PT_mapgeo_panel,
     VIEW3D_PT_mapgeo_layers_panel,

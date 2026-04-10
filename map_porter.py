@@ -14,11 +14,14 @@ Ports one League map to another by:
 
 import os
 import re
+import json
 import shutil
+import copy as _copy
+from datetime import datetime
 
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import StringProperty, BoolProperty, EnumProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty, IntProperty
 
 from . import propertybin_parser
 from . import mapgeo_parser
@@ -42,10 +45,27 @@ CLASS_MAP_PARTICLE_ALT = "0x1f1f50f2"
 # Known type hashes for reporting
 _TYPE_LABELS = {
     0xff9d3409: "StaticMaterialDef",
-    0xb25c0a3f: "MapPlaceableContainer",
-    0x1f1f50f2: "MapParticle (alt)",
     0x45cd899f: "VfxSystemDefinitionData",
-    0xdde8c114: "mapContainer",
+    0xb25c0a3f: "MapPlaceableContainer",
+    0x24a31b3e: "MapParticle",
+    0x1f1f50f2: "MapParticle (alt)",
+    0x2d5c96cd: "EsportsBannerData",
+    0x3f04641e: "JungleCampData",
+    0x169a2f9c: "MapSunProperties",
+    0x6a4a3409: "MapBakeProperties",
+    0xdca35419: "MapLightingV2",
+    0xdde8c114: "MapContainer",
+    0xe21083b5: "ChildMapVisibilityController",
+    0xc406a533: "LayerController",
+    0xec733fe2: "PriorityLayerController",
+    0xe07edfa4: "NamedController",
+    0x4275b121: "MutatorMapVisibilityController",
+    0xb51e8bff: "MapNavGridOverlays",
+    0xbdc90544: "NavGridConfig",
+    0xbf11c509: "NavGridTerrainConfig",
+    0xa21d6491: "CinematicCameraData",
+    0x64ee2fb1: "GrassPreset",
+    0x7f796784: "EmptyMarker",
     0xcd19ef3c: "MapSkin",
 }
 
@@ -348,9 +368,6 @@ def _find_map_skins_by_geo_path(entries: list, map_name: str) -> list:
         if needle in geo.lower():
             results.append(e)
     return results
-
-
-import copy as _copy
 
 
 def _find_music_override(entries: list, map_name: str):
@@ -846,6 +863,368 @@ def merge_materials_bin(
 
 
 # ============================================================================
+# Materials.prey — Categorisation helper (mirrors prey_format.TYPE_REGISTRY)
+# ============================================================================
+
+_PREY_TYPE_REGISTRY = {
+    # ── Materials ──
+    0xff9d3409: ("StaticMaterialDef",                "materials"),
+    # ── VFX definitions ──
+    0x45cd899f: ("VfxSystemDefinitionData",          "vfx"),
+    # ── Particle containers / placements ──
+    0xb25c0a3f: ("MapPlaceableContainer",            "particles"),
+    0x24a31b3e: ("MapParticle",                      "particles"),
+    0x1f1f50f2: ("MapParticle_Alt",                  "particles"),
+    # ── Lighting / environment ──
+    0x169a2f9c: ("MapSunProperties",                 "lighting"),
+    0x6a4a3409: ("MapBakeProperties",                "lighting"),
+    0xdca35419: ("MapLightingV2",                    "lighting"),
+    # ── Map container ──
+    0xdde8c114: ("MapContainer",                     "map"),
+    # ── Visibility controllers ──
+    0xe21083b5: ("ChildMapVisibilityController",     "visibility"),
+    0xc406a533: ("LayerController",                  "visibility"),
+    0xec733fe2: ("PriorityLayerController",          "visibility"),
+    0xe07edfa4: ("NamedController",                  "visibility"),
+    0x4275b121: ("MutatorMapVisibilityController",   "visibility"),
+    # ── Esports banners ──
+    0x2d5c96cd: ("EsportsBannerData",                "banners"),
+    # ── Jungle camp visuals ──
+    0x3f04641e: ("JungleCampData",                   "jungle_camps"),
+    # ── Navigation grid ──
+    0xb51e8bff: ("MapNavGridOverlays",               "navgrid"),
+    0xbdc90544: ("NavGridConfig",                    "navgrid"),
+    0xbf11c509: ("NavGridTerrainConfig",             "navgrid"),
+}
+
+
+def _prey_categorise(entry: dict) -> str:
+    """Return the prey category for a bin entry."""
+    th = _type_hash_int(entry)
+    _, cat = _PREY_TYPE_REGISTRY.get(th, ("", "extra"))
+    return cat
+
+
+def _entry_to_json_comparable(entry: dict) -> str:
+    """Serialize a bin entry to a canonical JSON string for comparison."""
+    return json.dumps(entry, sort_keys=True, default=str)
+
+
+# ============================================================================
+# Materials.prey — Diff two materials.bin files
+# ============================================================================
+
+def diff_materials_bins(source_path: str, base_path: str) -> dict:
+    """
+    Compare source materials.bin against base materials.bin.
+
+    Returns a dict with:
+      - categories: {cat: {"added": [entries], "modified": [entries]}}
+      - source_linked_files: list of linked files from source
+      - base_linked_files: list of linked files from base
+      - extra_linked_files: linked files in source but not base
+      - source_map_name: derived map name from source
+      - base_map_name: derived map name from base
+      - source_header: {magic, version} from source
+    """
+    src_data = propertybin_parser.parse_bin(source_path)
+    base_data = propertybin_parser.parse_bin(base_path)
+
+    src_entries = src_data.get("entries", [])
+    base_entries = base_data.get("entries", [])
+
+    # Index base entries by path_hash for quick lookup
+    base_by_hash = {}
+    for e in base_entries:
+        ph = e.get("path_hash", "")
+        if ph:
+            base_by_hash[ph] = e
+
+    # Categorise differences
+    categories = {}
+    for cat in ("materials", "vfx", "particles", "lighting", "map",
+                "visibility", "banners", "jungle_camps", "navgrid", "extra"):
+        categories[cat] = {"added": [], "modified": []}
+
+    for entry in src_entries:
+        ph = entry.get("path_hash", "")
+        cat = _prey_categorise(entry)
+
+        if ph not in base_by_hash:
+            # New entry — not in base
+            categories[cat]["added"].append(entry)
+        else:
+            # Exists in both — check if modified
+            base_entry = base_by_hash[ph]
+            src_json = _entry_to_json_comparable(entry)
+            base_json = _entry_to_json_comparable(base_entry)
+            if src_json != base_json:
+                categories[cat]["modified"].append(entry)
+
+    # Linked files diff
+    src_linked = src_data.get("linked_files", [])
+    base_linked_set = set(base_data.get("linked_files", []))
+    extra_linked = [lf for lf in src_linked if lf not in base_linked_set]
+
+    return {
+        "categories": categories,
+        "source_linked_files": src_linked,
+        "base_linked_files": list(base_linked_set),
+        "extra_linked_files": extra_linked,
+        "source_map_name": _derive_map_name_from_materials(source_path),
+        "base_map_name": _derive_map_name_from_materials(base_path),
+        "source_header": {
+            "magic": src_data.get("magic", "PROP"),
+            "version": src_data.get("version", 2),
+        },
+    }
+
+
+# ============================================================================
+# Materials.prey — Export
+# ============================================================================
+
+MATERIALS_PREY_VERSION = 1
+
+
+def export_materials_prey(
+    source_path: str,
+    base_path: str,
+    output_path: str,
+    include_categories: dict[str, bool] | None = None,
+    include_modified: bool = True,
+) -> dict:
+    """
+    Export custom entries from source materials.bin (compared to base) to
+    a .materials.prey JSON file.
+
+    Args:
+        source_path: Path to the custom map's materials.bin
+        base_path: Path to the base/vanilla materials.bin
+        output_path: Where to write the .materials.prey file
+        include_categories: {cat: bool} for which categories to include.
+                           Default: all True.
+        include_modified: Whether to include modified entries (same path_hash,
+                         different content). Default True.
+
+    Returns:
+        Summary dict with counts.
+    """
+    diff = diff_materials_bins(source_path, base_path)
+    cats = diff["categories"]
+
+    if include_categories is None:
+        include_categories = {c: True for c in cats}
+
+    # Build the prey data
+    prey_categories = {}
+    total_added = 0
+    total_modified = 0
+
+    for cat_name, cat_data in cats.items():
+        if not include_categories.get(cat_name, True):
+            continue
+
+        entries = list(cat_data["added"])
+        total_added += len(entries)
+
+        if include_modified:
+            entries.extend(cat_data["modified"])
+            total_modified += len(cat_data["modified"])
+
+        if entries:
+            prey_categories[cat_name] = {
+                "count": len(entries),
+                "entries": entries,
+            }
+
+    prey_data = {
+        "format": "materials.prey",
+        "version": MATERIALS_PREY_VERSION,
+        "source_map": diff["source_map_name"],
+        "base_map": diff["base_map_name"],
+        "created": datetime.now().isoformat(),
+        "header": diff["source_header"],
+        "linked_files": diff["extra_linked_files"],
+        "categories": prey_categories,
+        "total_added": total_added,
+        "total_modified": total_modified,
+        "total_entries": total_added + total_modified,
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(prey_data, f, indent=2, ensure_ascii=False, default=str)
+
+    print(f"[Materials.prey] Exported {prey_data['total_entries']} custom entries "
+          f"({total_added} added, {total_modified} modified) → {os.path.basename(output_path)}")
+
+    return {
+        "total_entries": prey_data["total_entries"],
+        "total_added": total_added,
+        "total_modified": total_modified,
+        "categories": {c: d["count"] for c, d in prey_categories.items()},
+        "output_path": output_path,
+    }
+
+
+# ============================================================================
+# Materials.prey — Merge into target materials.bin
+# ============================================================================
+
+def merge_materials_prey(
+    prey_path: str,
+    target_materials_path: str,
+    output_path: str,
+    required_material_names: set[str] | None = None,
+) -> dict:
+    """
+    Merge a .materials.prey file into a target materials.bin.
+
+    This injects only the custom entries from the prey file into the target,
+    keeping the target's mapContainer and map identity intact while adding
+    the source map's custom materials, VFX, particles, and settings.
+
+    For entries with matching path_hash: replaces the target entry in-place.
+    For new entries: appends after all target entries.
+    Special handling for mapContainer: merges chunks (same as full porter).
+
+    Returns a summary dict.
+    """
+    # Load prey file
+    with open(prey_path, "r", encoding="utf-8") as f:
+        prey_data = json.load(f)
+
+    if prey_data.get("format") != "materials.prey":
+        raise ValueError(f"Not a materials.prey file: {prey_path}")
+
+    # Load target materials.bin
+    tgt_data = propertybin_parser.parse_bin(target_materials_path)
+    tgt_entries = list(tgt_data.get("entries", []))
+
+    # Index target entries by path_hash for quick lookup
+    tgt_by_hash = {}
+    for i, e in enumerate(tgt_entries):
+        ph = e.get("path_hash", "")
+        if ph:
+            tgt_by_hash[ph] = i
+
+    # Collect all prey entries across categories
+    prey_entries = []
+    prey_mc_entry = None  # mapContainer handled specially
+    for cat_name, cat_data in prey_data.get("categories", {}).items():
+        for entry in cat_data.get("entries", []):
+            if _is_map_container(entry):
+                prey_mc_entry = entry
+            else:
+                prey_entries.append(entry)
+
+    # Apply prey entries to target
+    replaced = 0
+    appended = 0
+    for entry in prey_entries:
+        ph = entry.get("path_hash", "")
+        if ph in tgt_by_hash:
+            # Replace in-place
+            idx = tgt_by_hash[ph]
+            tgt_entries[idx] = _copy.deepcopy(entry)
+            replaced += 1
+        else:
+            # Append new entry
+            tgt_entries.append(_copy.deepcopy(entry))
+            appended += 1
+
+    # Handle mapContainer chunks merge
+    chunks_merged = 0
+    chunks_added = 0
+    if prey_mc_entry:
+        tgt_mc = None
+        for e in tgt_entries:
+            if _is_map_container(e):
+                tgt_mc = e
+                break
+        if tgt_mc:
+            tgt_mc, chunks_merged, chunks_added = _merge_mc_chunks(
+                prey_mc_entry, tgt_mc
+            )
+
+    # Merge linked_files
+    tgt_linked = tgt_data.get("linked_files", [])
+    linked_set = set(tgt_linked)
+    for lf in prey_data.get("linked_files", []):
+        if lf not in linked_set:
+            tgt_linked.append(lf)
+            linked_set.add(lf)
+
+    # Defensive material coverage (same as merge_materials_bin)
+    injected_missing = 0
+    if required_material_names:
+        merged_name_set = set()
+        merged_path_set = {e.get("path_hash", "") for e in tgt_entries}
+        for e in tgt_entries:
+            if _type_hash_int(e) != 0xff9d3409:
+                continue
+            for f in e.get("fields", []):
+                if f.get("name_hash") == "0x8d39bde6" or f.get("name_hash_int") == 0x8d39bde6:
+                    merged_name_set.add(str(f.get("value", "")).strip().lower())
+                    break
+        for mat_name in sorted(required_material_names):
+            key = mat_name.strip().lower()
+            if not key or key in merged_name_set:
+                continue
+            # Search in all prey entries for the missing material
+            for entry in prey_entries:
+                if _type_hash_int(entry) != 0xff9d3409:
+                    continue
+                for f in entry.get("fields", []):
+                    nh = f.get("name_hash") or ""
+                    nhi = f.get("name_hash_int", 0)
+                    if nh == "0x8d39bde6" or nhi == 0x8d39bde6:
+                        if str(f.get("value", "")).strip().lower() == key:
+                            ph = entry.get("path_hash", "")
+                            if ph not in merged_path_set:
+                                tgt_entries.append(_copy.deepcopy(entry))
+                                injected_missing += 1
+                                merged_name_set.add(key)
+                                if ph:
+                                    merged_path_set.add(ph)
+                        break
+
+    # Build output
+    merged_data = {
+        "magic": tgt_data.get("magic", "PROP"),
+        "version": tgt_data.get("version", 2),
+        "linked_files": tgt_linked,
+        "entries": tgt_entries,
+        "entry_count": len(tgt_entries),
+    }
+    if "patch_entries" in tgt_data:
+        merged_data["patch_entries"] = tgt_data["patch_entries"]
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    propertybin_parser.write_bin(merged_data, output_path)
+
+    # Type summary
+    from collections import Counter
+    type_counts = Counter()
+    for e in tgt_entries:
+        th = _type_hash_int(e)
+        label = _TYPE_LABELS.get(th, f"0x{th:08x}")
+        type_counts[label] += 1
+
+    return {
+        "total_entries": len(tgt_entries),
+        "replaced": replaced,
+        "appended": appended,
+        "chunks_merged": chunks_merged,
+        "chunks_added": chunks_added,
+        "injected_missing_materials": injected_missing,
+        "type_summary": dict(type_counts),
+        "prey_source_map": prey_data.get("source_map", ""),
+    }
+
+
+# ============================================================================
 # Operator: Port Map
 # ============================================================================
 
@@ -859,14 +1238,18 @@ class MAPPORTER_OT_port_map(Operator):
         settings = context.scene.map_porter_settings
         src_mapgeo = bpy.path.abspath(settings.source_mapgeo)
         src_materials = bpy.path.abspath(settings.source_materials)
+        materials_prey = bpy.path.abspath(settings.materials_prey)
         tgt_materials = bpy.path.abspath(settings.target_materials)
         map11_bin = bpy.path.abspath(settings.map11_bin)
         out_dir = bpy.path.abspath(settings.output_directory)
 
+        use_prey = materials_prey and os.path.isfile(materials_prey)
+        has_src_materials = src_materials and os.path.isfile(src_materials)
+
         # --- Validation ---
         errors = []
-        if not src_materials or not os.path.isfile(src_materials):
-            errors.append("Source materials.bin not found")
+        if not use_prey and not has_src_materials:
+            errors.append("Source materials.bin or .materials.prey not found")
         if not tgt_materials or not os.path.isfile(tgt_materials):
             errors.append("Target materials.bin not found")
         if not out_dir:
@@ -878,8 +1261,19 @@ class MAPPORTER_OT_port_map(Operator):
 
         os.makedirs(out_dir, exist_ok=True)
 
-        source_map_name = _derive_map_name_from_materials(src_materials)
         target_map_name = _derive_map_name_from_materials(tgt_materials)
+
+        if use_prey:
+            # Prey-based porting mode
+            try:
+                with open(materials_prey, "r", encoding="utf-8") as f:
+                    prey_meta = json.load(f)
+                source_map_name = prey_meta.get("source_map", "custom")
+            except Exception:
+                source_map_name = "custom"
+        else:
+            source_map_name = _derive_map_name_from_materials(src_materials)
+
         report_lines = [f"Map Porter: porting '{source_map_name}' → '{target_map_name}'"]
 
         required_material_names = set()
@@ -892,38 +1286,61 @@ class MAPPORTER_OT_port_map(Operator):
             except Exception as e:
                 report_lines.append(f"WARNING: Could not scan source mapgeo materials: {e}")
 
-        # --- 1. Merge materials.bin ---
+        # --- 1. Merge materials ---
         try:
             out_materials = os.path.join(out_dir, f"{target_map_name}.materials.bin")
-            summary = merge_materials_bin(
-                src_materials,
-                tgt_materials,
-                out_materials,
-                required_material_names=required_material_names,
-            )
-            mc_status = "swapped" if summary["mc_swapped"] else "NOT FOUND in target"
-            report_lines.append(
-                f"Materials.bin: {summary['total_entries']} entries, "
-                f"mapContainer {mc_status}"
-            )
-            if summary.get("target_only_added", 0) > 0:
-                report_lines.append(
-                    f"  • Added {summary['target_only_added']} target-only entries"
+
+            if use_prey:
+                # Prey-based mode: inject custom entries into target
+                report_lines.append(f"Using .materials.prey: {os.path.basename(materials_prey)}")
+                summary = merge_materials_prey(
+                    materials_prey,
+                    tgt_materials,
+                    out_materials,
+                    required_material_names=required_material_names,
                 )
-            if summary.get("skin_replacements", 0) > 0:
                 report_lines.append(
-                    f"  • Patched {summary['skin_replacements']} character skin paths "
-                    f"in target-only MPCs"
+                    f"Materials.bin: {summary['total_entries']} entries "
+                    f"({summary['replaced']} replaced, {summary['appended']} custom added)"
                 )
-                for sr in summary.get("skin_report", []):
-                    report_lines.append(f"    {sr}")
-            cm = summary.get("chunks_merged", 0)
-            ca = summary.get("chunks_added", 0)
-            if cm or ca:
+                cm = summary.get("chunks_merged", 0)
+                ca = summary.get("chunks_added", 0)
+                if cm or ca:
+                    report_lines.append(
+                        f"  • mapContainer chunks: {cm} merged, {ca} added"
+                    )
+            else:
+                # Traditional mode: full source + target merge
+                summary = merge_materials_bin(
+                    src_materials,
+                    tgt_materials,
+                    out_materials,
+                    required_material_names=required_material_names,
+                )
+                mc_status = "swapped" if summary["mc_swapped"] else "NOT FOUND in target"
                 report_lines.append(
-                    f"  • mapContainer chunks: {cm} redirected to source, "
-                    f"{ca} source-only added"
+                    f"Materials.bin: {summary['total_entries']} entries, "
+                    f"mapContainer {mc_status}"
                 )
+                if summary.get("target_only_added", 0) > 0:
+                    report_lines.append(
+                        f"  • Added {summary['target_only_added']} target-only entries"
+                    )
+                if summary.get("skin_replacements", 0) > 0:
+                    report_lines.append(
+                        f"  • Patched {summary['skin_replacements']} character skin paths "
+                        f"in target-only MPCs"
+                    )
+                    for sr in summary.get("skin_report", []):
+                        report_lines.append(f"    {sr}")
+                cm = summary.get("chunks_merged", 0)
+                ca = summary.get("chunks_added", 0)
+                if cm or ca:
+                    report_lines.append(
+                        f"  • mapContainer chunks: {cm} redirected to source, "
+                        f"{ca} source-only added"
+                    )
+
             im = summary.get("injected_missing_materials", 0)
             if im:
                 report_lines.append(
@@ -936,11 +1353,11 @@ class MAPPORTER_OT_port_map(Operator):
                 )
                 for m in unresolved[:25]:
                     report_lines.append(f"    - {m}")
-            if summary["type_summary"]:
+            if summary.get("type_summary"):
                 for label, count in sorted(summary["type_summary"].items()):
                     report_lines.append(f"  • {label}: {count}")
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to merge materials.bin: {e}")
+            self.report({'ERROR'}, f"Failed to merge materials: {e}")
             return {'CANCELLED'}
 
         # --- 2. Patch map11.bin (optional) ---
@@ -1106,8 +1523,451 @@ class MAPPORTER_OT_pick_map11(Operator):
 
 
 # ============================================================================
+# Operator: Pick Materials.prey (for porter)
+# ============================================================================
+
+class MAPPORTER_OT_pick_materials_prey(Operator):
+    """Select a .materials.prey file with custom entries"""
+    bl_idname = "mapporter.pick_materials_prey"
+    bl_label = "Select .materials.prey"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.materials.prey", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        context.scene.map_porter_settings.materials_prey = self.filepath
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Materials.prey Export — Settings PropertyGroup
+# ============================================================================
+
+class MaterialsPreyExportSettings(PropertyGroup):
+    source_materials: StringProperty(
+        name="Source Materials",
+        description="Path to the custom map's .materials.bin",
+        subtype='FILE_PATH',
+    )
+    base_materials: StringProperty(
+        name="Base Materials",
+        description="Path to the base/vanilla .materials.bin to compare against",
+        subtype='FILE_PATH',
+    )
+    output_path: StringProperty(
+        name="Output File",
+        description="Where to save the .materials.prey file",
+        subtype='FILE_PATH',
+    )
+    include_materials: BoolProperty(
+        name="Materials", description="Include custom StaticMaterialDef entries",
+        default=True,
+    )
+    include_vfx: BoolProperty(
+        name="VFX Definitions", description="Include custom VfxSystemDefinitionData entries",
+        default=True,
+    )
+    include_particles: BoolProperty(
+        name="Particles / MPC", description="Include custom MapPlaceableContainer and MapParticle entries",
+        default=True,
+    )
+    include_lighting: BoolProperty(
+        name="Lighting", description="Include custom sun, bake, and lighting entries",
+        default=True,
+    )
+    include_map: BoolProperty(
+        name="Map Container", description="Include the MapContainer entry (chunk references)",
+        default=True,
+    )
+    include_visibility: BoolProperty(
+        name="Visibility", description="Include custom visibility controller entries",
+        default=True,
+    )
+    include_banners: BoolProperty(
+        name="Esports Banners", description="Include EsportsBannerData entries",
+        default=True,
+    )
+    include_jungle_camps: BoolProperty(
+        name="Jungle Camps", description="Include jungle camp visual data entries",
+        default=True,
+    )
+    include_navgrid: BoolProperty(
+        name="Nav Grid", description="Include MapNavGridOverlays and NavGridConfig entries",
+        default=True,
+    )
+    include_extra: BoolProperty(
+        name="Extra", description="Include other custom entry types",
+        default=True,
+    )
+    include_modified: BoolProperty(
+        name="Include Modified",
+        description="Also export entries that exist in both files but have different values",
+        default=True,
+    )
+    # Analysis result counts (updated by Analyze operator)
+    analyzed: BoolProperty(default=False)
+    count_materials_added: IntProperty(default=0)
+    count_materials_modified: IntProperty(default=0)
+    count_vfx_added: IntProperty(default=0)
+    count_vfx_modified: IntProperty(default=0)
+    count_particles_added: IntProperty(default=0)
+    count_particles_modified: IntProperty(default=0)
+    count_lighting_added: IntProperty(default=0)
+    count_lighting_modified: IntProperty(default=0)
+    count_map_added: IntProperty(default=0)
+    count_map_modified: IntProperty(default=0)
+    count_visibility_added: IntProperty(default=0)
+    count_visibility_modified: IntProperty(default=0)
+    count_banners_added: IntProperty(default=0)
+    count_banners_modified: IntProperty(default=0)
+    count_jungle_camps_added: IntProperty(default=0)
+    count_jungle_camps_modified: IntProperty(default=0)
+    count_navgrid_added: IntProperty(default=0)
+    count_navgrid_modified: IntProperty(default=0)
+    count_extra_added: IntProperty(default=0)
+    count_extra_modified: IntProperty(default=0)
+
+
+# ============================================================================
+# Operator: Pick Source for Prey Export
+# ============================================================================
+
+class PREYEXPORT_OT_pick_source(Operator):
+    """Select the custom map's materials.bin"""
+    bl_idname = "preyexport.pick_source"
+    bl_label = "Select Source Materials"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.materials.bin", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        context.scene.prey_export_settings.source_materials = self.filepath
+        context.scene.prey_export_settings.analyzed = False
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Operator: Pick Base for Prey Export
+# ============================================================================
+
+class PREYEXPORT_OT_pick_base(Operator):
+    """Select the base/vanilla materials.bin to compare against"""
+    bl_idname = "preyexport.pick_base"
+    bl_label = "Select Base Materials"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.materials.bin", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        context.scene.prey_export_settings.base_materials = self.filepath
+        context.scene.prey_export_settings.analyzed = False
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Operator: Pick Output for Prey Export
+# ============================================================================
+
+class PREYEXPORT_OT_pick_output(Operator):
+    """Select where to save the .materials.prey file"""
+    bl_idname = "preyexport.pick_output"
+    bl_label = "Select Output"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.materials.prey", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        context.scene.prey_export_settings.output_path = self.filepath
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Operator: Analyze (diff source vs base)
+# ============================================================================
+
+class PREYEXPORT_OT_analyze(Operator):
+    """Compare source materials.bin against base to find custom entries"""
+    bl_idname = "preyexport.analyze"
+    bl_label = "Analyze Differences"
+
+    def execute(self, context):
+        s = context.scene.prey_export_settings
+        src = bpy.path.abspath(s.source_materials)
+        base = bpy.path.abspath(s.base_materials)
+
+        if not src or not os.path.isfile(src):
+            self.report({'ERROR'}, "Source materials.bin not found")
+            return {'CANCELLED'}
+        if not base or not os.path.isfile(base):
+            self.report({'ERROR'}, "Base materials.bin not found")
+            return {'CANCELLED'}
+
+        try:
+            diff = diff_materials_bins(src, base)
+        except Exception as e:
+            self.report({'ERROR'}, f"Analysis failed: {e}")
+            return {'CANCELLED'}
+
+        cats = diff["categories"]
+        for cat_name in ("materials", "vfx", "particles", "lighting", "map",
+                         "visibility", "banners", "jungle_camps", "navgrid", "extra"):
+            setattr(s, f"count_{cat_name}_added", len(cats[cat_name]["added"]))
+            setattr(s, f"count_{cat_name}_modified", len(cats[cat_name]["modified"]))
+        s.analyzed = True
+
+        total_added = sum(len(c["added"]) for c in cats.values())
+        total_modified = sum(len(c["modified"]) for c in cats.values())
+
+        src_name = _derive_map_name_from_materials(src)
+        base_name = _derive_map_name_from_materials(base)
+
+        self.report(
+            {'INFO'},
+            f"'{src_name}' vs '{base_name}': "
+            f"{total_added} added, {total_modified} modified entries"
+        )
+
+        # Auto-generate output path if empty
+        if not s.output_path:
+            out_dir = os.path.dirname(src)
+            s.output_path = os.path.join(out_dir, f"{src_name}.materials.prey")
+
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Operator: Export Materials.prey
+# ============================================================================
+
+class PREYEXPORT_OT_export(Operator):
+    """Export custom entries to a .materials.prey file"""
+    bl_idname = "preyexport.export"
+    bl_label = "Export .materials.prey"
+
+    def execute(self, context):
+        s = context.scene.prey_export_settings
+        src = bpy.path.abspath(s.source_materials)
+        base = bpy.path.abspath(s.base_materials)
+        output = bpy.path.abspath(s.output_path)
+
+        if not src or not os.path.isfile(src):
+            self.report({'ERROR'}, "Source materials.bin not found")
+            return {'CANCELLED'}
+        if not base or not os.path.isfile(base):
+            self.report({'ERROR'}, "Base materials.bin not found")
+            return {'CANCELLED'}
+        if not output:
+            self.report({'ERROR'}, "Output path not set")
+            return {'CANCELLED'}
+
+        # Ensure .materials.prey extension
+        if not output.endswith(".materials.prey"):
+            output += ".materials.prey"
+
+        include_cats = {
+            "materials": s.include_materials,
+            "vfx": s.include_vfx,
+            "particles": s.include_particles,
+            "lighting": s.include_lighting,
+            "map": s.include_map,
+            "visibility": s.include_visibility,
+            "banners": s.include_banners,
+            "jungle_camps": s.include_jungle_camps,
+            "navgrid": s.include_navgrid,
+            "extra": s.include_extra,
+        }
+
+        try:
+            result = export_materials_prey(
+                src, base, output,
+                include_categories=include_cats,
+                include_modified=s.include_modified,
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            return {'CANCELLED'}
+
+        cat_summary = ", ".join(
+            f"{c}: {n}" for c, n in result["categories"].items()
+        )
+        self.report(
+            {'INFO'},
+            f"Exported {result['total_entries']} entries "
+            f"({result['total_added']} added, {result['total_modified']} modified) "
+            f"→ {os.path.basename(output)}"
+        )
+
+        return {'FINISHED'}
+
+
+# ============================================================================
+# Panel: Materials.prey Export
+# ============================================================================
+
+class VIEW3D_PT_materials_prey_export(Panel):
+    """Export custom materials entries to a lightweight .materials.prey file"""
+    bl_label = "Materials.prey Export"
+    bl_idname = "VIEW3D_PT_materials_prey_export"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "League Tools"
+    bl_order = 81
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = context.scene.prey_export_settings
+
+        # ── Info ──
+        box = layout.box()
+        box.label(text="Export only custom entries from materials.bin", icon='EXPORT')
+        col = box.column(align=True)
+        col.label(text="Compare against a base map to find")
+        col.label(text="added and modified entries.")
+
+        # ── Source (custom map) ──
+        box = layout.box()
+        box.label(text="Source (custom map)", icon='FILE')
+        row = box.row(align=True)
+        row.prop(s, "source_materials", text="")
+        row.operator("preyexport.pick_source", text="", icon='FILE_FOLDER')
+        if s.source_materials:
+            name = os.path.basename(bpy.path.abspath(s.source_materials))
+            box.label(text=f"  {name}", icon='MATERIAL')
+
+        # ── Base (vanilla map) ──
+        box = layout.box()
+        box.label(text="Base (vanilla map)", icon='FILE')
+        row = box.row(align=True)
+        row.prop(s, "base_materials", text="")
+        row.operator("preyexport.pick_base", text="", icon='FILE_FOLDER')
+        if s.base_materials:
+            name = os.path.basename(bpy.path.abspath(s.base_materials))
+            box.label(text=f"  {name}", icon='MATERIAL')
+
+        # ── Analyze button ──
+        layout.separator()
+        can_analyze = bool(s.source_materials and s.base_materials)
+        row = layout.row()
+        row.enabled = can_analyze
+        row.operator("preyexport.analyze", text="Analyze Differences", icon='VIEWZOOM')
+
+        # ── Category selection (shown after analysis) ──
+        if s.analyzed:
+            box = layout.box()
+            box.label(text="Custom entries found:", icon='INFO')
+
+            def _cat_row(box, prop_name, label, added, modified):
+                row = box.row()
+                row.prop(s, prop_name, text="")
+                total = added + modified if s.include_modified else added
+                detail = f"{label}: {added} added"
+                if modified > 0:
+                    detail += f", {modified} modified"
+                row.label(text=detail)
+
+            _cat_row(box, "include_materials", "Materials",
+                     s.count_materials_added, s.count_materials_modified)
+            _cat_row(box, "include_vfx", "VFX Definitions",
+                     s.count_vfx_added, s.count_vfx_modified)
+            _cat_row(box, "include_particles", "Particles / MPC",
+                     s.count_particles_added, s.count_particles_modified)
+            _cat_row(box, "include_lighting", "Lighting",
+                     s.count_lighting_added, s.count_lighting_modified)
+            _cat_row(box, "include_map", "Map Container",
+                     s.count_map_added, s.count_map_modified)
+            _cat_row(box, "include_visibility", "Visibility",
+                     s.count_visibility_added, s.count_visibility_modified)
+            _cat_row(box, "include_banners", "Esports Banners",
+                     s.count_banners_added, s.count_banners_modified)
+            _cat_row(box, "include_jungle_camps", "Jungle Camps",
+                     s.count_jungle_camps_added, s.count_jungle_camps_modified)
+            _cat_row(box, "include_navgrid", "Nav Grid",
+                     s.count_navgrid_added, s.count_navgrid_modified)
+            _cat_row(box, "include_extra", "Extra",
+                     s.count_extra_added, s.count_extra_modified)
+
+            box.separator()
+            box.prop(s, "include_modified")
+
+            # Total count
+            total = 0
+            for cat_name in ("materials", "vfx", "particles", "lighting", "map",
+                             "visibility", "banners", "jungle_camps", "navgrid", "extra"):
+                prop_name = f"include_{cat_name}"
+                if getattr(s, prop_name):
+                    added = getattr(s, f"count_{cat_name}_added")
+                    modified = getattr(s, f"count_{cat_name}_modified")
+                    total += added
+                    if s.include_modified:
+                        total += modified
+            box.label(text=f"Total to export: {total} entries", icon='CHECKMARK')
+
+        # ── Output ──
+        box = layout.box()
+        box.label(text="Output", icon='FILE_FOLDER')
+        row = box.row(align=True)
+        row.prop(s, "output_path", text="")
+        row.operator("preyexport.pick_output", text="", icon='FILE_FOLDER')
+
+        # ── Export button ──
+        layout.separator()
+        row = layout.row()
+        row.scale_y = 1.5
+        can_export = bool(
+            s.source_materials and s.base_materials
+            and s.output_path and s.analyzed
+        )
+        row.enabled = can_export
+        row.operator("preyexport.export", text="Export .materials.prey", icon='EXPORT')
+
+        if not can_export and not s.analyzed and s.source_materials and s.base_materials:
+            layout.label(text="Click 'Analyze Differences' first", icon='ERROR')
+        elif not can_export:
+            layout.label(text="Set source, base, and output path", icon='ERROR')
+
+
+# ============================================================================
 # Settings PropertyGroup
 # ============================================================================
+
+def _on_materials_prey_update(self, context):
+    """Update cached prey metadata when the file path changes."""
+    self.prey_cache_entries = 0
+    self.prey_cache_source = ""
+    path = bpy.path.abspath(self.materials_prey)
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            # Read only the first ~2KB to extract metadata without parsing full file
+            header = f.read(2048)
+        import re as _re
+        m = _re.search(r'"total_entries"\s*:\s*(\d+)', header)
+        if m:
+            self.prey_cache_entries = int(m.group(1))
+        m = _re.search(r'"source_map"\s*:\s*"([^"]+)"', header)
+        if m:
+            self.prey_cache_source = m.group(1)
+    except Exception:
+        pass
+
 
 class MapPorterSettings(PropertyGroup):
     source_mapgeo: StringProperty(
@@ -1120,6 +1980,16 @@ class MapPorterSettings(PropertyGroup):
         description="Path to the source .materials.bin file (the map to port)",
         subtype='FILE_PATH',
     )
+    materials_prey: StringProperty(
+        name="Custom Materials (.materials.prey)",
+        description="Path to a .materials.prey file containing only custom entries. "
+                    "When set, these custom entries are injected into the target "
+                    "instead of doing a full source merge",
+        subtype='FILE_PATH',
+        update=_on_materials_prey_update,
+    )
+    prey_cache_entries: IntProperty(default=0)
+    prey_cache_source: StringProperty(default="")
     target_materials: StringProperty(
         name="Target Materials",
         description="Path to the target .materials.bin file (the map slot to port into)",
@@ -1173,8 +2043,8 @@ class VIEW3D_PT_map_porter(Panel):
         box = layout.box()
         box.label(text="Port one map onto another map slot", icon='FILE_REFRESH')
         col = box.column(align=True)
-        col.label(text="All entries from SOURCE (preserving order).")
-        col.label(text="Only mapContainer swapped from TARGET.")
+        col.label(text="All entries from SOURCE (preserving order),")
+        col.label(text="or inject custom entries from .materials.prey.")
 
         # ── Source Map ──
         box = layout.box()
@@ -1188,13 +2058,39 @@ class VIEW3D_PT_map_porter(Panel):
             name = os.path.basename(bpy.path.abspath(settings.source_mapgeo))
             box.label(text=f"  Mapgeo: {name}", icon='MESH_DATA')
 
-        # Source Materials
+        # Source Materials (full .materials.bin)
         row = box.row(align=True)
         row.prop(settings, "source_materials", text="")
         row.operator("mapporter.pick_source_materials", text="", icon='FILE_FOLDER')
         if settings.source_materials:
             name = os.path.basename(bpy.path.abspath(settings.source_materials))
             box.label(text=f"  Materials: {name}", icon='MATERIAL')
+
+        # Custom Materials (.materials.prey) — alternative to full source
+        box_prey = box.box()
+        box_prey.label(text="— OR use custom entries —", icon='FILTER')
+        row = box_prey.row(align=True)
+        row.prop(settings, "materials_prey", text="")
+        row.operator("mapporter.pick_materials_prey", text="", icon='FILE_FOLDER')
+        if settings.materials_prey:
+            prey_file = bpy.path.abspath(settings.materials_prey)
+            name = os.path.basename(prey_file)
+            box_prey.label(text=f"  Prey: {name}", icon='OUTLINER_OB_LIGHT')
+            # Show cached entry count (populated on file selection, no I/O here)
+            if settings.prey_cache_entries > 0:
+                src_map = settings.prey_cache_source or "?"
+                box_prey.label(
+                    text=f"  {settings.prey_cache_entries} custom entries from '{src_map}'",
+                    icon='INFO',
+                )
+
+        # Show mode indicator
+        has_prey = bool(settings.materials_prey)
+        has_src = bool(settings.source_materials)
+        if has_prey and has_src:
+            box.label(text="Prey file takes priority over source materials", icon='INFO')
+        elif has_prey:
+            box.label(text="Mode: Custom entries injection", icon='CHECKMARK')
 
         # ── Target Map ──
         box = layout.box()
@@ -1242,14 +2138,17 @@ class VIEW3D_PT_map_porter(Panel):
         row = layout.row()
         row.scale_y = 1.5
 
-        can_port = bool(settings.source_materials and settings.target_materials
+        has_source = bool(settings.source_materials or settings.materials_prey)
+        can_port = bool(has_source and settings.target_materials
                         and settings.output_directory)
         row.enabled = can_port
         row.operator("mapporter.port_map", text="Port Map", icon='FILE_REFRESH')
 
         if not can_port:
-            layout.label(text="Set source materials, target materials, and output directory",
-                         icon='ERROR')
+            layout.label(
+                text="Set source (materials or .prey), target, and output",
+                icon='ERROR',
+            )
 
 
 # ============================================================================
@@ -1258,12 +2157,20 @@ class VIEW3D_PT_map_porter(Panel):
 
 _classes = [
     MapPorterSettings,
+    MaterialsPreyExportSettings,
     MAPPORTER_OT_pick_source_mapgeo,
     MAPPORTER_OT_pick_source_materials,
     MAPPORTER_OT_pick_target_materials,
     MAPPORTER_OT_pick_output_dir,
     MAPPORTER_OT_pick_map11,
+    MAPPORTER_OT_pick_materials_prey,
+    PREYEXPORT_OT_pick_source,
+    PREYEXPORT_OT_pick_base,
+    PREYEXPORT_OT_pick_output,
+    PREYEXPORT_OT_analyze,
+    PREYEXPORT_OT_export,
     MAPPORTER_OT_port_map,
+    VIEW3D_PT_materials_prey_export,
     VIEW3D_PT_map_porter,
 ]
 
@@ -1272,10 +2179,12 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.map_porter_settings = bpy.props.PointerProperty(type=MapPorterSettings)
+    bpy.types.Scene.prey_export_settings = bpy.props.PointerProperty(type=MaterialsPreyExportSettings)
     print("[Map Porter] Registered")
 
 
 def unregister():
+    del bpy.types.Scene.prey_export_settings
     del bpy.types.Scene.map_porter_settings
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

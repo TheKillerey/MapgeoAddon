@@ -22,33 +22,6 @@ _PARTICLE_ITEM_TYPES = {"MapParticle", "0x1f1f50f2"}
 _VFX_DEF_TYPE = "VfxSystemDefinitionData"
 _CONTAINER_TYPE = "MapPlaceableContainer"
 
-# ---------------------------------------------------------------------------
-# Shared cube mesh
-# ---------------------------------------------------------------------------
-
-_CUBE_MESH_NAME = "Particle_Cube_Preview"
-
-
-def _get_or_create_cube_mesh(size=0.5):
-    mesh = bpy.data.meshes.get(_CUBE_MESH_NAME)
-    if mesh is not None:
-        return mesh
-    mesh = bpy.data.meshes.new(_CUBE_MESH_NAME)
-    h = size * 0.5
-    verts = [
-        (-h, -h, -h), (h, -h, -h), (h, h, -h), (-h, h, -h),
-        (-h, -h,  h), (h, -h,  h), (h, h,  h), (-h, h,  h),
-    ]
-    faces = [
-        (0, 1, 2, 3), (4, 5, 6, 7),
-        (0, 1, 5, 4), (1, 2, 6, 5),
-        (2, 3, 7, 6), (3, 0, 4, 7),
-    ]
-    mesh.from_pydata(verts, [], faces)
-    mesh.update()
-    return mesh
-
-
 # ===================================================================
 # PARSING
 # ===================================================================
@@ -602,8 +575,6 @@ def import_particles_from_materials(
     except Exception:
         baron_parser = None
 
-    cube_mesh = _get_or_create_cube_mesh(cube_size)
-
     # Root collections
     settings = context.scene.mapgeo_settings
     root_name = root_collection_name or (
@@ -629,7 +600,7 @@ def import_particles_from_materials(
     wm.progress_begin(0, max(total, 1))
 
     try:
-        # --- 1) VFX Raw Particles (use cube mesh — few objects) ---
+        # --- 1) VFX Definitions (use Empties — not geometry) ---
         if vfx_count > 0:
             vfx_col_name = f"{particles_col_name}_VFX_Definitions"
             vfx_col = bpy.data.collections.get(vfx_col_name)
@@ -644,7 +615,9 @@ def import_particles_from_materials(
                 # Trim trailing underscores from sanitization
                 safe_name = safe_name.strip('_') or safe_name
 
-                obj = bpy.data.objects.new(f"VFX_{safe_name}", cube_mesh)
+                obj = bpy.data.objects.new(f"VFX_{safe_name}", None)
+                obj.empty_display_type = 'CUBE'
+                obj.empty_display_size = cube_size
                 vfx_col.objects.link(obj)
 
                 obj["is_vfx_definition"] = True

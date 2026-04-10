@@ -1125,31 +1125,46 @@ def import_nvr(filepath: str, collection_name: str = "Legacy_NVR") -> dict:
             me.from_pydata(all_verts, [], all_faces)
             me.update()
 
-            # UV0 — primary tile/diffuse UVs
+            # Pre-fetch loop→vertex mapping for bulk UV/color writes
+            n_loops = len(me.loops)
+            loop_vi = [0] * n_loops
+            me.loops.foreach_get("vertex_index", loop_vi)
+            uv0_count = len(all_uvs0)
+
+            # UV0 — primary tile/diffuse UVs (bulk foreach_set)
             uv0_layer = me.uv_layers.new(name="UVMap")
-            for poly in me.polygons:
-                for li in poly.loop_indices:
-                    vi = me.loops[li].vertex_index
-                    if vi < len(all_uvs0):
-                        uv0_layer.data[li].uv = all_uvs0[vi]
+            uv0_flat = [0.0] * (n_loops * 2)
+            for i, vi in enumerate(loop_vi):
+                if vi < uv0_count:
+                    uv0_flat[i * 2] = all_uvs0[vi][0]
+                    uv0_flat[i * 2 + 1] = all_uvs0[vi][1]
+            uv0_layer.data.foreach_set("uv", uv0_flat)
 
             # UV1 — blend map UVs (FourBlend only)
             if all_uvs1:
                 uv1_layer = me.uv_layers.new(name="UV1_Blend")
-                for poly in me.polygons:
-                    for li in poly.loop_indices:
-                        vi = me.loops[li].vertex_index
-                        if vi < len(all_uvs1):
-                            uv1_layer.data[li].uv = all_uvs1[vi]
+                uv1_count = len(all_uvs1)
+                uv1_flat = [0.0] * (n_loops * 2)
+                for i, vi in enumerate(loop_vi):
+                    if vi < uv1_count:
+                        uv1_flat[i * 2] = all_uvs1[vi][0]
+                        uv1_flat[i * 2 + 1] = all_uvs1[vi][1]
+                uv1_layer.data.foreach_set("uv", uv1_flat)
 
-            # Vertex colors
+            # Vertex colors (bulk foreach_set)
             if all_colors:
                 vcol = me.color_attributes.new(name="Color", type='BYTE_COLOR', domain='CORNER')
-                for poly in me.polygons:
-                    for li in poly.loop_indices:
-                        vi = me.loops[li].vertex_index
-                        if vi < len(all_colors):
-                            vcol.data[li].color = all_colors[vi]
+                color_count = len(all_colors)
+                color_flat = [0.0] * (n_loops * 4)
+                for i, vi in enumerate(loop_vi):
+                    if vi < color_count:
+                        c = all_colors[vi]
+                        base = i * 4
+                        color_flat[base] = c[0]
+                        color_flat[base + 1] = c[1]
+                        color_flat[base + 2] = c[2]
+                        color_flat[base + 3] = c[3] if len(c) > 3 else 1.0
+                vcol.data.foreach_set("color", color_flat)
 
             obj = bpy.data.objects.new(me.name, me)
             collection.objects.link(obj)

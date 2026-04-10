@@ -417,11 +417,12 @@ def _build_blender_mesh(mesh_data, collection, apply_rotation=True, import_color
     bl_mesh.validate(verbose=False, clean_customdata=False)
     bl_mesh.update()
 
-    # ----- UV Layer -----
+    # ----- UV Layer ----- (bulk foreach_set for performance)
     if mesh_data.uvs:
         uv_layer = bl_mesh.uv_layers.new(name="UVMap")
-        uv_data = uv_layer.data
-
+        n_loops = len(bl_mesh.loops)
+        uv_flat = [0.0] * (n_loops * 2)
+        loop_offset = 0
         for fi, poly in enumerate(bl_mesh.polygons):
             if fi >= len(mesh_data.uvs):
                 break
@@ -430,13 +431,11 @@ def _build_blender_mesh(mesh_data, collection, apply_rotation=True, import_color
                 if li >= len(face_uvs):
                     break
                 # If winding was reversed, UV order must match
-                if apply_rotation:
-                    # Face was (v0, v2, v1) so UV order is (uv0, uv2, uv1)
-                    uv_idx = [0, 2, 1][li]
-                else:
-                    uv_idx = li
+                uv_idx = [0, 2, 1][li] if apply_rotation else li
                 u, v = face_uvs[uv_idx]
-                uv_data[loop_idx].uv = (u, 1.0 - v)  # Flip V for Blender
+                uv_flat[loop_idx * 2] = u
+                uv_flat[loop_idx * 2 + 1] = 1.0 - v  # Flip V for Blender
+        uv_layer.data.foreach_set("uv", uv_flat)
 
     # ----- Materials -----
     # Collect unique material names and assign per-face
@@ -456,19 +455,27 @@ def _build_blender_mesh(mesh_data, collection, apply_rotation=True, import_color
             if fi < len(mesh_data.materials):
                 poly.material_index = mat_map.get(mesh_data.materials[fi], 0)
 
-    # ----- Vertex Colors -----
+    # ----- Vertex Colors ----- (bulk foreach_set for performance)
     if import_colors and hasattr(mesh_data, 'vertex_colors') and mesh_data.vertex_colors:
         color_layer = bl_mesh.color_attributes.new(
             name="VertexColor",
             type='BYTE_COLOR',
             domain='CORNER'
         )
-        for poly in bl_mesh.polygons:
-            for loop_idx in poly.loop_indices:
-                vert_idx = bl_mesh.loops[loop_idx].vertex_index
-                if vert_idx < len(mesh_data.vertex_colors):
-                    r, g, b, a = mesh_data.vertex_colors[vert_idx]
-                    color_layer.data[loop_idx].color = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+        n_loops = len(bl_mesh.loops)
+        loop_vi = [0] * n_loops
+        bl_mesh.loops.foreach_get("vertex_index", loop_vi)
+        vc_count = len(mesh_data.vertex_colors)
+        color_flat = [0.0] * (n_loops * 4)
+        for i, vi in enumerate(loop_vi):
+            if vi < vc_count:
+                r, g, b, a = mesh_data.vertex_colors[vi]
+                base = i * 4
+                color_flat[base] = r / 255.0
+                color_flat[base + 1] = g / 255.0
+                color_flat[base + 2] = b / 255.0
+                color_flat[base + 3] = a / 255.0
+        color_layer.data.foreach_set("color", color_flat)
 
     # ----- Custom properties (metadata) -----
     bl_obj["league_sco_scb"] = True

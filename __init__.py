@@ -1,5 +1,5 @@
 """
-League of Legends Mapgeo Addon for Blender 5.0
+League of Legends Mapgeo Addon for Blender 5.0 / 5.1
 Author: TheKillerey
 Description: A comprehensive tool to import, edit, and export League of Legends .mapgeo files and more
 """
@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 4, 2),
+    "version": (0, 4, 4),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -49,10 +49,12 @@ from . import (
     project_manager,
     map_porter,
     map_patcher,
+    map11_editor,
     character_bin_updater,
     project_checker,
     mapgeo_debug,
     map_objects_import,
+    materials_bin_manager,
     utils,
 )
 
@@ -774,6 +776,7 @@ classes = (
     ui_panel.MAPGEO_OT_open_addon_release_page,
     ui_panel.MAPGEO_OT_setup_mesh,
     ui_panel.MAPGEO_OT_reverse_selected_faces,
+    ui_panel.MAPGEO_OT_select_same_oriented_faces,
     ui_panel.MAPGEO_OT_enable_decal_transparency_overlap,
     ui_panel.MAPGEO_OT_initialize_custom_mesh,
     ui_panel.MAPGEO_OT_assign_layer,
@@ -922,6 +925,12 @@ def register():
     except Exception as e:
         print(f"[Map Patcher] Registration failed: {e}")
 
+    # Register map11 editor
+    try:
+        map11_editor.register()
+    except Exception as e:
+        print(f"[Map11 Editor] Registration failed: {e}")
+
     # Register character bin updater
     try:
         character_bin_updater.register()
@@ -933,6 +942,12 @@ def register():
         project_checker.register()
     except Exception as e:
         print(f"[Project Checker] Registration failed: {e}")
+
+    # Register materials.bin manager
+    try:
+        materials_bin_manager.register()
+    except Exception as e:
+        print(f"[Materials.bin Manager] Registration failed: {e}")
 
     # Register mapgeo debug tool
     try:
@@ -966,6 +981,12 @@ def unregister():
     except Exception as e:
         print(f"[Project Checker] Unregister failed: {e}")
 
+    # Unregister materials.bin manager
+    try:
+        materials_bin_manager.unregister()
+    except Exception as e:
+        print(f"[Materials.bin Manager] Unregister failed: {e}")
+
     # Unregister mapgeo debug tool
     try:
         mapgeo_debug.unregister()
@@ -977,6 +998,12 @@ def unregister():
         map_patcher.unregister()
     except Exception as e:
         print(f"[Map Patcher] Unregister failed: {e}")
+
+    # Unregister map11 editor
+    try:
+        map11_editor.unregister()
+    except Exception as e:
+        print(f"[Map11 Editor] Unregister failed: {e}")
 
     # Unregister map porter
     try:

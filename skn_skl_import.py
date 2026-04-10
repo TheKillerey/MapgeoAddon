@@ -1007,14 +1007,19 @@ def _build_unified_mesh(
                 if key in face_lookup:
                     bl_mesh.polygons[face_lookup[key]].material_index = sub_idx
 
-    # ---- UVs ----
+    # ---- UVs ---- (bulk foreach_set for performance)
     uv_layer = bl_mesh.uv_layers.new(name="UVMap")
-    for poly in bl_mesh.polygons:
-        for loop_idx in poly.loop_indices:
-            vert_idx = bl_mesh.loops[loop_idx].vertex_index
-            if vert_idx < len(skn.vertices):
-                u, v = skn.vertices[vert_idx].uv
-                uv_layer.data[loop_idx].uv = (u, 1.0 - v)
+    n_loops = len(bl_mesh.loops)
+    loop_vi = [0] * n_loops
+    bl_mesh.loops.foreach_get("vertex_index", loop_vi)
+    vert_count = len(skn.vertices)
+    uv_flat = [0.0] * (n_loops * 2)
+    for i, vi in enumerate(loop_vi):
+        if vi < vert_count:
+            u, v = skn.vertices[vi].uv
+            uv_flat[i * 2] = u
+            uv_flat[i * 2 + 1] = 1.0 - v
+    uv_layer.data.foreach_set("uv", uv_flat)
 
     # ---- Normals ----
     normals = []
@@ -1025,18 +1030,21 @@ def _build_unified_mesh(
             normals.append(v.normal)
     bl_mesh.normals_split_custom_set_from_vertices(normals)
 
-    # ---- Vertex Colors ----
+    # ---- Vertex Colors ---- (bulk foreach_set for performance)
     if import_colors and any(v.color is not None for v in skn.vertices):
         color_layer = bl_mesh.color_attributes.new(
             name="Color", type='BYTE_COLOR', domain='CORNER'
         )
-        for poly in bl_mesh.polygons:
-            for loop_idx in poly.loop_indices:
-                vert_idx = bl_mesh.loops[loop_idx].vertex_index
-                if vert_idx < len(skn.vertices) and skn.vertices[vert_idx].color:
-                    c = skn.vertices[vert_idx].color
-                    color_layer.data[loop_idx].color = (c[0] / 255.0, c[1] / 255.0,
-                                                        c[2] / 255.0, c[3] / 255.0)
+        color_flat = [0.0] * (n_loops * 4)
+        for i, vi in enumerate(loop_vi):
+            if vi < vert_count and skn.vertices[vi].color:
+                c = skn.vertices[vi].color
+                base = i * 4
+                color_flat[base] = c[0] / 255.0
+                color_flat[base + 1] = c[1] / 255.0
+                color_flat[base + 2] = c[2] / 255.0
+                color_flat[base + 3] = c[3] / 255.0
+        color_layer.data.foreach_set("color", color_flat)
 
     # ---- Vertex Groups (Bone Weights) ----
     if skeleton:
@@ -1164,15 +1172,20 @@ def _build_single_submesh(
         mat.use_nodes = True
     bl_mesh.materials.append(mat)
 
-    # UVs
+    # UVs (bulk foreach_set for performance)
     uv_layer = bl_mesh.uv_layers.new(name="UVMap")
-    for poly in bl_mesh.polygons:
-        for loop_idx in poly.loop_indices:
-            local_vi = bl_mesh.loops[loop_idx].vertex_index
-            global_vi = sv + local_vi
-            if global_vi < len(skn.vertices):
-                u, v = skn.vertices[global_vi].uv
-                uv_layer.data[loop_idx].uv = (u, 1.0 - v)
+    n_loops = len(bl_mesh.loops)
+    loop_vi = [0] * n_loops
+    bl_mesh.loops.foreach_get("vertex_index", loop_vi)
+    total_verts = len(skn.vertices)
+    uv_flat = [0.0] * (n_loops * 2)
+    for i, lvi in enumerate(loop_vi):
+        gvi = sv + lvi
+        if gvi < total_verts:
+            u, v = skn.vertices[gvi].uv
+            uv_flat[i * 2] = u
+            uv_flat[i * 2 + 1] = 1.0 - v
+    uv_layer.data.foreach_set("uv", uv_flat)
 
     # Normals
     normals = []
@@ -1188,7 +1201,7 @@ def _build_single_submesh(
             normals.append((0, 0, 1))
     bl_mesh.normals_split_custom_set_from_vertices(normals)
 
-    # Vertex colors
+    # Vertex colors (bulk foreach_set for performance)
     if import_colors:
         has_any = any(
             skn.vertices[sv + i].color is not None
@@ -1198,15 +1211,17 @@ def _build_single_submesh(
             color_layer = bl_mesh.color_attributes.new(
                 name="Color", type='BYTE_COLOR', domain='CORNER'
             )
-            for poly in bl_mesh.polygons:
-                for loop_idx in poly.loop_indices:
-                    local_vi = bl_mesh.loops[loop_idx].vertex_index
-                    global_vi = sv + local_vi
-                    if global_vi < len(skn.vertices) and skn.vertices[global_vi].color:
-                        c = skn.vertices[global_vi].color
-                        color_layer.data[loop_idx].color = (
-                            c[0] / 255.0, c[1] / 255.0, c[2] / 255.0, c[3] / 255.0
-                        )
+            color_flat = [0.0] * (n_loops * 4)
+            for i, lvi in enumerate(loop_vi):
+                gvi = sv + lvi
+                if gvi < total_verts and skn.vertices[gvi].color:
+                    c = skn.vertices[gvi].color
+                    base = i * 4
+                    color_flat[base] = c[0] / 255.0
+                    color_flat[base + 1] = c[1] / 255.0
+                    color_flat[base + 2] = c[2] / 255.0
+                    color_flat[base + 3] = c[3] / 255.0
+            color_layer.data.foreach_set("color", color_flat)
 
     # Vertex groups
     if skeleton:

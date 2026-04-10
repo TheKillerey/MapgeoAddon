@@ -57,6 +57,7 @@ class CheckIssue(PropertyGroup):
     message:   StringProperty(name="Message",   default="")
     detail:    StringProperty(name="Detail",    default="")
     file_path: StringProperty(name="File",      default="", subtype='FILE_PATH')
+    fix_id:    StringProperty(name="Fix ID",    default="")
 
 
 class ProjectCheckerSettings(PropertyGroup):
@@ -176,13 +177,14 @@ def run_checks(project_settings) -> list:
 
     issues = []
 
-    def add(severity, category, message, detail="", file_path=""):
+    def add(severity, category, message, detail="", file_path="", fix_id=""):
         issues.append({
             'severity': severity,
             'category': category,
             'message':  message,
             'detail':   detail,
             'file_path': file_path,
+            'fix_id':   fix_id,
         })
 
     s = project_settings
@@ -268,13 +270,17 @@ def run_checks(project_settings) -> list:
     # ── CHECK 1: Mapgeo → Materials ───────────────────────────────────────
     if mapgeo_data and bin_data:
         missing_mats = set()
+        default_count = 0
         for mesh in mapgeo_data.meshes:
             for prim in mesh.primitives:
                 name = prim.material
                 if not name:
                     continue
+                if name == 'Default':
+                    default_count += 1
+                    continue
                 # Look up by FNV-1a hash (robust, doesn't rely on name field)
-                ph = hex(_fnv1a_32(name))
+                ph = f"0x{_fnv1a_32(name):08x}"
                 if ph not in all_path_hashes:
                     missing_mats.add(name)
 
@@ -282,11 +288,18 @@ def run_checks(project_settings) -> list:
             for name in sorted(missing_mats):
                 add('ERROR', 'Materials',
                     'Mapgeo material not found in materials.bin',
-                    detail=name, file_path=loaded_mapgeo)
+                    detail=name, file_path=loaded_mapgeo,
+                    fix_id='MISSING_MATERIAL')
         else:
             total = sum(len(m.primitives) for m in mapgeo_data.meshes)
             add('INFO', 'Materials',
-                f'All {total} mesh primitive materials resolve OK.')
+                f'All {total - default_count} mesh primitive materials resolve OK.')
+        if default_count:
+            add('WARNING', 'Materials',
+                f'{default_count} mesh primitive(s) use "Default" material '
+                f'(VFX placeholder — not expected in mapgeo)',
+                file_path=loaded_mapgeo,
+                fix_id='MISSING_MATERIAL')
 
     # ── CHECK 2: Materials → Textures ─────────────────────────────────────
     if bin_data:
@@ -374,10 +387,9 @@ def run_checks(project_settings) -> list:
                 is_custom = True   # no basis for comparison → assume custom
 
             if is_custom:
-                add('WARNING', 'BucketGrid',
+                add('INFO', 'BucketGrid',
                     f'Custom bucket grid detected ({len(active_grids)} active grid(s)).',
-                    detail='Custom bucket grids cause issues until the bucket grid feature '
-                           'is fully implemented. They will be handled automatically later.',
+                    detail='This is a custom bucket grid. It will be exported as-is.',
                     file_path=loaded_mapgeo)
             else:
                 add('INFO', 'BucketGrid',
@@ -390,30 +402,55 @@ def run_checks(project_settings) -> list:
         bad_vis  = []
         ok_vis   = 0
 
+        # Build set of render_region_hash values used by meshes so we can
+        # distinguish genuine VC lookups from render-region identifiers on
+        # bucket grids.
+        render_region_hashes = set()
+        for mesh in mapgeo_data.meshes:
+            rr = mesh.unknown_version18_int
+            if rr and rr != 0:
+                render_region_hashes.add(f"0x{rr:08x}")
+
         for i, mesh in enumerate(mapgeo_data.meshes):
             h = mesh.visibility_controller_path_hash
             if h and h != 0:
-                ph_str = hex(h)
+                ph_str = f"0x{h:08x}"
                 if ph_str not in all_path_hashes:
                     bad_vis.append(f'Mesh #{i}: {ph_str}')
                 else:
                     ok_vis += 1
 
+        bad_bg_vis  = []
+        ok_bg_vis   = 0
+        rr_bg_count = 0
         for bg in mapgeo_data.bucket_grids:
             h = bg.path_hash
             if h and h != 0:
-                ph_str = hex(h)
-                if ph_str not in all_path_hashes:
-                    bad_vis.append(f'BucketGrid: {ph_str}')
+                ph_str = f"0x{h:08x}"
+                if ph_str in all_path_hashes:
+                    ok_bg_vis += 1
+                elif ph_str in render_region_hashes:
+                    # This is a render-region identifier, not a VC lookup
+                    rr_bg_count += 1
                 else:
-                    ok_vis += 1
+                    bad_bg_vis.append(f'BucketGrid: {ph_str}')
 
         for item in bad_vis:
             add('ERROR', 'Visibility',
                 'Visibility controller path_hash not in materials.bin',
-                detail=item, file_path=loaded_mapgeo)
-        if ok_vis:
-            add('INFO', 'Visibility', f'{ok_vis} visibility controller(s) resolved OK.')
+                detail=item, file_path=loaded_mapgeo,
+                fix_id='MISSING_VISIBILITY')
+        for item in bad_bg_vis:
+            add('ERROR', 'Visibility',
+                'BucketGrid path_hash not in materials.bin',
+                detail=item, file_path=loaded_mapgeo,
+                fix_id='MISSING_VISIBILITY')
+        ok_total = ok_vis + ok_bg_vis
+        if ok_total:
+            add('INFO', 'Visibility', f'{ok_total} visibility controller(s) resolved OK.')
+        if rr_bg_count:
+            add('INFO', 'Visibility',
+                f'{rr_bg_count} bucket grid(s) use render-region hashes (no VC entry needed).')
 
     # ── CHECK 6: Linked bin files ─────────────────────────────────────────
     if bin_data:
@@ -431,7 +468,7 @@ def run_checks(project_settings) -> list:
                     f'Linked file not found: {os.path.basename(norm)}',
                     detail=norm, file_path=loaded_materials)
 
-    # ── CHECK 7: VFX / MapParticle cross-links ────────────────────────────
+    # ── CHECK 7: VFX / MapParticle cross-links (bin level) ──────────────
     if bin_data:
         vfx_types = {_HASH_VFX_SYSTEM, _HASH_MAP_PLACEABLE, _HASH_MAP_PARTICLE}
         bad_links  = []
@@ -457,6 +494,67 @@ def run_checks(project_settings) -> list:
                 detail=item, file_path=loaded_materials)
         if ok_links:
             add('INFO', 'VFX', f'{ok_links} VFX link(s) resolved OK.')
+
+    # ── CHECK 7b: MapParticle → VFX_Definition (scene level) ─────────────
+    # Verify each MapParticle in the scene references a VFX_Definition that
+    # actually exists both in the Blender scene and in the materials.bin.
+    vfx_defs_by_name = {}   # vfx_name → obj
+    particle_systems = []   # (obj, system_name)
+
+    for obj in bpy.context.scene.objects:
+        if obj.get('is_vfx_definition'):
+            vname = obj.get('vfx_name', '')
+            if vname:
+                vfx_defs_by_name[vname] = obj
+        if obj.get('is_particle_system'):
+            sys_name = obj.get('particle_system', '')
+            if sys_name:
+                particle_systems.append((obj, sys_name))
+
+    if particle_systems:
+        # Also build a set of VFX entry path_hashes in the bin
+        vfx_bin_hashes = set()
+        if bin_data:
+            for entry in bin_data.get('entries', []):
+                th = entry.get('type_hash', '')
+                th_int = int(th, 16) if (th and th.startswith('0x')) else 0
+                if th_int == _HASH_VFX_SYSTEM:
+                    vfx_bin_hashes.add(entry.get('path_hash', ''))
+
+        missing_scene = []
+        missing_bin   = []
+        ok_particle   = 0
+
+        for obj, sys_name in particle_systems:
+            # Check Blender scene
+            has_scene_def = sys_name in vfx_defs_by_name
+            # Check materials.bin by hashing the system name
+            sys_hash = f"0x{_fnv1a_32(sys_name):08x}"
+            has_bin_def = sys_hash in vfx_bin_hashes or sys_hash in all_path_hashes
+
+            if has_scene_def and has_bin_def:
+                ok_particle += 1
+            elif not has_scene_def and not has_bin_def:
+                missing_scene.append(f'{obj.name} → {sys_name} (missing in scene + bin)')
+            elif not has_scene_def:
+                missing_scene.append(f'{obj.name} → {sys_name} (missing in scene)')
+            elif not has_bin_def:
+                missing_bin.append(f'{obj.name} → {sys_name} (missing in bin)')
+
+        for item in missing_scene:
+            add('WARNING', 'VFX',
+                'MapParticle references missing VFX definition',
+                detail=item)
+        for item in missing_bin:
+            add('WARNING', 'VFX',
+                'MapParticle VFX system not found in materials.bin',
+                detail=item, file_path=loaded_materials)
+        if ok_particle:
+            add('INFO', 'VFX',
+                f'{ok_particle} MapParticle(s) have matching VFX definitions.')
+    elif vfx_defs_by_name:
+        add('INFO', 'VFX',
+            f'{len(vfx_defs_by_name)} VFX definition(s) loaded (no MapParticles to check).')
 
     # ── CHECK 8: Lightmap / stationary-light textures ─────────────────────
     if mapgeo_data:
@@ -539,7 +637,7 @@ def run_checks(project_settings) -> list:
                     sbin = propertybin_parser.parse_bin(spath)
                     skins_entry_count = sum(
                         1 for e in sbin.get('entries', [])
-                        if e.get('type_hash', '') == hex(_HASH_VIS_CTRL)
+                        if e.get('type_hash', '') == f"0x{_HASH_VIS_CTRL:08x}"
                     )
                     add('INFO', 'MapBin',
                         f'Shipping map bin parsed OK: {len(sbin.get("entries", []))} entries',
@@ -600,6 +698,7 @@ class PROJ_OT_run_integrity_check(Operator):
             item.message      = issue['message']
             item.detail       = issue.get('detail', '')
             item.file_path    = issue.get('file_path', '')
+            item.fix_id       = issue.get('fix_id', '')
             if issue['severity'] == 'ERROR':
                 errors += 1
             elif issue['severity'] == 'WARNING':
@@ -646,6 +745,243 @@ class PROJ_OT_open_issue_file(Operator):
                 subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
             except Exception:
                 pass
+        return {'FINISHED'}
+
+
+class PROJ_OT_select_issue_meshes(Operator):
+    """Select mesh objects affected by the selected issue"""
+    bl_idname  = "project.select_issue_meshes"
+    bl_label   = "Select Affected Meshes"
+    bl_description = "Select all mesh objects affected by this issue"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        checker = context.scene.project_checker
+        idx = checker.active_index
+        if idx < 0 or idx >= len(checker.issues):
+            self.report({'ERROR'}, "No issue selected")
+            return {'CANCELLED'}
+
+        item = checker.issues[idx]
+        fix_id = item.fix_id
+
+        if fix_id == 'MISSING_MATERIAL':
+            return self._select_by_material(context, item.detail)
+        elif fix_id == 'MISSING_VISIBILITY':
+            return self._select_by_visibility(context, item.detail)
+
+        self.report({'WARNING'}, "No mesh selection available for this issue type")
+        return {'CANCELLED'}
+
+    def _select_by_material(self, context, mat_name):
+        if context.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+        bpy.ops.object.select_all(action='DESELECT')
+        count = 0
+        for obj in context.scene.objects:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+            for mat_slot in obj.material_slots:
+                mat = mat_slot.material
+                if mat and mat.get('league_material_name') == mat_name:
+                    obj.select_set(True)
+                    count += 1
+                    break
+
+        self.report({'INFO'}, f"Selected {count} mesh(es) using '{mat_name}'")
+        return {'FINISHED'}
+
+    def _select_by_visibility(self, context, detail):
+        """Select meshes whose visibility_controller_path_hash matches the issue detail."""
+        if context.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+        # detail format: "Mesh #<idx>: 0x<hash>" or "BucketGrid: 0x<hash>"
+        hash_str = detail.split(':')[-1].strip() if ':' in detail else ''
+        try:
+            target_hash = int(hash_str, 16)
+        except (ValueError, TypeError):
+            self.report({'ERROR'}, f"Could not parse hash from: {detail}")
+            return {'CANCELLED'}
+
+        # baron_hash is stored as uppercase hex WITHOUT 0x prefix (e.g. "1A2B3C4D")
+        target_baron = f"{target_hash:08X}"
+
+        bpy.ops.object.select_all(action='DESELECT')
+        count = 0
+        for obj in context.scene.objects:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+            baron = obj.get('baron_hash', '')
+            if baron and baron.upper() == target_baron:
+                obj.select_set(True)
+                count += 1
+
+        self.report({'INFO'}, f"Selected {count} mesh(es) with visibility hash {hash_str}")
+        return {'FINISHED'}
+
+
+class PROJ_OT_fix_issue(Operator):
+    """Automatically fix the selected issue"""
+    bl_idname  = "project.fix_issue"
+    bl_label   = "Fix Issue"
+    bl_description = "Automatically fix this issue"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        checker = context.scene.project_checker
+        idx = checker.active_index
+        if idx < 0 or idx >= len(checker.issues):
+            self.report({'ERROR'}, "No issue selected")
+            return {'CANCELLED'}
+
+        item = checker.issues[idx]
+        if item.fix_id == 'MISSING_MATERIAL':
+            return self._fix_missing_material(context, item.detail)
+
+        self.report({'WARNING'}, "No auto-fix available for this issue type")
+        return {'CANCELLED'}
+
+    def _fix_missing_material(self, context, mat_name):
+        if context.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+        fixed_count = 0
+        for obj in context.scene.objects:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+            slots_to_remove = []
+            for slot_idx, mat_slot in enumerate(obj.material_slots):
+                mat = mat_slot.material
+                if mat and mat.get('league_material_name') == mat_name:
+                    slots_to_remove.append(slot_idx)
+
+            if not slots_to_remove:
+                continue
+
+            context.view_layer.objects.active = obj
+            for slot_idx in reversed(slots_to_remove):
+                obj.active_material_index = slot_idx
+                bpy.ops.object.material_slot_remove()
+            fixed_count += 1
+
+        if fixed_count:
+            self.report({'INFO'}, f"Removed '{mat_name}' material from {fixed_count} mesh(es)")
+        else:
+            self.report({'INFO'}, f"No meshes found with '{mat_name}' material")
+        return {'FINISHED'}
+
+
+class PROJ_OT_fix_visibility(Operator):
+    """Import missing visibility controller entries from another materials.bin"""
+    bl_idname  = "project.fix_visibility"
+    bl_label   = "Import Visibility Controller"
+    bl_description = (
+        "Browse for a materials.bin that contains the missing baron hash "
+        "visibility controller, and add it to your project's materials.bin"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.bin", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import copy
+        from . import propertybin_parser
+
+        checker  = context.scene.project_checker
+        settings = context.scene.project_settings
+
+        # Gather all missing visibility path hashes from current issues
+        missing_hashes = set()
+        for issue in checker.issues:
+            if issue.fix_id != 'MISSING_VISIBILITY':
+                continue
+            detail = issue.detail
+            hash_str = detail.split(':')[-1].strip() if ':' in detail else ''
+            if hash_str:
+                missing_hashes.add(hash_str.lower())
+
+        if not missing_hashes:
+            self.report({'INFO'}, "No missing visibility controllers to import")
+            return {'CANCELLED'}
+
+        # Parse the source bin the user selected
+        if not self.filepath or not os.path.isfile(self.filepath):
+            self.report({'ERROR'}, "Selected file does not exist")
+            return {'CANCELLED'}
+
+        try:
+            source_data = propertybin_parser.parse_bin(self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to parse source bin: {e}")
+            return {'CANCELLED'}
+
+        # Find matching entries in the source
+        entries_to_inject = []
+        for entry in source_data.get('entries', []):
+            ph = entry.get('path_hash', '').lower()
+            if ph in missing_hashes:
+                entries_to_inject.append(copy.deepcopy(entry))
+
+        if not entries_to_inject:
+            self.report({'WARNING'},
+                        f"Source bin does not contain any of the {len(missing_hashes)} "
+                        f"missing visibility controller(s)")
+            return {'CANCELLED'}
+
+        # Load the project's materials.bin
+        project_bin_path = bpy.path.abspath(settings.loaded_materials_path) \
+            if settings.loaded_materials_path else ''
+        if not project_bin_path or not os.path.isfile(project_bin_path):
+            self.report({'ERROR'}, "No project materials.bin loaded")
+            return {'CANCELLED'}
+
+        try:
+            target_data = propertybin_parser.parse_bin(project_bin_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to parse project bin: {e}")
+            return {'CANCELLED'}
+
+        # Check for duplicates and inject
+        existing = {e.get('path_hash', '').lower()
+                    for e in target_data.get('entries', [])}
+        injected = 0
+        for entry in entries_to_inject:
+            ph = entry.get('path_hash', '').lower()
+            if ph not in existing:
+                target_data['entries'].append(entry)
+                existing.add(ph)
+                injected += 1
+
+        if injected == 0:
+            self.report({'INFO'}, "All entries already exist in project bin")
+            return {'FINISHED'}
+
+        # Write back
+        try:
+            propertybin_parser.write_bin(target_data, project_bin_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to write project bin: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Imported {injected} visibility controller(s) into "
+                    f"{os.path.basename(project_bin_path)}")
         return {'FINISHED'}
 
 
@@ -797,6 +1133,19 @@ class VIEW3D_PT_project_checker(Panel):
                         icon='FILEBROWSER')
                     op.file_path = item.file_path
 
+                if item.fix_id:
+                    detail_box.separator()
+                    row = detail_box.row(align=True)
+                    row.operator("project.select_issue_meshes",
+                                 text="Select Affected Meshes",
+                                 icon='RESTRICT_SELECT_OFF')
+                    if item.fix_id == 'MISSING_MATERIAL':
+                        row.operator("project.fix_issue",
+                                     text="Fix", icon='CHECKMARK')
+                    elif item.fix_id == 'MISSING_VISIBILITY':
+                        row.operator("project.fix_visibility",
+                                     text="Fix (Load .bin)", icon='FILEBROWSER')
+
 
 # ============================================================================
 # Registration
@@ -808,6 +1157,9 @@ classes = (
     PROJ_OT_run_integrity_check,
     PROJ_OT_clear_check_results,
     PROJ_OT_open_issue_file,
+    PROJ_OT_select_issue_meshes,
+    PROJ_OT_fix_issue,
+    PROJ_OT_fix_visibility,
     PROJ_UL_check_issues,
     VIEW3D_PT_project_checker,
 )

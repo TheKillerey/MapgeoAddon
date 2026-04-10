@@ -4147,7 +4147,7 @@ class MATERIAL_PT_league_samplers(Panel):
                     node = mat.node_tree.nodes.get(f"MAPGEO_SAMPLER_{i}")
                     if node and hasattr(node, 'image') and node.image:
                         img = node.image
-                if img:
+                if img and img.preview:
                     box.template_icon(icon_value=img.preview.icon_id, scale=5.0)
 
                 # Path
@@ -4405,6 +4405,459 @@ def _get_all_defines_from_material(mat):
         pass
 
     return material_macros, pass_macros
+
+
+# ============================================================================
+# Bulk Shader Updater
+# ============================================================================
+
+def _collect_scene_shader_items(self, context):
+    """Build enum items from shaders actually used in the scene."""
+    items = []
+    seen = set()
+    for mat in bpy.data.materials:
+        shader = _get_shader_from_material(mat)
+        if shader and shader not in seen:
+            seen.add(shader)
+            short = shader.rsplit("/", 1)[-1]
+            count = sum(1 for m in bpy.data.materials if _get_shader_from_material(m) == shader)
+            items.append((shader, short, f"{count} material(s)"))
+    items.sort(key=lambda x: x[1].lower())
+    if not items:
+        items.append(("NONE", "(no shaders found)", ""))
+    return items
+
+
+class MAPGEO_OT_bulk_shader_update(Operator):
+    """Replace a shader across all materials that use it"""
+    bl_idname = "mapgeo.bulk_shader_update"
+    bl_label = "Bulk Shader Update"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    source_shader: EnumProperty(
+        name="From Shader",
+        description="The shader to replace (only shaders currently used in the scene are listed)",
+        items=_collect_scene_shader_items,
+    )
+    target_shader: EnumProperty(
+        name="To Shader",
+        items=_SHADER_ITEMS,
+        description="The new shader to apply",
+    )
+    custom_shader: StringProperty(name="Custom Shader Path", default="")
+    apply_template: BoolProperty(
+        name="Apply Shader Template",
+        description="Update samplers, parameters, switches, and macros from the shader template. Preserves existing texture paths",
+        default=True,
+    )
+    include_low_freq: BoolProperty(
+        name="Include Rare Properties",
+        default=False,
+        description="Also include parameters/switches that appear in <10% of materials using this shader",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.label(text="Replace shader on ALL materials that use it:", icon='FILE_REFRESH')
+        layout.separator()
+
+        layout.prop(self, "source_shader")
+        layout.separator()
+
+        layout.prop(self, "target_shader")
+        if self.target_shader == "CUSTOM":
+            layout.prop(self, "custom_shader")
+
+        target = self.custom_shader if self.target_shader == "CUSTOM" else self.target_shader
+        has_template = target in _SHADER_TEMPLATES
+
+        if has_template:
+            box = layout.box()
+            box.prop(self, "apply_template", icon='FILE_REFRESH')
+            if self.apply_template:
+                box.prop(self, "include_low_freq")
+                tpl = _SHADER_TEMPLATES[target]
+                threshold = 0 if self.include_low_freq else 10
+                samp = len([s for s in tpl.get("samplers", []) if s.get("frequency", 0) >= threshold])
+                parm = len([p for p in tpl.get("parameters", []) if p.get("frequency", 0) >= threshold])
+                sw = len([s for s in tpl.get("switches", []) if s.get("frequency", 0) >= threshold])
+                box.label(text=f"Template: {samp} samplers, {parm} params, {sw} switches", icon='INFO')
+                box.label(text="Existing texture paths will be preserved", icon='IMAGE_DATA')
+
+        # Show count of affected materials
+        if self.source_shader and self.source_shader != "NONE":
+            count = sum(1 for m in bpy.data.materials if _get_shader_from_material(m) == self.source_shader)
+            layout.separator()
+            layout.label(text=f"{count} material(s) will be updated", icon='MATERIAL')
+
+    def execute(self, context):
+        if self.source_shader == "NONE":
+            self.report({'WARNING'}, "No source shader selected")
+            return {'CANCELLED'}
+
+        target = self.custom_shader if self.target_shader == "CUSTOM" else self.target_shader
+        if not target:
+            self.report({'WARNING'}, "No target shader specified")
+            return {'CANCELLED'}
+
+        if self.source_shader == target:
+            self.report({'INFO'}, "Source and target shader are the same — nothing to do")
+            return {'CANCELLED'}
+
+        threshold = 0 if self.include_low_freq else 10
+        tpl = _SHADER_TEMPLATES.get(target) if self.apply_template else None
+
+        updated = 0
+        for mat in bpy.data.materials:
+            current_shader = _get_shader_from_material(mat)
+            if current_shader != self.source_shader:
+                continue
+
+            try:
+                techniques = json.loads(mat.get("techniques", "[]"))
+            except Exception:
+                continue
+
+            # Update shader in all passes across all techniques
+            changed = False
+            for tech in techniques:
+                for p in tech.get("passes", []):
+                    if p.get("shader") == self.source_shader:
+                        p["shader"] = target
+                        # Apply blend settings from template if available
+                        if tpl:
+                            blend = tpl.get("blend", {})
+                            p["blendEnable"] = blend.get("blendEnable", p.get("blendEnable", False))
+                            p["srcColorBlendFactor"] = blend.get("srcColorBlendFactor", p.get("srcColorBlendFactor", 1))
+                            p["dstColorBlendFactor"] = blend.get("dstColorBlendFactor", p.get("dstColorBlendFactor", 0))
+                            p["srcAlphaBlendFactor"] = blend.get("srcAlphaBlendFactor", p.get("srcAlphaBlendFactor", 1))
+                            p["dstAlphaBlendFactor"] = blend.get("dstAlphaBlendFactor", p.get("dstAlphaBlendFactor", 0))
+                        changed = True
+            if not changed:
+                continue
+
+            mat["techniques"] = json.dumps(techniques)
+
+            # Apply shader template (samplers, params, switches, macros)
+            if tpl:
+                self._apply_template_to_material(mat, tpl, threshold)
+
+            # Sync Blender preview
+            try:
+                _sync_material_preview_from_data(mat, 0, 0, *_get_assets_folders_from_context())
+            except Exception:
+                pass
+
+            updated += 1
+
+        _tag_redraw(context)
+        short_src = self.source_shader.rsplit("/", 1)[-1]
+        short_tgt = target.rsplit("/", 1)[-1]
+        self.report({'INFO'}, f"Bulk shader update: {updated} material(s) changed from {short_src} → {short_tgt}")
+        return {'FINISHED'}
+
+    @staticmethod
+    def _apply_template_to_material(mat, tpl, threshold):
+        """Apply shader template structure to a material, preserving existing values.
+
+        For every category the logic is:
+        1. Build a lookup of the material's current values by name.
+        2. Walk the template entries that pass the frequency threshold.
+        3. Keep the material's existing value when present, otherwise use
+           the template default.
+        This ensures the template adds any missing slots without clobbering
+        values the user (or the original bin) already set.
+        """
+        # --- Preserve existing sampler data by name ---
+        preserved_samplers = {}  # name_lower → full sampler dict
+        try:
+            old_samplers = json.loads(mat.get("samplers", "[]"))
+            for s in old_samplers:
+                name = (s.get("textureName") or "").strip()
+                if name:
+                    preserved_samplers[name.lower()] = s
+        except Exception:
+            pass
+
+        # --- Samplers ---
+        samplers = []
+        for s in tpl.get("samplers", []):
+            if s.get("frequency", 0) >= threshold:
+                sampler_name = s["name"]
+                old = preserved_samplers.get(sampler_name.lower())
+                sampler = {
+                    "textureName": sampler_name,
+                    "texturePath": old.get("texturePath", "") if old else "",
+                    "addressU": old.get("addressU", s.get("addressU")) if old else s.get("addressU"),
+                    "addressV": old.get("addressV", s.get("addressV")) if old else s.get("addressV"),
+                    "addressW": old.get("addressW", s.get("addressW")) if old else s.get("addressW"),
+                }
+                samplers.append(sampler)
+        mat["samplers"] = json.dumps(samplers)
+
+        # --- Preserve existing parameter values by name ---
+        preserved_params = {}  # name_lower → value list
+        try:
+            old_params = json.loads(mat.get("parameters", "[]"))
+            for p in old_params:
+                name = (p.get("name") or "").strip()
+                if name and p.get("value") is not None:
+                    preserved_params[name.lower()] = p["value"]
+        except Exception:
+            pass
+
+        # --- Parameters ---
+        params = []
+        for p in tpl.get("parameters", []):
+            if p.get("frequency", 0) >= threshold:
+                pname = p["name"]
+                old_val = preserved_params.get(pname.lower())
+                params.append({
+                    "name": pname,
+                    "value": old_val if old_val is not None else p.get("value", [0, 0, 0, 0]),
+                })
+        mat["parameters"] = json.dumps(params)
+
+        # --- Preserve existing switch states by name ---
+        preserved_switches = {}  # name_lower → bool
+        try:
+            old_switches = json.loads(mat.get("switches", "[]"))
+            for s in old_switches:
+                name = (s.get("name") or "").strip()
+                if name and s.get("on") is not None:
+                    preserved_switches[name.lower()] = s["on"]
+        except Exception:
+            pass
+
+        # --- Switches ---
+        switches = []
+        for s in tpl.get("switches", []):
+            if s.get("frequency", 0) >= threshold:
+                sname = s["name"]
+                old_on = preserved_switches.get(sname.lower())
+                switches.append({
+                    "name": sname,
+                    "on": old_on if old_on is not None else s.get("on", False),
+                })
+        mat["switches"] = json.dumps(switches)
+
+        # --- Material-level shader macros ---
+        # Keep existing values; add new template macros with their defaults
+        template_macros = tpl.get("macros", {})
+        try:
+            old_macros = json.loads(mat.get("shader_macros", "{}"))
+            if not isinstance(old_macros, dict):
+                old_macros = {}
+        except Exception:
+            old_macros = {}
+        new_macros = {}
+        for key, default_val in template_macros.items():
+            new_macros[key] = old_macros.get(key, default_val)
+        mat["shader_macros"] = json.dumps(new_macros)
+
+        # --- Child techniques ---
+        # Preserve existing child technique macros by name
+        preserved_children = {}  # name_lower → dict
+        try:
+            old_children = json.loads(mat.get("child_techniques", "[]"))
+            for c in old_children:
+                cname = (c.get("name") or "").strip()
+                if cname:
+                    preserved_children[cname.lower()] = c
+        except Exception:
+            pass
+
+        children = tpl.get("child_techniques", [])
+        if children:
+            child_list = []
+            for cn in children:
+                old_c = preserved_children.get(cn.lower())
+                if old_c:
+                    child_list.append(old_c)
+                else:
+                    child_list.append({
+                        "name": cn,
+                        "parentName": "normal",
+                        "shaderMacros": {"ENV_TRANSITION": "1"} if cn == "env_transition" else {},
+                    })
+            mat["child_techniques"] = json.dumps(child_list)
+        else:
+            mat["child_techniques"] = json.dumps([])
+
+
+# ============================================================================
+# Update Shader from Template (Selected / All)
+# ============================================================================
+
+class MAPGEO_OT_update_shader_from_template(Operator):
+    """Re-apply shader template to materials, preserving texture paths.\nUpdates samplers, parameters, switches, macros and blend from the template"""
+    bl_idname = "mapgeo.update_shader_from_template"
+    bl_label = "Update Shader from Template"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Scope",
+        items=[
+            ('SELECTED', "Selected Objects", "Update materials on selected mesh objects only"),
+            ('ALL', "All Materials", "Update every League material in the file"),
+        ],
+        default='SELECTED',
+    )
+    include_low_freq: BoolProperty(
+        name="Include Rare Properties",
+        default=False,
+        description="Also include parameters/switches that appear in <10%% of materials using this shader",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "mode", expand=True)
+        layout.prop(self, "include_low_freq")
+        # Preview counts
+        mats = self._gather_materials(context)
+        with_tpl = sum(1 for m in mats if _get_shader_from_material(m) in _SHADER_TEMPLATES)
+        layout.separator()
+        layout.label(text=f"{len(mats)} material(s) in scope, {with_tpl} have a matching template", icon='INFO')
+
+    def execute(self, context):
+        materials = self._gather_materials(context)
+        if not materials:
+            self.report({'WARNING'}, "No League materials found in scope")
+            return {'CANCELLED'}
+
+        threshold = 0 if self.include_low_freq else 10
+        updated = 0
+        skipped_no_shader = 0
+        skipped_no_template = 0
+
+        for mat in materials:
+            shader = _get_shader_from_material(mat)
+            if not shader:
+                skipped_no_shader += 1
+                continue
+            tpl = _SHADER_TEMPLATES.get(shader)
+            if not tpl:
+                skipped_no_template += 1
+                continue
+
+            # Re-apply template while preserving textures (reuse bulk updater logic)
+            MAPGEO_OT_bulk_shader_update._apply_template_to_material(mat, tpl, threshold)
+
+            # Also refresh blend settings in techniques
+            try:
+                techniques = json.loads(mat.get("techniques", "[]"))
+                blend = tpl.get("blend", {})
+                for tech in techniques:
+                    for p in tech.get("passes", []):
+                        if p.get("shader") == shader:
+                            p["blendEnable"] = blend.get("blendEnable", p.get("blendEnable", False))
+                            p["srcColorBlendFactor"] = blend.get("srcColorBlendFactor", p.get("srcColorBlendFactor", 1))
+                            p["dstColorBlendFactor"] = blend.get("dstColorBlendFactor", p.get("dstColorBlendFactor", 0))
+                            p["srcAlphaBlendFactor"] = blend.get("srcAlphaBlendFactor", p.get("srcAlphaBlendFactor", 1))
+                            p["dstAlphaBlendFactor"] = blend.get("dstAlphaBlendFactor", p.get("dstAlphaBlendFactor", 0))
+                mat["techniques"] = json.dumps(techniques)
+            except Exception:
+                pass
+
+            updated += 1
+
+        _tag_redraw(context)
+        parts = [f"{updated} updated"]
+        if skipped_no_template:
+            parts.append(f"{skipped_no_template} no template")
+        self.report({'INFO'}, f"Update from template: {', '.join(parts)}")
+        return {'FINISHED'}
+
+    def _gather_materials(self, context):
+        """Collect unique League materials based on mode."""
+        seen = set()
+        result = []
+        if self.mode == 'SELECTED':
+            for obj in context.selected_objects:
+                if obj.type != 'MESH' or not obj.data:
+                    continue
+                for slot in obj.material_slots:
+                    if slot.material and slot.material.get("league_material_name"):
+                        if id(slot.material) not in seen:
+                            seen.add(id(slot.material))
+                            result.append(slot.material)
+        else:
+            for mat in bpy.data.materials:
+                if mat.get("league_material_name"):
+                    result.append(mat)
+        return result
+
+
+# ============================================================================
+# Show All Shaders Used
+# ============================================================================
+
+class MAPGEO_OT_show_project_shaders(Operator):
+    """Show all unique shaders used by League materials in this file"""
+    bl_idname = "mapgeo.show_project_shaders"
+    bl_label = "Shaders Used in Project"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        # Gather shader → [material names]
+        shader_map = {}  # shader_path → list of material names
+        for mat in bpy.data.materials:
+            if not mat.get("league_material_name"):
+                continue
+            shader = _get_shader_from_material(mat)
+            if not shader:
+                shader = "(no shader)"
+            shader_map.setdefault(shader, []).append(mat.get("league_material_name", mat.name))
+
+        if not shader_map:
+            self.report({'WARNING'}, "No League materials found")
+            return {'CANCELLED'}
+
+        # Store for the popup draw
+        self._shader_map = shader_map
+        return context.window_manager.invoke_popup(self, width=520)
+
+    def draw(self, context):
+        layout = self.layout
+        shader_map = getattr(self, '_shader_map', {})
+
+        layout.label(text=f"{len(shader_map)} unique shader(s), {sum(len(v) for v in shader_map.values())} material(s) total", icon='SHADING_RENDERED')
+        layout.separator()
+
+        # Sort by material count descending
+        for shader_path, mat_names in sorted(shader_map.items(), key=lambda x: -len(x[1])):
+            short = shader_path.rsplit("/", 1)[-1] if "/" in shader_path else shader_path
+            has_template = shader_path in _SHADER_TEMPLATES
+            icon = 'CHECKMARK' if has_template else 'ERROR'
+            box = layout.box()
+            row = box.row()
+            row.label(text=f"{short}  ({len(mat_names)})", icon=icon)
+            if not has_template:
+                row.label(text="no template", icon='BLANK1')
+
+    def invoke(self, context, event):
+        shader_map = {}
+        for mat in bpy.data.materials:
+            if not mat.get("league_material_name"):
+                continue
+            shader = _get_shader_from_material(mat)
+            if not shader:
+                shader = "(no shader)"
+            shader_map.setdefault(shader, []).append(mat.get("league_material_name", mat.name))
+
+        if not shader_map:
+            self.report({'WARNING'}, "No League materials found")
+            return {'CANCELLED'}
+
+        self._shader_map = shader_map
+        return context.window_manager.invoke_popup(self, width=520)
 
 
 class MAPGEO_OT_validate_shader(Operator):
@@ -4688,6 +5141,34 @@ class VIEW3D_PT_mapgeo_material_editor_panel(Panel):
             )
             op.source_material = getattr(context.scene, "mat_template_search", "")
             op.new_name = getattr(context.scene, "mat_new_name", "New_Material")
+
+        # Bulk shader update
+        box = layout.box()
+        box.label(text="Bulk Shader Update", icon='FILE_REFRESH')
+        box.operator(
+            "mapgeo.bulk_shader_update",
+            text="Replace Shader Across Materials", icon='MOD_HUE_SATURATION',
+        )
+
+        # Update shader from template
+        box = layout.box()
+        box.label(text="Shader Tools", icon='SHADING_RENDERED')
+        col = box.column(align=True)
+        op = col.operator(
+            "mapgeo.update_shader_from_template",
+            text="Update Selected from Template", icon='FILE_REFRESH',
+        )
+        op.mode = 'SELECTED'
+        op = col.operator(
+            "mapgeo.update_shader_from_template",
+            text="Update All from Template", icon='FILE_REFRESH',
+        )
+        op.mode = 'ALL'
+        col.separator()
+        col.operator(
+            "mapgeo.show_project_shaders",
+            text="Show All Shaders Used", icon='VIEWZOOM',
+        )
 
         # Quick tip
         box = layout.box()
@@ -5185,6 +5666,11 @@ material_editor_classes = (
     MAPGEO_OT_edit_technique_pass,
     # Shader validation
     MAPGEO_OT_validate_shader,
+    # Bulk shader update
+    MAPGEO_OT_bulk_shader_update,
+    # Shader tools
+    MAPGEO_OT_update_shader_from_template,
+    MAPGEO_OT_show_project_shaders,
     # Panels (parent first, then children)
     MATERIAL_PT_league_properties,
     MATERIAL_PT_league_info,

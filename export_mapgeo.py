@@ -151,6 +151,12 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             # Also exclude objects in bucket grid collections
             objects = [obj for obj in objects if not any(col.get("is_bucket_grid_collection") for col in obj.users_collection)]
             
+            # Exclude VFX definition objects (they use "Default" material as a preview placeholder)
+            vfx_count = sum(1 for obj in objects if obj.get("is_vfx_definition"))
+            if vfx_count:
+                objects = [obj for obj in objects if not obj.get("is_vfx_definition")]
+                print(f"Skipped {vfx_count} VFX definition object(s) (not part of mapgeo geometry)")
+            
             if show_progress:
                 context.window_manager.progress_update(20)
             
@@ -575,6 +581,48 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 if vb_id in vb_to_desc_idx:
                     mesh_entry.vertex_declaration_id = vb_to_desc_idx[vb_id]
         
+        # -----------------------------------------------------------------
+        # Post-pass: deduplicate VBDs and remap mesh references
+        # This catches bloated VBD lists from cached imports where each mesh
+        # had its own copy of an otherwise identical description.
+        # -----------------------------------------------------------------
+        if len(mapgeo.vertex_buffer_descriptions) > len(mapgeo.meshes) * 0.5 and len(mapgeo.vertex_buffer_descriptions) > 20:
+            old_count = len(mapgeo.vertex_buffer_descriptions)
+            dedup_descs = []
+            dedup_key_to_idx = {}
+            old_to_new = {}  # old index -> new index
+
+            for old_idx, desc in enumerate(mapgeo.vertex_buffer_descriptions):
+                key = (desc.usage, tuple((e.name, e.format) for e in desc.elements))
+                if key not in dedup_key_to_idx:
+                    dedup_key_to_idx[key] = len(dedup_descs)
+                    dedup_descs.append(desc)
+                old_to_new[old_idx] = dedup_key_to_idx[key]
+
+            if len(dedup_descs) < old_count:
+                mapgeo.vertex_buffer_descriptions = dedup_descs
+                # Remap mesh vertex_declaration_id references
+                for mesh_entry in mapgeo.meshes:
+                    old_id = mesh_entry.vertex_declaration_id
+                    if mesh_entry.vertex_declaration_count > 1:
+                        # Multi-stream: remap the base index, consecutive descs stay consecutive
+                        if old_id in old_to_new:
+                            mesh_entry.vertex_declaration_id = old_to_new[old_id]
+                    else:
+                        if old_id in old_to_new:
+                            mesh_entry.vertex_declaration_id = old_to_new[old_id]
+                print(f"Post-pass VBD dedup: {old_count} -> {len(dedup_descs)} descriptions")
+
+        # Ensure standard sampler defs are present
+        sampler_names = {sd.name for sd in mapgeo.sampler_defs}
+        if "BAKED_DIFFUSE_TEXTURE" not in sampler_names:
+            mapgeo.sampler_defs.insert(0, mapgeo_parser.SamplerDef(index=0, name="BAKED_DIFFUSE_TEXTURE"))
+            print("Added missing sampler def: BAKED_DIFFUSE_TEXTURE")
+        if "BAKED_DIFFUSE_TEXTURE_ALPHA" not in sampler_names:
+            next_idx = max((sd.index for sd in mapgeo.sampler_defs), default=-1) + 1
+            mapgeo.sampler_defs.append(mapgeo_parser.SamplerDef(index=next_idx, name="BAKED_DIFFUSE_TEXTURE_ALPHA"))
+            print("Added missing sampler def: BAKED_DIFFUSE_TEXTURE_ALPHA")
+
         return mapgeo
     
     def create_multi_stream_vertex_buffers(self, mesh, obj, stream_elements) -> list:

@@ -898,6 +898,27 @@ def write_bin(bin_data: dict, filepath: str):
     linked_files = bin_data.get("linked_files", [])
     entries = bin_data.get("entries", [])
 
+    # Deduplicate entries by path_hash to prevent hash collisions in-game.
+    # Case-only name differences produce the same FNV-1a hash → duplicate path_hash.
+    seen_hashes = set()
+    deduped = []
+    for entry in entries:
+        ph = entry.get("path_hash", "0x00000000")
+        if ph != "0x00000000" and ph in seen_hashes:
+            name = ""
+            for f in entry.get("fields", []):
+                if f.get("name_hash") == "0x8d39bde6":
+                    name = f.get("value", "")
+                    break
+            print(f"[write_bin] WARNING: Skipping duplicate path_hash {ph} (name: {name!r})")
+            continue
+        if ph != "0x00000000":
+            seen_hashes.add(ph)
+        deduped.append(entry)
+    if len(deduped) < len(entries):
+        print(f"[write_bin] Removed {len(entries) - len(deduped)} duplicate path_hash entry(ies)")
+        entries = deduped
+
     # PTCH wrapper
     if is_patch:
         writer.write_bytes(b'PTCH')

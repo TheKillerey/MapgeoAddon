@@ -955,19 +955,24 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # This preserves original primitive boundaries even when prims share the same material.
                 if len(mesh_data.primitives) > 1 and face_materials:
                     prim_attr = bl_mesh.attributes.new(name="mapgeo_prim_idx", type='INT', domain='FACE')
-                    for fi in range(min(len(face_materials), len(bl_mesh.polygons))):
-                        prim_attr.data[fi].value = face_materials[fi]
+                    n_polys = len(bl_mesh.polygons)
+                    prim_attr.data.foreach_set("value", face_materials[:n_polys])
                 
                 # Apply normals - Blender 5.0+ automatically uses custom normals when set
                 if self.import_normals and normals:
                     _safe_set_vertex_normals(bl_mesh, normals, f"mesh_{mesh_idx:03d}")
                 
-                # Create UV layers
+                # Create UV layers — bulk foreach_set for performance
                 uv_channels_created = 0
                 has_lightmap_uv = False
+                n_loops = len(bl_mesh.loops)
+                # Pre-fetch loop→vertex mapping once for all UV channels and colors
+                loop_vert_indices = [0] * n_loops
+                bl_mesh.loops.foreach_get("vertex_index", loop_vert_indices)
                 if uvs:
                     for uv_idx, uv_data in enumerate(uvs):
                         if uv_data and len(uv_data) > 0:
+                            uv_count = len(uv_data)
                             # TEXCOORD7 (index 7) is the lightmap UV channel
                             if uv_idx == 7:
                                 uv_layer = bl_mesh.uv_layers.new(name="LightmapUV")
@@ -975,33 +980,28 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                                 
                                 # Apply scale+bias transform from BakedLight channel
                                 # finalUV = rawUV * Scale + Bias
-                                lm_scale = (1.0, 1.0)
-                                lm_bias = (0.0, 0.0)
+                                lm_scale_u, lm_scale_v = 1.0, 1.0
+                                lm_bias_u, lm_bias_v = 0.0, 0.0
                                 if mesh_data.baked_light:
-                                    lm_scale = mesh_data.baked_light.scale
-                                    lm_bias = mesh_data.baked_light.bias
+                                    lm_scale_u, lm_scale_v = mesh_data.baked_light.scale
+                                    lm_bias_u, lm_bias_v = mesh_data.baked_light.bias
                                 
-                                for face_idx, face in enumerate(bl_mesh.polygons):
-                                    for loop_idx in face.loop_indices:
-                                        loop = bl_mesh.loops[loop_idx]
-                                        vert_idx = loop.vertex_index
-                                        if vert_idx < len(uv_data):
-                                            raw_u, raw_v = uv_data[vert_idx]
-                                            # Apply scale+bias, keeping the V-flip already applied
-                                            # Note: raw_v is already flipped (1.0 - v) from parse_vertex_buffer
-                                            # We need to un-flip, apply transform, then re-flip
-                                            orig_v = 1.0 - raw_v
-                                            final_u = raw_u * lm_scale[0] + lm_bias[0]
-                                            final_v = orig_v * lm_scale[1] + lm_bias[1]
-                                            uv_layer.data[loop_idx].uv = (final_u, 1.0 - final_v)
+                                uv_flat = [0.0] * (n_loops * 2)
+                                for i, vi in enumerate(loop_vert_indices):
+                                    if vi < uv_count:
+                                        raw_u, raw_v = uv_data[vi]
+                                        orig_v = 1.0 - raw_v
+                                        uv_flat[i * 2] = raw_u * lm_scale_u + lm_bias_u
+                                        uv_flat[i * 2 + 1] = 1.0 - (orig_v * lm_scale_v + lm_bias_v)
+                                uv_layer.data.foreach_set("uv", uv_flat)
                             else:
                                 uv_layer = bl_mesh.uv_layers.new(name=f"UVMap{uv_idx}" if uv_idx > 0 else "UVMap")
-                                for face_idx, face in enumerate(bl_mesh.polygons):
-                                    for loop_idx in face.loop_indices:
-                                        loop = bl_mesh.loops[loop_idx]
-                                        vert_idx = loop.vertex_index
-                                        if vert_idx < len(uv_data):
-                                            uv_layer.data[loop_idx].uv = uv_data[vert_idx]
+                                uv_flat = [0.0] * (n_loops * 2)
+                                for i, vi in enumerate(loop_vert_indices):
+                                    if vi < uv_count:
+                                        uv_flat[i * 2] = uv_data[vi][0]
+                                        uv_flat[i * 2 + 1] = uv_data[vi][1]
+                                uv_layer.data.foreach_set("uv", uv_flat)
                             uv_channels_created += 1
                 
                 # Create vertex colors (Blender 5.0+ uses color attributes)
@@ -1011,17 +1011,17 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                         type='BYTE_COLOR',
                         domain='CORNER'
                     )
-                    for face in bl_mesh.polygons:
-                        for loop_idx in face.loop_indices:
-                            loop = bl_mesh.loops[loop_idx]
-                            vert_idx = loop.vertex_index
-                            if vert_idx < len(colors):
-                                # Ensure we have RGBA (4 components)
-                                col = colors[vert_idx]
-                                if len(col) == 3:
-                                    color_attr.data[loop_idx].color = (*col, 1.0)
-                                else:
-                                    color_attr.data[loop_idx].color = col[:4]
+                    color_count = len(colors)
+                    color_flat = [0.0] * (n_loops * 4)
+                    for i, vi in enumerate(loop_vert_indices):
+                        if vi < color_count:
+                            col = colors[vi]
+                            base = i * 4
+                            color_flat[base] = col[0]
+                            color_flat[base + 1] = col[1]
+                            color_flat[base + 2] = col[2]
+                            color_flat[base + 3] = col[3] if len(col) > 3 else 1.0
+                    color_attr.data.foreach_set("color", color_flat)
                 
                 # Raw normals preservation for render region meshes
                 # Render region meshes use non-unit "normals" that contain game-specific data.
@@ -1029,16 +1029,28 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Store pre-swap raw normals so the exporter can write them back.
                 if normals and mesh_data.unknown_version18_int != 0:
                     raw_attr = bl_mesh.attributes.new(name="raw_normals", type='FLOAT_VECTOR', domain='POINT')
-                    for vi in range(min(len(normals), len(bl_mesh.vertices))):
-                        raw_attr.data[vi].vector = normals[vi]
+                    n_verts = min(len(normals), len(bl_mesh.vertices))
+                    raw_flat = [0.0] * (n_verts * 3)
+                    for vi in range(n_verts):
+                        n = normals[vi]
+                        raw_flat[vi * 3] = n[0]
+                        raw_flat[vi * 3 + 1] = n[1]
+                        raw_flat[vi * 3 + 2] = n[2]
+                    raw_attr.data.foreach_set("vector", raw_flat)
 
                 # TEXCOORD5 - bush animation anchor positions (3D per-vertex data)
                 # Store as a vertex-domain float vector attribute for round-trip export
                 if texcoord5_data and len(texcoord5_data) > 0:
                     # Store as a vector attribute on the mesh (per-vertex, 3 floats)
                     tc5_attr = bl_mesh.attributes.new(name="TEXCOORD5", type='FLOAT_VECTOR', domain='POINT')
-                    for vert_idx in range(min(len(texcoord5_data), len(bl_mesh.vertices))):
-                        tc5_attr.data[vert_idx].vector = texcoord5_data[vert_idx]
+                    n_tc5 = min(len(texcoord5_data), len(bl_mesh.vertices))
+                    tc5_flat = [0.0] * (n_tc5 * 3)
+                    for vi in range(n_tc5):
+                        d = texcoord5_data[vi]
+                        tc5_flat[vi * 3] = d[0]
+                        tc5_flat[vi * 3 + 1] = d[1]
+                        tc5_flat[vi * 3 + 2] = d[2]
+                    tc5_attr.data.foreach_set("vector", tc5_flat)
                 
                 # Assign materials
                 material_mapping = {}  # Maps primitive index to material slot

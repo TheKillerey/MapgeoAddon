@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.4] - 2026-04-10
+
+### 🐛 Bug Fixes
+- **Fixed WAD extraction loop in Blender 5.1** — The WAD cache completeness check used a subdirectory heuristic (`data/maps/mapgeometry`) that failed when hash resolution produced `raw/` hex-named files, causing infinite re-extraction on every project scan. Replaced with a `.extraction_done` marker file written after successful extraction.
+- **Fixed WAD hashes not loaded before extraction** — `load_wad_hashes()` is now called before `parse_wad()` during cache extraction so entries get resolved paths.
+
+### 🔧 Improvements
+- **Update script now syncs subdirectories** — `hashes/` and `LeagueShaderTextures/` are now copied to all Blender version targets. WAD hash files downloaded in one Blender version are automatically propagated to others.
+
+## [0.4.3] - 2026-06-14
+
+### 🚀 Performance: Mesh Import Optimization
+- **Replaced all per-element Python loops with bulk `foreach_set` operations** across all importers (mapgeo, skn/skl, sco/scb, legacy NVR), providing ~10-100x faster UV, vertex color, and attribute assignment
+- **Pre-fetch loop→vertex mapping once** per mesh instead of re-reading per UV channel/color layer
+- **Bulk attribute writes** for per-face primitive indices, raw normals, and TEXCOORD5 data
+
+### 📦 Blender 5.1 Support
+- **Full Blender 5.1 compatibility** verified — Python 3.13, all mesh API patterns confirmed working
+- Updated addon metadata to reflect 5.0 / 5.1 dual support
+
 ## [0.4.2] - 2026-03-28
 
 ### 🔧 Materials Export Fix (prey format)

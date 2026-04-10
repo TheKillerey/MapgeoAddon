@@ -2,11 +2,16 @@
 Project Reys Format (.prey) — Blender-friendly split of League materials data.
 
 Converts .materials.bin / .materials.py → sorted, categorised .prey.* JSON files:
-    <name>.prey.materials   — StaticMaterialDef entries
-    <name>.prey.vfx         — VfxSystemDefinitionData + MapPlaceableContainer + particles
-    <name>.prey.map         — MapSunProperties, MapBakeProperties, MapLightingV2, MapContainer
-    <name>.prey.visibility  — Visibility controllers (Dragon/Baron/Named/Child/Mutator layers)
-    <name>.prey.extra       — Everything else (MapSkin, music, unknown types)
+    <name>.prey.materials    — StaticMaterialDef entries
+    <name>.prey.vfx          — VfxSystemDefinitionData
+    <name>.prey.particles    — MapPlaceableContainer + MapParticle placements
+    <name>.prey.lighting     — MapSunProperties, MapBakeProperties, MapLightingV2
+    <name>.prey.map          — MapContainer
+    <name>.prey.visibility   — Visibility controllers (Layer/Named/Child/Mutator)
+    <name>.prey.banners      — EsportsBannerData
+    <name>.prey.jungle_camps — JungleCampData
+    <name>.prey.navgrid      — NavGrid configs and overlays
+    <name>.prey.extra        — Everything else (cameras, vegetation, unknown types)
 
 Round-trip: bin → prey → bin preserves all data.
 """
@@ -27,20 +32,34 @@ PREY_FORMAT_VERSION = 1
 
 # Known type hashes → (human name, category)
 TYPE_REGISTRY = {
+    # ── Materials ──
     0xff9d3409: ("StaticMaterialDef",                "materials"),
+    # ── VFX definitions ──
     0x45cd899f: ("VfxSystemDefinitionData",          "vfx"),
-    0xb25c0a3f: ("MapPlaceableContainer",            "vfx"),
-    0x24a31b3e: ("MapParticle",                      "vfx"),
-    0x1f1f50f2: ("MapParticle_Alt",                  "vfx"),
-    0x169a2f9c: ("MapSunProperties",                 "map"),
-    0x6a4a3409: ("MapBakeProperties",                "map"),
-    0xdca35419: ("MapLightingV2",                    "map"),
+    # ── Particle containers / placements ──
+    0xb25c0a3f: ("MapPlaceableContainer",            "particles"),
+    0x24a31b3e: ("MapParticle",                      "particles"),
+    0x1f1f50f2: ("MapParticle_Alt",                  "particles"),
+    # ── Lighting / environment ──
+    0x169a2f9c: ("MapSunProperties",                 "lighting"),
+    0x6a4a3409: ("MapBakeProperties",                "lighting"),
+    0xdca35419: ("MapLightingV2",                    "lighting"),
+    # ── Map container ──
     0xdde8c114: ("MapContainer",                     "map"),
+    # ── Visibility controllers ──
     0xe21083b5: ("ChildMapVisibilityController",     "visibility"),
-    0xc406a533: ("DragonLayerController",            "visibility"),
-    0xec733fe2: ("BaronLayerController",             "visibility"),
+    0xc406a533: ("LayerController",                  "visibility"),
+    0xec733fe2: ("PriorityLayerController",          "visibility"),
     0xe07edfa4: ("NamedController",                  "visibility"),
-    0x4275b121: ("MutatorVisibilityController",      "visibility"),
+    0x4275b121: ("MutatorMapVisibilityController",   "visibility"),
+    # ── Esports banners ──
+    0x2d5c96cd: ("EsportsBannerData",                "banners"),
+    # ── Jungle camp visuals ──
+    0x3f04641e: ("JungleCampData",                   "jungle_camps"),
+    # ── Navigation grid ──
+    0xb51e8bff: ("MapNavGridOverlays",               "navgrid"),
+    0xbdc90544: ("NavGridConfig",                    "navgrid"),
+    0xbf11c509: ("NavGridTerrainConfig",             "navgrid"),
 }
 
 # ============================================================================
@@ -411,8 +430,11 @@ def _prey_material_to_bin(mat: dict) -> dict:
             "pairs": pairs,
         })
 
-    # techniques — prefer parsed 'techniques' (Blender-editable) over raw passthrough
-    if mat.get("techniques"):
+    # techniques — prefer raw passthrough for lossless round-trip;
+    # fall back to parsed 'techniques' only when raw data is absent (user-created material)
+    if mat.get("_rawTechniques"):
+        fields.append(mat["_rawTechniques"])
+    elif mat.get("techniques"):
         # Build technique bin fields from parsed technique data
         tech_values = []
         for tech in mat["techniques"]:
@@ -463,11 +485,11 @@ def _prey_material_to_bin(mat: dict) -> dict:
             "type": 0x80, "value_type": 0x83,
             "values": tech_values,
         })
-    elif mat.get("_rawTechniques"):
-        fields.append(mat["_rawTechniques"])
 
-    # childTechniques — prefer parsed over raw passthrough
-    if mat.get("childTechniques"):
+    # childTechniques — prefer raw passthrough for lossless round-trip
+    if mat.get("_rawChildTechniques"):
+        fields.append(mat["_rawChildTechniques"])
+    elif mat.get("childTechniques"):
         child_values = []
         for ct in mat["childTechniques"]:
             cf = [
@@ -492,8 +514,6 @@ def _prey_material_to_bin(mat: dict) -> dict:
             "type": 0x80, "value_type": 0x83,
             "values": child_values,
         })
-    elif mat.get("_rawChildTechniques"):
-        fields.append(mat["_rawChildTechniques"])
 
     # Re-emit any unknown fields preserved during decode
     for ef in mat.get("_extraFields", []):
@@ -935,8 +955,13 @@ def bin_to_prey(bin_path: str, output_dir: str, base_name: Optional[str] = None)
     buckets = {
         "materials": [],
         "vfx": [],
+        "particles": [],
+        "lighting": [],
         "map": [],
         "visibility": [],
+        "banners": [],
+        "jungle_camps": [],
+        "navgrid": [],
         "extra": [],
     }
     # Preserve original order for round-trip
@@ -980,69 +1005,23 @@ def bin_to_prey(bin_path: str, output_dir: str, base_name: Optional[str] = None)
     _write_json(mat_path, mat_data)
     created["materials"] = mat_path
 
-    # ── VFX ──
-    vfx_entries = []
-    for entry in buckets["vfx"]:
-        vfx_entries.append(_generic_entry_to_prey(entry))
+    # ── Generic categories (everything except materials) ──
+    _GENERIC_CATS = ("vfx", "particles", "lighting", "map", "visibility",
+                     "banners", "jungle_camps", "navgrid", "extra")
+    for cat in _GENERIC_CATS:
+        converter = _bin_map_entry_to_prey if cat == "map" else _generic_entry_to_prey
+        cat_entries = [converter(e) for e in buckets[cat]]
 
-    vfx_data = {
-        "format": "prey.vfx",
-        "version": PREY_FORMAT_VERSION,
-        "source": os.path.basename(bin_path),
-        "count": len(vfx_entries),
-        "entries": vfx_entries,
-    }
-    vfx_path = os.path.join(output_dir, f"{base_name}.prey.vfx")
-    _write_json(vfx_path, vfx_data)
-    created["vfx"] = vfx_path
-
-    # ── Map ──
-    map_entries = []
-    for entry in buckets["map"]:
-        map_entries.append(_bin_map_entry_to_prey(entry))
-
-    map_data = {
-        "format": "prey.map",
-        "version": PREY_FORMAT_VERSION,
-        "source": os.path.basename(bin_path),
-        "count": len(map_entries),
-        "entries": map_entries,
-    }
-    map_path = os.path.join(output_dir, f"{base_name}.prey.map")
-    _write_json(map_path, map_data)
-    created["map"] = map_path
-
-    # ── Visibility ──
-    vis_entries = []
-    for entry in buckets["visibility"]:
-        vis_entries.append(_generic_entry_to_prey(entry))
-
-    vis_data = {
-        "format": "prey.visibility",
-        "version": PREY_FORMAT_VERSION,
-        "source": os.path.basename(bin_path),
-        "count": len(vis_entries),
-        "entries": vis_entries,
-    }
-    vis_path = os.path.join(output_dir, f"{base_name}.prey.visibility")
-    _write_json(vis_path, vis_data)
-    created["visibility"] = vis_path
-
-    # ── Extra ──
-    extra_entries = []
-    for entry in buckets["extra"]:
-        extra_entries.append(_generic_entry_to_prey(entry))
-
-    extra_data = {
-        "format": "prey.extra",
-        "version": PREY_FORMAT_VERSION,
-        "source": os.path.basename(bin_path),
-        "count": len(extra_entries),
-        "entries": extra_entries,
-    }
-    extra_path = os.path.join(output_dir, f"{base_name}.prey.extra")
-    _write_json(extra_path, extra_data)
-    created["extra"] = extra_path
+        cat_data = {
+            "format": f"prey.{cat}",
+            "version": PREY_FORMAT_VERSION,
+            "source": os.path.basename(bin_path),
+            "count": len(cat_entries),
+            "entries": cat_entries,
+        }
+        cat_path = os.path.join(output_dir, f"{base_name}.prey.{cat}")
+        _write_json(cat_path, cat_data)
+        created[cat] = cat_path
 
     # ── Manifest (for round-trip) ──
     manifest = {
@@ -1083,7 +1062,8 @@ def prey_to_bin(prey_dir: str, base_name: str, output_path: str):
 
     # Load all prey files
     prey_data = {}
-    for cat in ("materials", "vfx", "map", "visibility", "extra"):
+    for cat in ("materials", "vfx", "particles", "lighting", "map",
+                "visibility", "banners", "jungle_camps", "navgrid", "extra"):
         fpath = os.path.join(prey_dir, f"{base_name}.prey.{cat}")
         if os.path.exists(fpath):
             prey_data[cat] = _read_json(fpath)
@@ -1094,7 +1074,8 @@ def prey_to_bin(prey_dir: str, base_name: str, output_path: str):
         mat_lookup[mat.get("name", "")] = mat
 
     generic_lookups = {}  # cat → {pathHash → prey entry}
-    for cat in ("vfx", "visibility", "extra"):
+    for cat in ("vfx", "particles", "lighting", "visibility",
+                "banners", "jungle_camps", "navgrid", "extra"):
         lookup = {}
         for e in prey_data.get(cat, {}).get("entries", []):
             ph = e.get("pathHash", "")
@@ -1133,10 +1114,32 @@ def prey_to_bin(prey_dir: str, base_name: str, output_path: str):
     for ph, me in map_lookup.items():
         if ("map", ph) not in consumed:
             entries.append(_prey_map_entry_to_bin(me))
-    for cat in ("vfx", "visibility", "extra"):
+    for cat in ("vfx", "particles", "lighting", "visibility",
+                "banners", "jungle_camps", "navgrid", "extra"):
         for ph, ge in generic_lookups.get(cat, {}).items():
             if (cat, ph) not in consumed:
                 entries.append(_prey_generic_to_bin(ge))
+
+    # Deduplicate entries by path_hash.  Case-only material name differences
+    # produce identical FNV-1a hashes, causing hash collisions in-game.
+    seen_ph = set()
+    deduped = []
+    for entry in entries:
+        ph = entry.get("path_hash", "0x00000000")
+        if ph != "0x00000000" and ph in seen_ph:
+            name = ""
+            for f in entry.get("fields", []):
+                if f.get("name_hash") == "0x8d39bde6":
+                    name = f.get("value", "")
+                    break
+            print(f"[PREY] WARNING: Skipping duplicate path_hash {ph} (name: {name!r})")
+            continue
+        if ph != "0x00000000":
+            seen_ph.add(ph)
+        deduped.append(entry)
+    if len(deduped) < len(entries):
+        print(f"[PREY] Removed {len(entries) - len(deduped)} duplicate path_hash entry(ies)")
+        entries = deduped
 
     bin_data = {
         "magic": header.get("magic", "PROP"),
@@ -1209,7 +1212,9 @@ def py_to_prey(py_path: str, output_dir: str, base_name: Optional[str] = None) -
 
     # ── Categorise other entries ──
     # other_entries: name → (type_name_str, full_text_str)
-    buckets = {"vfx": [], "map": [], "visibility": [], "extra": []}
+    buckets = {"vfx": [], "particles": [], "lighting": [], "map": [],
+               "visibility": [], "banners": [], "jungle_camps": [], "navgrid": [],
+               "extra": []}
 
     for entry_name, (type_name, full_text) in other_entries.items():
         # Resolve type name to hash if known
@@ -1231,7 +1236,8 @@ def py_to_prey(py_path: str, output_dir: str, base_name: Optional[str] = None) -
         }
         buckets[cat].append(prey_entry)
 
-    for cat in ("vfx", "map", "visibility", "extra"):
+    for cat in ("vfx", "particles", "lighting", "map", "visibility",
+             "banners", "jungle_camps", "navgrid", "extra"):
         file_data = {
             "format": f"prey.{cat}",
             "version": PREY_FORMAT_VERSION,
@@ -1259,7 +1265,8 @@ def py_to_prey(py_path: str, output_dir: str, base_name: Optional[str] = None) -
     created["manifest"] = manifest_path
 
     counts = {"materials": len(mat_list)}
-    for cat in ("vfx", "map", "visibility", "extra"):
+    for cat in ("vfx", "particles", "lighting", "map", "visibility",
+             "banners", "jungle_camps", "navgrid", "extra"):
         counts[cat] = len(buckets[cat])
     total = sum(counts.values())
     print(f"[PREY] Converted {os.path.basename(py_path)} → {total} entries")
@@ -1300,25 +1307,34 @@ def _json_default(obj):
 def supplement_prey_from_py(prey_dir: str, base_name: str, py_path: str) -> int:
     """Add missing map/vfx/extra entries from a .materials.py into existing prey files.
 
-    Checks the prey.map file for MapSunProperties/MapBakeProperties/MapLightingV2.
-    If missing, parses the .py and appends them.
+    Checks prey.lighting (and legacy prey.map) for MapSunProperties/MapBakeProperties/MapLightingV2.
+    If missing, parses the .py and appends them to prey.lighting.
 
     Returns the number of entries added.
     """
     from .materials_parser import MaterialsParser
 
-    map_path = os.path.join(prey_dir, f"{base_name}.prey.map")
-    if not os.path.isfile(map_path):
-        return 0
+    # Check both prey.lighting (new) and prey.map (legacy) for existing entries
+    existing_types = set()
+    for fname in (f"{base_name}.prey.lighting", f"{base_name}.prey.map"):
+        fpath = os.path.join(prey_dir, fname)
+        if os.path.isfile(fpath):
+            data = _read_json(fpath)
+            for e in data.get("entries", []):
+                tn = e.get("typeName", "")
+                if tn:
+                    existing_types.add(tn)
+
+    lighting_path = os.path.join(prey_dir, f"{base_name}.prey.lighting")
+    if not os.path.isfile(lighting_path):
+        # Fall back to prey.map for legacy projects
+        lighting_path = os.path.join(prey_dir, f"{base_name}.prey.map")
+        if not os.path.isfile(lighting_path):
+            return 0
     if not os.path.isfile(py_path):
         return 0
 
-    map_data = _read_json(map_path)
-    existing_types = set()
-    for e in map_data.get("entries", []):
-        tn = e.get("typeName", "")
-        if tn:
-            existing_types.add(tn)
+    lighting_data = _read_json(lighting_path)
 
     # Determine which map types are missing
     needed_types = {"MapSunProperties", "MapBakeProperties", "MapLightingV2"} - existing_types
@@ -1344,13 +1360,13 @@ def supplement_prey_from_py(prey_dir: str, base_name: str, py_path: str) -> int:
             "fullText": full_text,
             "_sourceFormat": "py",
         }
-        map_data["entries"].append(prey_entry)
-        map_data["count"] = len(map_data["entries"])
+        lighting_data["entries"].append(prey_entry)
+        lighting_data["count"] = len(lighting_data["entries"])
         added += 1
         print(f"[PREY] Supplemented {type_name} from .materials.py")
 
     if added:
-        _write_json(map_path, map_data)
+        _write_json(lighting_path, lighting_data)
 
     return added
 
@@ -1368,17 +1384,23 @@ def find_py_sibling(prey_dir: str) -> str:
 
 
 def _load_prey_map_settings_core(prey_dir: str, base_name: str) -> dict:
-    """Core loader: parse map settings from the prey.map file without auto-supplement."""
+    """Core loader: parse map settings from prey.lighting (or legacy prey.map) file."""
     import re as _re
 
-    map_path = os.path.join(prey_dir, f"{base_name}.prey.map")
-    if not os.path.isfile(map_path):
+    # Try prey.lighting first (new category), fall back to prey.map (legacy)
+    all_entries = []
+    for fname in (f"{base_name}.prey.lighting", f"{base_name}.prey.map"):
+        fpath = os.path.join(prey_dir, fname)
+        if os.path.isfile(fpath):
+            data = _read_json(fpath)
+            all_entries.extend(data.get("entries", []))
+
+    if not all_entries:
         return {}
 
-    map_data = _read_json(map_path)
     settings = {}
 
-    for entry in map_data.get("entries", []):
+    for entry in all_entries:
         tn = entry.get("typeName", "")
 
         if entry.get("_sourceFormat") == "py" and entry.get("fullText"):
@@ -1556,16 +1578,19 @@ def _parse_py_lighting_v2(body: str, settings: dict, _re):
 
 
 def save_prey_map_settings(prey_dir: str, base_name: str, settings: dict) -> bool:
-    """Write scene map settings back into prey.map entries.
+    """Write scene map settings back into prey.lighting (or legacy prey.map) entries.
 
     Updates existing MapSunProperties / MapBakeProperties / MapLightingV2
-    entries in prey.map.  Creates new entries if necessary.
+    entries.  Creates new entries if necessary.
 
-    Returns True if prey.map was modified.
+    Returns True if the file was modified.
     """
-    map_path = os.path.join(prey_dir, f"{base_name}.prey.map")
+    # Prefer prey.lighting (new category), fall back to prey.map (legacy)
+    map_path = os.path.join(prey_dir, f"{base_name}.prey.lighting")
     if not os.path.isfile(map_path):
-        return False
+        map_path = os.path.join(prey_dir, f"{base_name}.prey.map")
+        if not os.path.isfile(map_path):
+            return False
 
     map_data = _read_json(map_path)
     entries = map_data.get("entries", [])
@@ -1905,7 +1930,7 @@ def save_prey_materials(prey_dir: str, base_name: str) -> int:
 
 
 # ============================================================================
-# Save Blender VFX transforms → prey.vfx
+# Save Blender VFX transforms → prey.particles (or legacy prey.vfx)
 # ============================================================================
 
 def _transforms_differ(a: list, b: list, eps: float = 1e-4) -> bool:
@@ -1918,7 +1943,7 @@ def _transforms_differ(a: list, b: list, eps: float = 1e-4) -> bool:
 
 
 def save_prey_vfx_transforms(prey_dir: str, base_name: str) -> int:
-    """Write Blender particle position/rotation/scale back into prey.vfx.
+    """Write Blender particle position/rotation/scale back into prey.particles (or legacy prey.vfx).
 
     Matches particles using (container_name, system, name_value) and
     updates the transform field in each MapPlaceableContainer item.
@@ -1929,11 +1954,22 @@ def save_prey_vfx_transforms(prey_dir: str, base_name: str) -> int:
     import bpy
     from collections import defaultdict
 
-    vfx_path = os.path.join(prey_dir, f"{base_name}.prey.vfx")
-    if not os.path.isfile(vfx_path):
+    # Check prey.particles (new) and prey.vfx (legacy) for MapPlaceableContainer entries
+    vfx_path = None
+    data = None
+    for fname in (f"{base_name}.prey.particles", f"{base_name}.prey.vfx"):
+        fpath = os.path.join(prey_dir, fname)
+        if os.path.isfile(fpath):
+            candidate = _read_json(fpath)
+            for e in candidate.get("entries", []):
+                if e.get("typeName") == "MapPlaceableContainer":
+                    vfx_path = fpath
+                    data = candidate
+                    break
+            if data is not None:
+                break
+    if data is None:
         return 0
-
-    data = _read_json(vfx_path)
     entries = data.get("entries", [])
     if not entries:
         return 0
@@ -2109,7 +2145,7 @@ def save_prey_vfx_transforms(prey_dir: str, base_name: str) -> int:
 
 
 def save_prey_gds_transforms(prey_dir: str, base_name: str) -> int:
-    """Write Blender GdsMapObject position/rotation/scale back into prey.vfx.
+    """Write Blender GdsMapObject position/rotation/scale back into prey.particles (or legacy prey.vfx).
 
     Matches map objects using item_key and updates the transform field
     in each MapPlaceableContainer item with class_hash 0xda9e5c0c.
@@ -2118,11 +2154,23 @@ def save_prey_gds_transforms(prey_dir: str, base_name: str) -> int:
     """
     import bpy
 
-    vfx_path = os.path.join(prey_dir, f"{base_name}.prey.vfx")
-    if not os.path.isfile(vfx_path):
+    # Check prey.particles (new) and prey.vfx (legacy) for MapPlaceableContainer entries
+    vfx_path = None
+    data = None
+    for fname in (f"{base_name}.prey.particles", f"{base_name}.prey.vfx"):
+        fpath = os.path.join(prey_dir, fname)
+        if os.path.isfile(fpath):
+            candidate = _read_json(fpath)
+            for e in candidate.get("entries", []):
+                if e.get("typeName") == "MapPlaceableContainer":
+                    vfx_path = fpath
+                    data = candidate
+                    break
+            if data is not None:
+                break
+    if data is None:
         return 0
 
-    data = _read_json(vfx_path)
     entries = data.get("entries", [])
     if not entries:
         return 0
