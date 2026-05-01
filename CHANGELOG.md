@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.5] - 2026-05-01
+
+### 🐛 Bug Fixes
+- **Fixed "only `base` variant visible" + "Source files not found for variant 'base'" on project creation** — Root cause was the missing CommunityDragon WAD hash database (`hashes.game.txt.0` / `.1`). Without those hashes, WAD entries extracted to `raw/<hex>.<ext>` instead of `data/maps/mapgeometry/<map>/<variant>.mapgeo`, so variant discovery silently returned an empty list (falling back to a single `base` entry) and source-file lookup then failed.
+- `_ensure_riot_wad_cache` now **auto-downloads the WAD hash database** from CommunityDragon when missing, and aborts cache extraction with a clear console message if the download fails (instead of silently producing an unusable cache).
+- `_get_variant_items` no longer swallows discovery exceptions; the fallback enum entry is now labeled `base (fallback — WAD hashes may be missing)` so the cause is visible in the UI.
+- `PROJECT_OT_create_project` error messages for both the cache failure and the source-files-not-found case now mention the missing hash database and how to recover (download via the WAD Tool panel, then delete the cache folder and retry).
+
 ## [0.4.4] - 2026-04-10
 
 ### 🐛 Bug Fixes

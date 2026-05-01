@@ -517,9 +517,24 @@ def _ensure_riot_wad_cache(league_path: str, map_id: str) -> str:
             wad_path = wad_candidates[0]
             print(f"[Project Manager] Extracting Riot base WAD: {wad_path}")
             
-            # Ensure WAD hashes are loaded so entries get proper paths
+            # Ensure WAD hashes are loaded so entries get proper paths.
+            # Without these, files extract to raw/<hex>.<ext> instead of
+            # data/maps/mapgeometry/<map>/<variant>.mapgeo, which breaks
+            # variant discovery and project creation downstream.
             if not wad_tool._wad_hashes:
                 wad_tool.load_wad_hashes()
+            if not wad_tool._wad_hashes:
+                print("[Project Manager] WAD hash database missing — attempting auto-download from CommunityDragon...")
+                try:
+                    wad_tool.download_wad_hashes()
+                except Exception as e:
+                    print(f"[Project Manager] WAD hash auto-download failed: {e}")
+                if not wad_tool._wad_hashes:
+                    print("[Project Manager] ERROR: WAD hashes unavailable. "
+                          "Open the WAD Tool panel and click 'Download WAD Hashes' "
+                          "(requires internet). Without these, mapgeo/materials.bin "
+                          "files inside the WAD cannot be located by name.")
+                    return ""
             
             tmp_wad = None
             try:
@@ -4273,9 +4288,15 @@ def _get_variant_items(self, context):
             for v in variants:
                 vname = v['name']
                 items.append((vname, vname, f"Variant: {vname}"))
-        except Exception:
-            pass
-    return items or [("base", "base", "Default base variant")]
+        except Exception as e:
+            print(f"[Project Manager] Variant discovery failed for {map_id}: {e}")
+    if not items:
+        # Fallback. This usually means WAD hashes are missing — without them,
+        # files extract under raw/<hex>.<ext> so .mapgeo discovery returns nothing.
+        # See _ensure_riot_wad_cache for the auto-download attempt and console hint.
+        return [("base", "base (fallback — WAD hashes may be missing)",
+                 "No variants discovered. If extraction fails, download WAD hashes via the WAD Tool panel.")]
+    return items
 
 
 class PROJECT_OT_create_project(Operator):
@@ -4407,7 +4428,13 @@ class PROJECT_OT_create_project(Operator):
         # ── Ensure WAD cache ──
         cache_dir = _ensure_riot_wad_cache(league_path, map_id)
         if not cache_dir:
-            self.report({'ERROR'}, f"Failed to extract Riot WAD for {map_id}")
+            from . import wad_tool
+            if not wad_tool._wad_hashes:
+                self.report({'ERROR'},
+                            f"Failed to extract Riot WAD for {map_id}: WAD hash database is missing. "
+                            f"Open the WAD Tool panel and click 'Download WAD Hashes' (requires internet).")
+            else:
+                self.report({'ERROR'}, f"Failed to extract Riot WAD for {map_id}")
             return {'CANCELLED'}
 
         # Locate source files in cache
@@ -4430,8 +4457,18 @@ class PROJECT_OT_create_project(Operator):
                     break
 
         if not src_mapgeo and not src_materials:
+            from . import wad_tool
+            hint = ""
+            if not wad_tool._wad_hashes:
+                hint = (" — WAD hash database missing; open the WAD Tool panel "
+                        "and click 'Download WAD Hashes' (requires internet), "
+                        "then delete the cache folder and retry.")
+            elif not os.path.isdir(mapgeo_dir):
+                hint = (f" — '{mapgeo_dir}' was not produced by extraction. "
+                        "The WAD may be encrypted, corrupted, or the hash database "
+                        "is incomplete. Try re-downloading WAD hashes.")
             self.report({'ERROR'},
-                        f"Source files not found for variant '{variant_name}' in {map_id}")
+                        f"Source files not found for variant '{variant_name}' in {map_id}{hint}")
             return {'CANCELLED'}
 
         # ── Create project folder structure ──
