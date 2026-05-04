@@ -46,6 +46,10 @@ temp/
 # Local-only work folders (never push)
 Research/
 TestCode/
+LeagueViewer/
+_test_cache/
+hashes/
+wiki-draft/
 
 # Test and debug scripts
 _*.py
