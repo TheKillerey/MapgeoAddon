@@ -1505,6 +1505,21 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
             col.operator("mapgeo.edit_selected_vfx_definition", text="Edit Selected VFX Definition", icon='MOD_PARTICLES')
         else:
             col.label(text="VFX editor unavailable (reload addon)", icon='ERROR')
+
+        # Visualization (translates Riot VFX → Blender particle systems)
+        col.separator()
+        col.label(text="Visualize in Viewport:", icon='PARTICLE_DATA')
+        if _operator_exists("mapgeo.visualize_particles"):
+            row = col.row(align=True)
+            op_all = row.operator("mapgeo.visualize_particles", text="All", icon='PARTICLES')
+            op_all.only_selected = False
+            op_sel = row.operator("mapgeo.visualize_particles", text="Selected", icon='RESTRICT_SELECT_OFF')
+            op_sel.only_selected = True
+            col.operator("mapgeo.clear_particle_visuals", text="Clear Visuals", icon='TRASH')
+            col.operator("mapgeo.inspect_vfx_definition", text="Inspect Active VFX (console)", icon='CONSOLE')
+        else:
+            col.label(text="Visualizer unavailable (reload addon)", icon='ERROR')
+
         box.label(text="Creates dedicated _Particles collection", icon='INFO')
         box.label(text="Parses MapParticle + 0x1f1f50f2 entries", icon='INFO')
         
@@ -3689,7 +3704,7 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
     )
 
     # Internal phase: FILE → show file browser; CONFIRM → show settings dialog
-    _dialog_phase: bpy.props.StringProperty(default='FILE', options={'HIDDEN', 'SKIP_SAVE'})
+    dialog_phase: bpy.props.StringProperty(default='FILE', options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
         layout = self.layout
@@ -3709,9 +3724,9 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
         sub.prop(self, "material_name", text="Name")
 
     def execute(self, context):
-        if self._dialog_phase == 'FILE':
+        if self.dialog_phase == 'FILE':
             # Phase 1: show settings dialog
-            self._dialog_phase = 'CONFIRM'
+            self.dialog_phase = 'CONFIRM'
             return context.window_manager.invoke_props_dialog(self, width=500)
 
         # Phase 2: perform the import
@@ -3739,11 +3754,11 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
                 bpy.ops.wm.obj_import(filepath=import_path)
             else:
                 self.report({'ERROR'}, f"Unsupported file format: {file_ext}")
-                self._dialog_phase = 'FILE'
+                self.dialog_phase = 'FILE'
                 return {'CANCELLED'}
         except Exception as e:
             self.report({'ERROR'}, f"Import failed: {e}")
-            self._dialog_phase = 'FILE'
+            self.dialog_phase = 'FILE'
             return {'CANCELLED'}
 
         new_objects = set(bpy.data.objects) - existing_objects
@@ -3786,12 +3801,12 @@ class MAPGEO_OT_import_external_mesh(bpy.types.Operator):
 
                 imported_count += 1
 
-        self._dialog_phase = 'FILE'  # reset for next invocation
+        self.dialog_phase = 'FILE'  # reset for next invocation
         self.report({'INFO'}, f"Imported {imported_count} mesh(es) from {os.path.basename(import_path)}")
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        self._dialog_phase = 'FILE'
+        self.dialog_phase = 'FILE'
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -3861,7 +3876,7 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
         description="Import placed MapParticle / container items in addition to VFX definitions",
     )
     # Internal phase tracker — 'SCAN' on first execute, 'CONFIRM' after dialog
-    _dialog_phase: bpy.props.StringProperty(default='SCAN', options={'HIDDEN', 'SKIP_SAVE'})
+    dialog_phase: bpy.props.StringProperty(default='SCAN', options={'HIDDEN', 'SKIP_SAVE'})
 
     def draw(self, context):
         layout = self.layout
@@ -3882,7 +3897,7 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
             layout.label(text="(no VFX definitions found in file)", icon='INFO')
 
     def execute(self, context):
-        if self._dialog_phase == 'SCAN':
+        if self.dialog_phase == 'SCAN':
             # Phase 1: parse file, populate VFX list, show selection dialog
             if not self.filepath or not os.path.exists(self.filepath):
                 self.report({'ERROR'}, "Select a valid materials file (.materials.bin)")
@@ -3899,7 +3914,7 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
                     item.name = name
                     item.selected = True
 
-            self._dialog_phase = 'CONFIRM'
+            self.dialog_phase = 'CONFIRM'
             return context.window_manager.invoke_props_dialog(self, width=560)
 
         else:
@@ -3919,7 +3934,7 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
                 import_map_particles=self.import_map_particles,
             )
 
-            self._dialog_phase = 'SCAN'  # reset for next use
+            self.dialog_phase = 'SCAN'  # reset for next use
 
             if not imported_count:
                 self.report({'WARNING'}, "No VFX or MapParticle entries found / selected")
@@ -3929,7 +3944,7 @@ class MAPGEO_OT_import_particles_map(bpy.types.Operator):
             return {'FINISHED'}
 
     def invoke(self, context, event):
-        self._dialog_phase = 'SCAN'
+        self.dialog_phase = 'SCAN'
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 

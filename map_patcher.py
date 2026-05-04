@@ -16,7 +16,7 @@ from datetime import datetime
 from urllib import request
 
 import bpy
-from bpy.props import EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 from . import propertybin_parser
@@ -24,6 +24,12 @@ from . import propertybin_parser
 _DIFF_FORMAT = "map_patcher_diff_v1"
 _CDRAGON_BASE = "https://raw.communitydragon.org"
 _USER_AGENT = {"User-Agent": "BlenderMapgeoAddon/1.0"}
+_MATERIAL_TYPE_HASHES = {
+    "0xff9d3409",  # StaticMaterialDef
+}
+_TEXTURE_EXTS = (
+    ".tex", ".dds", ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".ktx", ".ktx2"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +46,64 @@ def _entry_key(entry: dict) -> str:
 
 def _entry_fingerprint(entry: dict) -> str:
     return json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _looks_like_texture_path(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    s = value.replace("\\", "/").strip().lower()
+    if "assets/" not in s:
+        return False
+    return s.endswith(_TEXTURE_EXTS)
+
+
+def _entry_type_hash(entry: dict) -> str:
+    th = entry.get("type_hash")
+    if th is None:
+        th = entry.get("typeHash")
+    return _normalize_hash(th)
+
+
+def _is_material_entry(entry: dict) -> bool:
+    """Best-effort material-entry detector for map materials.bin entries."""
+    if not isinstance(entry, dict):
+        return False
+    if _entry_type_hash(entry) in _MATERIAL_TYPE_HASHES:
+        return True
+    tn = str(entry.get("type_name") or entry.get("typeName") or "").lower()
+    return "material" in tn
+
+
+def _merge_preserve_textures(new_node, old_node):
+    """Merge two parsed subtrees while preserving texture-path strings from
+    old_node whenever the new value also looks like a texture path."""
+    if isinstance(new_node, str) and isinstance(old_node, str):
+        if _looks_like_texture_path(new_node) and _looks_like_texture_path(old_node):
+            return old_node
+        return new_node
+
+    if isinstance(new_node, dict) and isinstance(old_node, dict):
+        out = copy.deepcopy(new_node)
+        for k in list(out.keys()):
+            if k in old_node:
+                out[k] = _merge_preserve_textures(out[k], old_node[k])
+        return out
+
+    if isinstance(new_node, list) and isinstance(old_node, list):
+        out = copy.deepcopy(new_node)
+        lim = min(len(out), len(old_node))
+        for i in range(lim):
+            out[i] = _merge_preserve_textures(out[i], old_node[i])
+        return out
+
+    if isinstance(new_node, tuple) and isinstance(old_node, tuple):
+        out = list(copy.deepcopy(new_node))
+        lim = min(len(out), len(old_node))
+        for i in range(lim):
+            out[i] = _merge_preserve_textures(out[i], old_node[i])
+        return tuple(out)
+
+    return copy.deepcopy(new_node)
 
 
 def _get_download_dir() -> str:
@@ -162,39 +226,55 @@ def _create_diff(from_entries: list, to_entries: list) -> dict:
     return {"added": added, "modified": modified, "removed": sorted(removed)}
 
 
-def _apply_diff_to_entries(entries: list, diff: dict) -> list:
+def _apply_diff_to_entries(entries: list, diff: dict, options: dict | None = None) -> list:
     """Apply a diff dict to an entry list, returning a new entry list."""
+    options = options or {}
+    apply_added = bool(options.get("apply_added", True))
+    apply_modified = bool(options.get("apply_modified", True))
+    apply_removed = bool(options.get("apply_removed", True))
+    preserve_textures = bool(options.get("preserve_texture_paths", False))
+    skip_material_mods = bool(options.get("skip_material_entry_modifications", False))
+
     entries = list(entries)
 
     # Remove
-    if diff.get("removed"):
+    if apply_removed and diff.get("removed"):
         remove_set = {_normalize_hash(x) for x in diff["removed"]}
         entries = [e for e in entries if not (_entry_key(e) and _entry_key(e) in remove_set)]
 
     by_key = {_entry_key(e): i for i, e in enumerate(entries) if _entry_key(e)}
 
     # Modify
-    for entry in diff.get("modified", []):
-        key = _entry_key(entry)
-        if not key:
-            continue
-        idx = by_key.get(key)
-        if idx is None:
-            entries.append(copy.deepcopy(entry))
-            by_key[key] = len(entries) - 1
-        else:
-            entries[idx] = copy.deepcopy(entry)
+    if apply_modified:
+        for entry in diff.get("modified", []):
+            key = _entry_key(entry)
+            if not key:
+                continue
+            idx = by_key.get(key)
+            if skip_material_mods:
+                ref_entry = entries[idx] if idx is not None else entry
+                if _is_material_entry(ref_entry):
+                    continue
+            if idx is None:
+                entries.append(copy.deepcopy(entry))
+                by_key[key] = len(entries) - 1
+            else:
+                repl = copy.deepcopy(entry)
+                if preserve_textures:
+                    repl = _merge_preserve_textures(repl, entries[idx])
+                entries[idx] = repl
 
     # Add
-    for entry in diff.get("added", []):
-        key = _entry_key(entry)
-        if not key:
-            continue
-        if key in by_key:
-            entries[by_key[key]] = copy.deepcopy(entry)
-            continue
-        entries.append(copy.deepcopy(entry))
-        by_key[key] = len(entries) - 1
+    if apply_added:
+        for entry in diff.get("added", []):
+            key = _entry_key(entry)
+            if not key:
+                continue
+            if key in by_key:
+                entries[by_key[key]] = copy.deepcopy(entry)
+                continue
+            entries.append(copy.deepcopy(entry))
+            by_key[key] = len(entries) - 1
 
     return entries
 
@@ -226,7 +306,7 @@ def create_diff_file(from_path: str, to_path: str, diff_path: str,
     }
 
 
-def apply_diff_file(diff_path: str, target_bin_path: str) -> dict:
+def apply_diff_file(diff_path: str, target_bin_path: str, options: dict | None = None) -> dict:
     """Apply a JSON diff file to a materials.bin on disk (with backup)."""
     with open(diff_path, "r", encoding="utf-8") as f:
         diff = json.load(f)
@@ -236,9 +316,11 @@ def apply_diff_file(diff_path: str, target_bin_path: str) -> dict:
             f"Unsupported diff format: {diff.get('format')} (expected {_DIFF_FORMAT})"
         )
 
+    options = options or {}
+
     data = propertybin_parser.parse_bin(target_bin_path)
     entries = list(data.get("entries", []))
-    new_entries = _apply_diff_to_entries(entries, diff)
+    new_entries = _apply_diff_to_entries(entries, diff, options=options)
 
     backup_path = (
         target_bin_path + ".bak_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -249,9 +331,9 @@ def apply_diff_file(diff_path: str, target_bin_path: str) -> dict:
     data["entry_count"] = len(new_entries)
     propertybin_parser.write_bin(data, target_bin_path)
 
-    added = len(diff.get("added", []))
-    modified = len(diff.get("modified", []))
-    removed = len(diff.get("removed", []))
+    added = len(diff.get("added", [])) if options.get("apply_added", True) else 0
+    modified = _count_applied_modified_entries(diff, options)
+    removed = len(diff.get("removed", [])) if options.get("apply_removed", True) else 0
     return {"backup": backup_path, "added": added, "modified": modified, "removed": removed}
 
 
@@ -292,6 +374,55 @@ class MapPatcherSettings(PropertyGroup):
 
     # Status line shown in the panel
     status_text: StringProperty(name="Status", default="")
+
+    apply_added: BoolProperty(
+        name="Apply Added Entries",
+        description="Apply newly added entries from the diff",
+        default=True,
+    )
+    apply_modified: BoolProperty(
+        name="Apply Modified Entries",
+        description="Apply modified entries from the diff",
+        default=True,
+    )
+    apply_removed: BoolProperty(
+        name="Apply Removed Entries",
+        description="Remove entries listed as removed in the diff",
+        default=True,
+    )
+    preserve_texture_paths: BoolProperty(
+        name="Preserve Custom Textures (Prey)",
+        description="When applying modified entries, keep existing texture asset paths from the target file",
+        default=False,
+    )
+    skip_material_entry_modifications: BoolProperty(
+        name="Skip Material Entry Modifications",
+        description="Ignore modified entries for material types (e.g. StaticMaterialDef)",
+        default=False,
+    )
+
+
+def _build_apply_options(settings: MapPatcherSettings) -> dict:
+    return {
+        "apply_added": bool(settings.apply_added),
+        "apply_modified": bool(settings.apply_modified),
+        "apply_removed": bool(settings.apply_removed),
+        "preserve_texture_paths": bool(settings.preserve_texture_paths),
+        "skip_material_entry_modifications": bool(settings.skip_material_entry_modifications),
+    }
+
+
+def _count_applied_modified_entries(diff: dict, options: dict) -> int:
+    if not options.get("apply_modified", True):
+        return 0
+    if not options.get("skip_material_entry_modifications", False):
+        return len(diff.get("modified", []))
+    n = 0
+    for entry in diff.get("modified", []):
+        if _is_material_entry(entry):
+            continue
+        n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +564,10 @@ class MAPPATCHER_OT_apply_diff(Operator):
             self.report({"ERROR"}, "Apply To file not found")
             return {"CANCELLED"}
 
+        options = _build_apply_options(settings)
+
         try:
-            result = apply_diff_file(diff_path, target_path)
+            result = apply_diff_file(diff_path, target_path, options=options)
         except Exception as e:
             self.report({"ERROR"}, f"Apply failed: {e}")
             return {"CANCELLED"}
@@ -472,6 +605,7 @@ class MAPPATCHER_OT_patch_all(Operator):
 
         map_name = settings.cdragon_map.strip().lower()
         variant_name = settings.variant.strip().lower()
+        options = _build_apply_options(settings)
 
         # 1. Fetch available versions ----------------------------------------
         settings.status_text = "Fetching CDragon version list..."
@@ -539,12 +673,19 @@ class MAPPATCHER_OT_patch_all(Operator):
             entries_b = _load_bin_entries(downloaded[ver_b])
             diff = _create_diff(entries_a, entries_b)
 
-            n_add = len(diff["added"])
-            n_mod = len(diff["modified"])
-            n_rem = len(diff["removed"])
-            print(f"[Map Patcher] {ver_a} → {ver_b}: +{n_add} ~{n_mod} -{n_rem}")
+            n_add_raw = len(diff["added"])
+            n_mod_raw = len(diff["modified"])
+            n_rem_raw = len(diff["removed"])
+            n_add = n_add_raw if options.get("apply_added", True) else 0
+            n_mod = _count_applied_modified_entries(diff, options)
+            n_rem = n_rem_raw if options.get("apply_removed", True) else 0
+            print(
+                f"[Map Patcher] {ver_a} → {ver_b}: "
+                f"raw +{n_add_raw} ~{n_mod_raw} -{n_rem_raw} | "
+                f"applied +{n_add} ~{n_mod} -{n_rem}"
+            )
 
-            if n_add == 0 and n_mod == 0 and n_rem == 0:
+            if n_add_raw == 0 and n_mod_raw == 0 and n_rem_raw == 0:
                 print(f"[Map Patcher] {ver_a} → {ver_b}: no changes, skipping")
                 continue
 
@@ -561,7 +702,7 @@ class MAPPATCHER_OT_patch_all(Operator):
                 json.dump(diff_data, f, indent=2, ensure_ascii=True)
 
             # Apply to in-memory entries
-            entries = _apply_diff_to_entries(entries, diff)
+            entries = _apply_diff_to_entries(entries, diff, options=options)
             total_added += n_add
             total_modified += n_mod
             total_removed += n_rem
@@ -638,6 +779,15 @@ class VIEW3D_PT_map_patcher(Panel):
         # -- Manual / Advanced -----------------------------------------------
         box = layout.box()
         box.label(text="Manual (Advanced)", icon="PREFERENCES")
+
+        opts = box.box()
+        opts.label(text="Apply Filters", icon="FILTER")
+        row = opts.row(align=True)
+        row.prop(settings, "apply_added")
+        row.prop(settings, "apply_modified")
+        row.prop(settings, "apply_removed")
+        opts.prop(settings, "skip_material_entry_modifications")
+        opts.prop(settings, "preserve_texture_paths")
 
         row = box.row(align=True)
         op = row.operator("mappatcher.download", text="Download Old", icon="IMPORT")

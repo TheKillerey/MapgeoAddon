@@ -96,6 +96,8 @@ QUICK_START.md
 
 # Release artifacts
 MapgeoAddon_v*.zip
+MapgeoAddon-v*.zip
+releases/
 
 # Keep test data folders
 !LeagueTestMap/

@@ -100,6 +100,48 @@ def ensure_clean_worktree() -> None:
         raise RuntimeError("Working tree is not clean. Commit/stash changes before running release script.")
 
 
+def ensure_init_imports_tracked() -> None:
+    """Fail fast if any module imported at the top of __init__.py is untracked.
+
+    `git archive` (used to build the release zip) only includes tracked files,
+    so an untracked module silently breaks every release with a misleading
+    'cannot import name X from partially initialized module' error on install.
+    """
+    text = INIT_FILE.read_text(encoding="utf-8")
+    m = re.search(r"from\s+\.\s+import\s+\(([^)]*)\)", text)
+    if not m:
+        return
+    block = m.group(1)
+    modules = [
+        line.strip().rstrip(",").strip()
+        for line in block.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    modules = [mod for mod in modules if mod and mod.isidentifier()]
+
+    missing = []
+    for mod in modules:
+        rel = f"{mod}.py"
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            missing.append(f"{rel} (file does not exist on disk)")
+            continue
+        proc = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", rel],
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            missing.append(f"{rel} (untracked)")
+
+    if missing:
+        raise RuntimeError(
+            "Refusing to release: the following modules are imported by "
+            "__init__.py but are not tracked by git, so they would be "
+            "missing from the release zip:\n  - " + "\n  - ".join(missing) +
+            "\n\nRun `git add` on these files (or remove the import) and try again."
+        )
+
+
 def build_release_zip(tag: str) -> pathlib.Path:
     RELEASES_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = RELEASES_DIR / f"MapgeoAddon-v{tag.lstrip('v')}.zip"
@@ -147,6 +189,7 @@ def main() -> int:
         notes_lines = ["Maintenance release"]
 
     ensure_clean_worktree()
+    ensure_init_imports_tracked()
     update_version_files(version, version_tuple, notes_lines)
 
     run(["git", "add", "__init__.py", "README.md", "CHANGELOG.md"])

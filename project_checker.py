@@ -18,9 +18,11 @@ displayed as a sub-panel under the Project Manager.
 
 import bpy
 import os
+import shutil
+from difflib import SequenceMatcher
 from datetime import datetime
 from bpy.props import (
-    StringProperty, EnumProperty, IntProperty,
+    StringProperty, EnumProperty, IntProperty, FloatProperty,
     CollectionProperty, PointerProperty, BoolProperty,
 )
 from bpy.types import PropertyGroup, Operator, Panel, UIList
@@ -37,6 +39,11 @@ _SEV_ICONS = {
 }
 
 _AUDIO_EXTENSIONS = {'.bnk', '.wpk', '.ogg', '.wav', '.mp3'}
+_TEXTURE_EXTENSIONS = {'.tex', '.dds', '.png', '.jpg', '.jpeg', '.tga', '.bmp', '.ktx', '.ktx2'}
+
+# Cache for Riot-hash classification of texture asset paths
+_riot_known_cache = {}
+_riot_hash_bootstrap_done = False
 
 
 # ============================================================================
@@ -76,6 +83,45 @@ class ProjectCheckerSettings(PropertyGroup):
             ('INFO',    'Info',     '', 'INFO',         3),
         ],
         default='ALL',
+    )
+    texture_project_mode: EnumProperty(
+        name="Texture Project Type",
+        description="How missing textures should be validated for this project",
+        items=[
+            ('MIXED',
+             "Mixed (Project OR Riot)",
+             "Legacy behavior: a texture is OK if it exists in project or Riot cache"),
+            ('REPLACED_RIOT',
+             "Replaced Riot Textures",
+             "Strict project mode: texture must exist in project folder (ignore Riot cache hit)"),
+            ('FULLY_CUSTOM',
+             "Fully Custom Names",
+             "Use Riot hash knowledge: known Riot paths can resolve from Riot cache, unknown/custom names must exist in project"),
+        ],
+        default='MIXED',
+    )
+    ai_fix_min_confidence: FloatProperty(
+        name="AI Texture Min Confidence",
+        description="Minimum confidence score required for automatic texture aliasing",
+        default=0.58,
+        min=0.0,
+        max=2.0,
+    )
+    use_chatgpt_api: BoolProperty(
+        name="Use ChatGPT API",
+        description="Use OpenAI ChatGPT to suggest the best matching project texture for each missing path (requires API key)",
+        default=False,
+    )
+    chatgpt_api_key: StringProperty(
+        name="OpenAI API Key",
+        description="Your OpenAI API key. Stored in the .blend file — do not share the file if this is set",
+        default="",
+        subtype='PASSWORD',
+    )
+    chatgpt_model: StringProperty(
+        name="ChatGPT Model",
+        description="Model name (e.g. gpt-4o-mini, gpt-4o, gpt-4.1-mini)",
+        default="gpt-4o-mini",
     )
 
 
@@ -150,12 +196,77 @@ def _walk_fields(fields):
                     yield from _walk_fields(v['fields'])
 
 
+def _stems_are_season_variants(a: str, b: str) -> bool:
+    """Two stems match if they're equal or one is a dot-token-extension of the other.
+
+    e.g. 'foo' <-> 'foo.summer'         -> True
+         'foo.summer' <-> 'foo.summer.hi' -> True
+         'foo.summer' <-> 'foo.winter'  -> False
+         'foobar' <-> 'foo'             -> False (must be split on '.')
+    """
+    a = (a or '').lower()
+    b = (b or '').lower()
+    if a == b:
+        return True
+    if a.startswith(b + '.'):
+        return True
+    if b.startswith(a + '.'):
+        return True
+    return False
+
+
+def _find_season_variant(project_root: str, rel_dir: str, base: str):
+    """Return rel-path of a season-variant file in project_root/rel_dir for `base`.
+
+    Looks for files in the same directory whose stem is a season variant of
+    `base` (under any known texture extension). Returns None if none found.
+    """
+    if not project_root:
+        return None
+    abs_dir = os.path.join(project_root, rel_dir.replace('/', os.sep))
+    if not os.path.isdir(abs_dir):
+        return None
+    base_l = base.lower()
+    for fn in os.listdir(abs_dir):
+        full = os.path.join(abs_dir, fn)
+        if not os.path.isfile(full):
+            continue
+        f_base, f_ext = os.path.splitext(fn)
+        if f_ext.lower() not in _TEXTURE_EXTENSIONS:
+            continue
+        if _stems_are_season_variants(f_base, base_l):
+            if f_base.lower() == base_l:
+                continue  # exact stem already handled by caller
+            rel = os.path.join(rel_dir, fn).replace('\\', '/')
+            return rel
+    return None
+
+
 def _tex_exists(tex_path: str, roots: list) -> bool:
-    """Check whether a texture path exists under any of the given root dirs."""
+    """Check whether a texture path exists under any of the given root dirs.
+
+    Accepts any matching file with the same stem under a known texture
+    extension (e.g. materials.bin references foo.dds but the project
+    actually contains foo.tex \u2014 still considered present).
+    """
     tex_norm = tex_path.replace('\\', '/')
+    base, ext = os.path.splitext(tex_norm)
+    # Candidate extensions: the requested one first (case-insensitive), then
+    # every other known texture extension.
+    candidates = [ext]
+    for e in _TEXTURE_EXTENSIONS:
+        if e.lower() != ext.lower():
+            candidates.append(e)
+
     for root in roots:
+        # Fast path: the literal requested path exists.
         if os.path.isfile(os.path.join(root, tex_norm)):
             return True
+        # Fallback: same stem with a different texture extension.
+        for cand_ext in candidates[1:]:
+            alt = base + cand_ext
+            if os.path.isfile(os.path.join(root, alt)):
+                return True
     return False
 
 
@@ -167,13 +278,642 @@ def _file_exists(rel_path: str, roots: list) -> bool:
     return False
 
 
-def run_checks(project_settings) -> list:
+def _is_known_riot_texture_path(tex_path: str):
+    """Return True/False if the texture path is known in Riot hash DB.
+
+    Returns None when hash DB is unavailable.
+    """
+    global _riot_hash_bootstrap_done
+    norm = (tex_path or '').replace('\\', '/').strip().lower()
+    if not norm:
+        return False
+    if norm in _riot_known_cache:
+        return _riot_known_cache[norm]
+
+    try:
+        from . import wad_tool
+    except Exception:
+        _riot_known_cache[norm] = None
+        return None
+
+    if not _riot_hash_bootstrap_done:
+        try:
+            wad_tool.load_wad_hashes()
+        except Exception:
+            pass
+        _riot_hash_bootstrap_done = True
+
+    try:
+        h = wad_tool.xxhash64_path(norm)
+        ok = wad_tool.resolve_wad_hash(h) is not None
+    except Exception:
+        ok = None
+    _riot_known_cache[norm] = ok
+    return ok
+
+
+def _find_first_file_by_ext(root_dir: str, ext: str) -> str:
+    """Find the first file ending with `ext` under root_dir (sorted walk)."""
+    if not root_dir or not os.path.isdir(root_dir):
+        return ""
+    for root, dirs, files in os.walk(root_dir):
+        dirs.sort(key=str.lower)
+        files_sorted = sorted(files, key=str.lower)
+        for fn in files_sorted:
+            if fn.lower().endswith(ext.lower()):
+                return os.path.join(root, fn)
+    return ""
+
+
+def _find_first_mapgeo_and_materials(root_dir: str) -> tuple:
+    """Best-effort pair resolver under a project/cache root.
+
+    Prefer a basename pair inside data/maps/mapgeometry (variant.mapgeo +
+    variant.materials.bin). Fallback to first mapgeo/materials found anywhere.
+    """
+    if not root_dir or not os.path.isdir(root_dir):
+        return "", ""
+
+    geom_root = os.path.join(root_dir, 'data', 'maps', 'mapgeometry')
+    if os.path.isdir(geom_root):
+        for walk_root, dirs, files in os.walk(geom_root):
+            dirs.sort(key=str.lower)
+            files_sorted = sorted(files, key=str.lower)
+            mapgeos = [f for f in files_sorted if f.lower().endswith('.mapgeo')]
+            mats = [f for f in files_sorted if f.lower().endswith('.materials.bin')]
+            if mapgeos and mats:
+                mat_by_base = {
+                    m[:-len('.materials.bin')].lower(): m for m in mats
+                }
+                for mg in mapgeos:
+                    base = mg[:-len('.mapgeo')].lower()
+                    if base in mat_by_base:
+                        return (
+                            os.path.join(walk_root, mg),
+                            os.path.join(walk_root, mat_by_base[base]),
+                        )
+
+    # Fallback: first-found files anywhere
+    mg = _find_first_file_by_ext(root_dir, '.mapgeo')
+    mb = _find_first_file_by_ext(root_dir, '.materials.bin')
+    return mg, mb
+
+
+def _resolve_integrity_paths(settings, wad_cache_dir: str) -> tuple:
+    """Resolve mapgeo/materials paths even when no variant was loaded.
+
+    Priority:
+      1) loaded_* paths
+      2) selected variant from map_variants
+      3) any variant from map_variants with existing files
+      4) project folder scan
+      5) Riot WAD cache scan
+    """
+    loaded_mapgeo = bpy.path.abspath(settings.loaded_mapgeo_path) if settings.loaded_mapgeo_path else ""
+    loaded_materials = bpy.path.abspath(settings.loaded_materials_path) if settings.loaded_materials_path else ""
+
+    mapgeo_path = loaded_mapgeo if (loaded_mapgeo and os.path.isfile(loaded_mapgeo)) else ""
+    materials_path = loaded_materials if (loaded_materials and os.path.isfile(loaded_materials)) else ""
+    source = "loaded"
+
+    # 2) selected variant
+    if (not mapgeo_path or not materials_path) and getattr(settings, 'map_variants', None):
+        idx = int(getattr(settings, 'selected_variant_index', 0) or 0)
+        if 0 <= idx < len(settings.map_variants):
+            v = settings.map_variants[idx]
+            if not mapgeo_path and v.mapgeo_path:
+                p = bpy.path.abspath(v.mapgeo_path)
+                if os.path.isfile(p):
+                    mapgeo_path = p
+                    source = "selected variant"
+            if not materials_path and v.materials_bin_path:
+                p = bpy.path.abspath(v.materials_bin_path)
+                if os.path.isfile(p):
+                    materials_path = p
+                    source = "selected variant"
+
+    # 3) any variant
+    if (not mapgeo_path or not materials_path) and getattr(settings, 'map_variants', None):
+        for v in settings.map_variants:
+            if not mapgeo_path and v.mapgeo_path:
+                p = bpy.path.abspath(v.mapgeo_path)
+                if os.path.isfile(p):
+                    mapgeo_path = p
+                    source = "variant list"
+            if not materials_path and v.materials_bin_path:
+                p = bpy.path.abspath(v.materials_bin_path)
+                if os.path.isfile(p):
+                    materials_path = p
+                    source = "variant list"
+            if mapgeo_path and materials_path:
+                break
+
+    # 4) project folder scan
+    project_folder = bpy.path.abspath(settings.project_folder) if settings.project_folder else ""
+    if (not mapgeo_path or not materials_path) and project_folder and os.path.isdir(project_folder):
+        mg, mb = _find_first_mapgeo_and_materials(project_folder)
+        if not mapgeo_path and mg:
+            mapgeo_path = mg
+            source = "project scan"
+        if not materials_path and mb:
+            materials_path = mb
+            source = "project scan"
+
+    # 5) Riot WAD cache fallback
+    if (not mapgeo_path or not materials_path) and wad_cache_dir and os.path.isdir(wad_cache_dir):
+        mg, mb = _find_first_mapgeo_and_materials(wad_cache_dir)
+        if not mapgeo_path and mg:
+            mapgeo_path = mg
+            source = "Riot cache scan"
+        if not materials_path and mb:
+            materials_path = mb
+            source = "Riot cache scan"
+
+    return mapgeo_path, materials_path, source
+
+
+def _norm_rel(path: str) -> str:
+    return (path or '').replace('\\', '/').strip().lower()
+
+
+def _iter_project_texture_files(project_root: str):
+    """Yield relative texture file paths under project_root."""
+    if not project_root or not os.path.isdir(project_root):
+        return
+    for root, _dirs, files in os.walk(project_root):
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in _TEXTURE_EXTENSIONS:
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, project_root).replace('\\', '/')
+            yield rel
+
+
+def _score_texture_candidate(expected_rel: str, candidate_rel: str) -> float:
+    """Heuristic "AI-like" similarity score for wrong texture path recovery."""
+    e = _norm_rel(expected_rel)
+    c = _norm_rel(candidate_rel)
+
+    e_dir, e_name = os.path.split(e)
+    c_dir, c_name = os.path.split(c)
+    e_base, e_ext = os.path.splitext(e_name)
+    c_base, c_ext = os.path.splitext(c_name)
+
+    base_ratio = SequenceMatcher(None, e_base, c_base).ratio()
+    path_ratio = SequenceMatcher(None, e, c).ratio()
+    dir_ratio = SequenceMatcher(None, e_dir, c_dir).ratio()
+
+    score = base_ratio * 0.60 + path_ratio * 0.25 + dir_ratio * 0.15
+    if e_base == c_base:
+        score += 0.30
+    if e_ext == c_ext:
+        score += 0.10
+    if e_dir and c_dir and (e_dir in c_dir or c_dir in e_dir):
+        score += 0.10
+    return score
+
+
+def _best_texture_candidate(expected_rel: str, project_root: str):
+    """Return (best_rel_path, score) for expected texture path."""
+    expected = _norm_rel(expected_rel)
+    if not expected:
+        return "", 0.0
+
+    e_name = os.path.basename(expected)
+    e_base, e_ext = os.path.splitext(e_name)
+
+    best_rel = ""
+    best_score = 0.0
+
+    for rel in _iter_project_texture_files(project_root):
+        r = _norm_rel(rel)
+        if r == expected:
+            return rel, 1.0
+
+        # Fast prefilter for scale: keep candidates with either matching ext
+        # or strong basename overlap signal.
+        r_name = os.path.basename(r)
+        r_base, r_ext = os.path.splitext(r_name)
+        if r_ext != e_ext and e_base[:4] not in r_base and r_base[:4] not in e_base:
+            continue
+
+        s = _score_texture_candidate(expected, r)
+        if s > best_score:
+            best_score = s
+            best_rel = rel
+
+    return best_rel, best_score
+
+
+def _chatgpt_audit_one_batch(refs, files, api_key, model, timeout):
+    """Single OpenAI call for one batch of references."""
+    import json
+    import urllib.request
+    import urllib.error
+
+    system_msg = (
+        "You audit referenced texture paths against an actual project file "
+        "listing. For each reference, decide one of:\n"
+        "  - 'exact'   : the reference is present in the project files (case-insensitive)\n"
+        "  - 'fuzzy'   : not present, but a project file is clearly the renamed/moved equivalent\n"
+        "  - 'missing' : no reasonable equivalent exists in the project files\n"
+        "Only choose 'fuzzy' when the basename or directory clearly corresponds "
+        "(do not invent matches). Respond with ONLY valid JSON of the form:\n"
+        "{\"exact\":[...refs...], \"fuzzy\":[{\"ref\":\"...\",\"candidate\":\"...\"}], "
+        "\"missing\":[...refs...]}\n"
+        "Each candidate MUST be one of the supplied project files verbatim."
+    )
+    user_msg = json.dumps({"references": refs, "project_files": files}, ensure_ascii=False)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+        # Surface 429 specifically so the caller's retry-with-backoff can react
+        raise RuntimeError(f"OpenAI HTTP {e.code}: {body[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"OpenAI request failed: {e}")
+
+    try:
+        data = json.loads(raw)
+        content = data["choices"][0]["message"]["content"]
+        result = json.loads(content)
+    except Exception as e:
+        raise RuntimeError(f"OpenAI response parse failed: {e}")
+
+    out = {'exact': [], 'fuzzy': [], 'missing': []}
+    if isinstance(result, dict):
+        out['exact']   = [r for r in result.get('exact', []) if isinstance(r, str)]
+        out['missing'] = [r for r in result.get('missing', []) if isinstance(r, str)]
+        for entry in result.get('fuzzy', []):
+            if isinstance(entry, dict) and isinstance(entry.get('ref'), str):
+                out['fuzzy'].append({
+                    'ref': entry['ref'],
+                    'candidate': entry.get('candidate', '') if isinstance(entry.get('candidate'), str) else '',
+                })
+    return out
+
+
+def _chatgpt_audit_textures(referenced_paths, project_files, api_key: str,
+                            model: str = "gpt-4o-mini", timeout: float = 90.0,
+                            batch_size: int = 20, max_files: int = 250,
+                            max_retries: int = 3) -> dict:
+    """Ask ChatGPT to classify every referenced texture path against the
+    actual project file list. Pre-filters exact matches locally, then sends
+    only ambiguous refs to the AI in small batches with retry.
+
+    Returns: { 'exact': [...], 'fuzzy': [{'ref','candidate'}, ...], 'missing': [...] }
+    Raises RuntimeError if every batch fails.
+    """
+    import time
+
+    if not api_key or not referenced_paths:
+        return {'exact': [], 'fuzzy': [], 'missing': []}
+
+    # Local pre-pass: anything already present (case-insensitive) is 'exact'.
+    # Also treat same-stem-different-extension as exact (e.g. project has
+    # foo.tex while the bin references foo.dds, or vice versa).
+    files_norm_map = {f.replace('\\', '/').lower(): f for f in project_files}
+    files_stem_map = {}
+    for f in project_files:
+        fn = f.replace('\\', '/').lower()
+        stem = os.path.splitext(fn)[0]
+        files_stem_map.setdefault(stem, fn)
+    exact_local = []
+    needs_ai = []
+    for r in referenced_paths:
+        rn = (r or '').replace('\\', '/').lower()
+        if rn in files_norm_map:
+            exact_local.append(r)
+            continue
+        stem = os.path.splitext(rn)[0]
+        if stem in files_stem_map:
+            exact_local.append(r)
+            continue
+        needs_ai.append(r)
+
+    aggregate = {'exact': list(exact_local), 'fuzzy': [], 'missing': []}
+
+    if not needs_ai:
+        return aggregate
+
+    # Trim project files to keep the prompt small. Prefer files whose basename
+    # appears in any unresolved ref so candidates remain useful.
+    files_list = project_files
+    if len(files_list) > max_files:
+        ref_basenames = {os.path.basename(r).lower() for r in needs_ai}
+        scored = []
+        for f in files_list:
+            base = os.path.basename(f).lower()
+            score = 1 if base in ref_basenames else 0
+            # also prefer same first 4 chars
+            stem = os.path.splitext(base)[0]
+            if any(rb.startswith(stem[:4]) for rb in ref_basenames if stem):
+                score += 1
+            scored.append((score, f))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        files_list = [f for _s, f in scored[:max_files]]
+
+    last_err = None
+    n_batches = (len(needs_ai) + batch_size - 1) // batch_size
+    succeeded_batches = 0
+
+    for bi in range(n_batches):
+        batch = needs_ai[bi * batch_size:(bi + 1) * batch_size]
+        attempt = 0
+        cur_timeout = timeout
+        while True:
+            try:
+                res = _chatgpt_audit_one_batch(batch, files_list, api_key, model, cur_timeout)
+                aggregate['exact'].extend(res.get('exact', []))
+                aggregate['fuzzy'].extend(res.get('fuzzy', []))
+                aggregate['missing'].extend(res.get('missing', []))
+                succeeded_batches += 1
+                break
+            except Exception as e:
+                last_err = str(e)
+                attempt += 1
+                if attempt > max_retries:
+                    print(f"[Project Checker] AI batch {bi+1}/{n_batches} failed permanently: {e}")
+                    # Treat batch as inconclusive — leave to local heuristic later
+                    break
+                # 429 (rate limit) — parse "try again in Xs" if present
+                wait_s = 2.0 * attempt
+                if '429' in last_err:
+                    import re as _re
+                    m = _re.search(r'try again in ([\d.]+)s', last_err, _re.IGNORECASE)
+                    if m:
+                        try:
+                            wait_s = max(wait_s, float(m.group(1)) + 1.0)
+                        except Exception:
+                            pass
+                    else:
+                        wait_s = max(wait_s, 10.0)
+                cur_timeout = min(cur_timeout + 60.0, 360.0)
+                print(f"[Project Checker] AI batch {bi+1}/{n_batches} attempt {attempt} retry in {wait_s:.1f}s "
+                      f"(timeout {cur_timeout}s): {e}")
+                time.sleep(wait_s)
+
+    if succeeded_batches == 0 and last_err:
+        raise RuntimeError(last_err)
+
+    # Dedupe
+    aggregate['exact'] = sorted(set(aggregate['exact']))
+    aggregate['missing'] = sorted(set(aggregate['missing']))
+    seen_fuzzy = set()
+    deduped_fuzzy = []
+    for entry in aggregate['fuzzy']:
+        key = (entry.get('ref', ''), entry.get('candidate', ''))
+        if key in seen_fuzzy:
+            continue
+        seen_fuzzy.add(key)
+        deduped_fuzzy.append(entry)
+    aggregate['fuzzy'] = deduped_fuzzy
+    return aggregate
+
+
+def _chatgpt_match_textures(missing_paths, candidate_paths, api_key: str,
+                            model: str = "gpt-4o-mini", timeout: float = 180.0):
+    """Ask ChatGPT to map each missing texture path to the best candidate.
+
+    Returns dict { missing_path_lower : candidate_path } (candidate is one of
+    the supplied candidate_paths, or "" if the model could not match).
+    Raises RuntimeError on transport / API errors so the caller can fall back.
+    """
+    import json
+    import re
+    import time
+    import urllib.request
+    import urllib.error
+
+    if not api_key or not missing_paths or not candidate_paths:
+        return {}
+
+    BATCH_SIZE = 20
+    MAX_FILES_PER_CALL = 300
+
+    def _trim_candidates_for(batch_misses):
+        """Keep candidates whose basename / stem overlaps the batch refs."""
+        ref_bases = {os.path.basename(m).lower() for m in batch_misses}
+        ref_stems = {os.path.splitext(b)[0][:4] for b in ref_bases if b}
+        scored = []
+        for c in candidate_paths:
+            base = os.path.basename(c).lower()
+            stem = os.path.splitext(base)[0]
+            score = 0
+            if base in ref_bases:
+                score += 2
+            if stem and any(stem.startswith(s) or s.startswith(stem[:4]) for s in ref_stems):
+                score += 1
+            scored.append((score, c))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [c for _s, c in scored[:MAX_FILES_PER_CALL]]
+
+    out = {}
+    n = len(missing_paths)
+    n_batches = (n + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for bi in range(n_batches):
+        miss = missing_paths[bi * BATCH_SIZE:(bi + 1) * BATCH_SIZE]
+        cands = _trim_candidates_for(miss)
+        if not cands:
+            continue
+
+        system_msg = (
+            "You map missing texture file paths to the closest matching existing "
+            "project texture path. Respond with ONLY valid JSON: an object whose "
+            "keys are the missing paths (verbatim) and whose values are the chosen "
+            "candidate path from the provided list, or an empty string if none "
+            "is a reasonable match. Do not invent paths."
+        )
+        user_msg = json.dumps({"missing": miss, "candidates": cands}, ensure_ascii=False)
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+
+        # Up to 3 attempts with 429-aware backoff
+        raw = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode('utf-8', errors='replace')
+                break
+            except urllib.error.HTTPError as e:
+                body = e.read().decode('utf-8', errors='replace') if e.fp else ''
+                if e.code == 429:
+                    wait_s = 5.0 * (attempt + 1)
+                    m = re.search(r'try again in ([\d.]+)s', body, re.IGNORECASE)
+                    if m:
+                        try:
+                            wait_s = max(wait_s, float(m.group(1)) + 1.0)
+                        except Exception:
+                            pass
+                    if attempt < 2:
+                        print(f"[Project Checker] OpenAI 429 (batch {bi+1}/{n_batches}), "
+                              f"backing off {wait_s:.1f}s\u2026")
+                        time.sleep(wait_s)
+                        continue
+                if attempt == 2:
+                    raise RuntimeError(f"OpenAI HTTP {e.code}: {body[:300]}")
+            except Exception as e:
+                if attempt == 2:
+                    raise RuntimeError(f"OpenAI request failed: {e}")
+                time.sleep(2.0 * (attempt + 1))
+
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+            mapping = json.loads(content)
+            if not isinstance(mapping, dict):
+                continue
+        except Exception:
+            continue
+
+        cand_set = {c.replace('\\', '/').lower(): c for c in cands}
+        for k, v in mapping.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            v_norm = v.replace('\\', '/').strip().lower()
+            if v_norm and v_norm in cand_set:
+                out[k.replace('\\', '/').strip().lower()] = cand_set[v_norm]
+
+    return out
+
+
+def _convert_texture_file(src_abs: str, dst_abs: str) -> str:
+    """Convert between .tex and .dds when extensions differ.
+
+    Returns one of: 'converted_tex_to_dds', 'converted_dds_to_tex'.
+    Raises RuntimeError on unsupported conversion or failure.
+    """
+    src_ext = os.path.splitext(src_abs)[1].lower()
+    dst_ext = os.path.splitext(dst_abs)[1].lower()
+    os.makedirs(os.path.dirname(dst_abs) or '.', exist_ok=True)
+
+    if src_ext == '.dds' and dst_ext == '.tex':
+        from . import texture_utils
+        texture_utils.convert_dds_to_tex_file(src_abs, dst_abs)
+        return 'converted_dds_to_tex'
+
+    if src_ext == '.tex' and dst_ext == '.dds':
+        from . import texture_utils
+        with open(src_abs, 'rb') as fh:
+            tex_data = fh.read()
+        # TexConverter._tex_to_dds is the inverse used internally for previews.
+        dds_data = texture_utils.TexConverter._tex_to_dds(tex_data)
+        with open(dst_abs, 'wb') as fh:
+            fh.write(dds_data)
+        return 'converted_tex_to_dds'
+
+    raise RuntimeError(
+        f"No converter from {src_ext or '?'} to {dst_ext or '?'}"
+    )
+
+
+def _create_texture_alias(project_root: str, source_rel: str, expected_rel: str):
+    """Create expected texture path next to existing project file.
+
+    Strategy:
+      1. If destination already exists \u2192 ('exists').
+      2. If source extension matches destination \u2192 hardlink (fallback copy).
+      3. If extensions differ but both are .tex/.dds \u2192 convert via texture_utils.
+      4. Otherwise raise.
+    """
+    src = os.path.join(project_root, source_rel.replace('/', os.sep))
+    dst = os.path.join(project_root, expected_rel.replace('/', os.sep))
+
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"Candidate source not found: {src}")
+
+    os.makedirs(os.path.dirname(dst) or '.', exist_ok=True)
+    if os.path.isfile(dst):
+        return dst, 'exists'
+
+    src_ext = os.path.splitext(src)[1].lower()
+    dst_ext = os.path.splitext(dst)[1].lower()
+
+    if src_ext == dst_ext:
+        try:
+            os.link(src, dst)
+            return dst, 'hardlink'
+        except Exception:
+            shutil.copy2(src, dst)
+            return dst, 'copy'
+
+    # Extensions differ \u2014 try TEX <-> DDS conversion
+    if {src_ext, dst_ext} == {'.tex', '.dds'}:
+        try:
+            mode = _convert_texture_file(src, dst)
+            return dst, mode
+        except Exception as e:
+            # Fallback: just copy the bytes so the file at least exists; note
+            # the format will be wrong but it preserves the previous behavior.
+            shutil.copy2(src, dst)
+            print(f"[Project Checker] TEX/DDS conversion failed ({e}); copied raw bytes instead.")
+            return dst, 'copy_fallback'
+
+    # Different image format with no converter \u2014 plain copy
+    shutil.copy2(src, dst)
+    return dst, 'copy'
+
+
+def run_checks(project_settings, checker_settings=None) -> list:
     """
     Run all integrity checks against the currently loaded project.
     Returns a list of issue dicts:
       {severity, category, message, detail, file_path}
     """
     from . import mapgeo_parser, propertybin_parser
+
+    # Resolve checker settings (where texture_project_mode lives) — fall back
+    # to scene.project_checker when not explicitly passed.
+    if checker_settings is None:
+        try:
+            checker_settings = bpy.context.scene.project_checker
+        except Exception:
+            checker_settings = None
 
     issues = []
 
@@ -196,7 +936,7 @@ def run_checks(project_settings) -> list:
 
     if not project_folder:
         add('ERROR', 'Setup', 'No project folder is set.')
-        return issues
+        return issues, None
 
     # ── Resolve WAD cache dirs ─────────────────────────────────────────────
     wad_cache_dir    = ""
@@ -213,8 +953,46 @@ def run_checks(project_settings) -> list:
         except Exception:
             pass
 
+    # Resolve check targets even when no variant has been loaded into Blender.
+    resolved_mapgeo, resolved_materials, resolved_source = _resolve_integrity_paths(s, wad_cache_dir)
+    loaded_mapgeo = resolved_mapgeo or loaded_mapgeo
+    loaded_materials = resolved_materials or loaded_materials
+    if resolved_source != "loaded" and (resolved_mapgeo or resolved_materials):
+        add('INFO', 'Setup',
+            f'Auto-resolved integrity inputs from {resolved_source}.',
+            detail=(f"mapgeo={resolved_mapgeo or '-'} | materials={resolved_materials or '-'}"))
+
+    project_asset_roots = [r for r in [project_folder] if r]
+    riot_asset_roots = [r for r in [wad_cache_dir] if r]
     asset_roots    = [r for r in [project_folder, wad_cache_dir] if r]
     lightmap_roots = [r for r in [project_folder, levels_cache_dir, wad_cache_dir] if r]
+    texture_mode = getattr(checker_settings, 'texture_project_mode', 'MIXED') or 'MIXED'
+    hash_db_info = {'warned': False}
+
+    def _texture_exists_for_project(tex: str) -> bool:
+        project_hit = _tex_exists(tex, project_asset_roots)
+        riot_hit = _tex_exists(tex, riot_asset_roots)
+
+        if texture_mode == 'REPLACED_RIOT':
+            return project_hit
+        if texture_mode == 'MIXED':
+            return project_hit or riot_hit
+
+        # FULLY_CUSTOM:
+        # - known Riot paths may resolve from Riot cache
+        # - unknown/custom paths must exist in project
+        known_riot = _is_known_riot_texture_path(tex)
+        if known_riot is None and not hash_db_info['warned']:
+            add('INFO', 'Setup',
+                'FULLY_CUSTOM mode: Riot hash DB unavailable, treating unknown paths as custom (project-only).')
+            hash_db_info['warned'] = True
+        if known_riot is True:
+            return project_hit or riot_hit
+        return project_hit
+
+    add('INFO', 'Setup', f"Texture project type: {texture_mode}")
+    add('INFO', 'Setup',
+        f"Texture roots — project: {project_folder or '(none)'} | riot: {wad_cache_dir or '(none)'}")
 
     # ── Parse mapgeo ──────────────────────────────────────────────────────
     mapgeo_data = None
@@ -302,50 +1080,95 @@ def run_checks(project_settings) -> list:
                 fix_id='MISSING_MATERIAL')
 
     # ── CHECK 2: Materials → Textures ─────────────────────────────────────
+    all_referenced_tex = set()  # union of sampler tex + mapgeo overrides
+    riot_tex_set = set()        # known Riot original paths
+    custom_tex_set = set()      # not in Riot hash DB (custom/renamed)
+    unknown_tex_set = set()     # could not classify (hash DB unavailable)
+
     if bin_data:
-        checked_tex  = set()
-        missing_tex  = []
-        ok_count     = 0
+        from . import project_manager as _pm
+
+        sampler_total = 0
+        unique_tex = set()
+        missing_tex = []
+        ok_count = 0
+        sampler_field_entries = 0
 
         for entry in bin_data.get('entries', []):
-            for fld in entry.get('fields', []):
-                if fld.get('name_hash_int') != _HASH_SAMPLER_VALS:
+            mat = _pm.convert_bin_entry_to_material_dict(entry)
+            if not mat:
+                continue
+            samplers = mat.get('samplerValues') or []
+            if samplers:
+                sampler_field_entries += 1
+            for s in samplers:
+                tex = (s.get('texturePath') or '').replace('\\', '/').strip()
+                if not tex:
                     continue
-                for sampler in fld.get('items', []):
-                    if not isinstance(sampler, dict):
-                        continue
-                    for sf in sampler.get('fields', []):
-                        if sf.get('name_hash_int') == _HASH_TEXTURE_PATH \
-                                and sf.get('type') == _TYPE_STRING:
-                            tex = sf.get('value', '').replace('\\', '/')
-                            if not tex or tex in checked_tex:
-                                continue
-                            checked_tex.add(tex)
-                            if _tex_exists(tex, asset_roots):
-                                ok_count += 1
-                            else:
-                                missing_tex.append(tex)
+                sampler_total += 1
+                if tex in unique_tex:
+                    continue
+                unique_tex.add(tex)
+                all_referenced_tex.add(tex)
+
+                # Classify Riot vs custom
+                cls = _is_known_riot_texture_path(tex)
+                if cls is True:
+                    riot_tex_set.add(tex)
+                elif cls is False:
+                    custom_tex_set.add(tex)
+                else:
+                    unknown_tex_set.add(tex)
+
+                if _texture_exists_for_project(tex):
+                    ok_count += 1
+                else:
+                    missing_tex.append(tex)
 
         for tex in missing_tex:
             add('WARNING', 'Textures',
                 'Texture file not found on disk',
-                detail=tex, file_path=loaded_materials)
-        if ok_count:
-            add('INFO', 'Textures',
-                f'{ok_count} unique texture(s) found OK, {len(missing_tex)} missing.')
+                detail=tex, file_path=loaded_materials,
+                fix_id='MISSING_TEXTURE')
+
+        add('INFO', 'Textures',
+            f'Sampler textures: {len(unique_tex)} unique '
+            f'({sampler_total} total refs across {sampler_field_entries} materials) '
+            f'\u2014 OK: {ok_count}, missing: {len(missing_tex)}.')
+        add('INFO', 'Textures',
+            f'Classification \u2014 Riot original: {len(riot_tex_set)}, '
+            f'Custom/renamed: {len(custom_tex_set)}, '
+            f'Unclassified: {len(unknown_tex_set)} '
+            f'(hash DB {"loaded" if (riot_tex_set or custom_tex_set) else "may be unavailable"}).')
 
     # ── CHECK 3: Mapgeo texture overrides (v17+) ──────────────────────────
     if mapgeo_data and bin_data:
         sampler_def_names = {sd.index: sd.name for sd in mapgeo_data.sampler_defs}
         override_missing = []
         override_ok = 0
+        override_total = 0
+        override_unique = set()
 
         for mesh in mapgeo_data.meshes:
             for ov in mesh.texture_overrides:
                 tex = ov.texture.replace('\\', '/')
                 if not tex:
                     continue
-                if _tex_exists(tex, asset_roots):
+                override_total += 1
+                if tex in override_unique:
+                    continue
+                override_unique.add(tex)
+                all_referenced_tex.add(tex)
+
+                cls = _is_known_riot_texture_path(tex)
+                if cls is True:
+                    riot_tex_set.add(tex)
+                elif cls is False:
+                    custom_tex_set.add(tex)
+                else:
+                    unknown_tex_set.add(tex)
+
+                if _texture_exists_for_project(tex):
                     override_ok += 1
                 else:
                     slot_name = sampler_def_names.get(ov.index, f'slot {ov.index}')
@@ -354,10 +1177,55 @@ def run_checks(project_settings) -> list:
         for tex, slot in override_missing:
             add('WARNING', 'Textures',
                 f'Texture override not found (sampler: {slot})',
-                detail=tex, file_path=loaded_mapgeo)
-        if override_ok:
-            add('INFO', 'Textures',
-                f'{override_ok} texture override(s) found OK.')
+                detail=tex, file_path=loaded_mapgeo,
+                fix_id='MISSING_TEXTURE')
+        add('INFO', 'Textures',
+            f'Mapgeo overrides: {len(override_unique)} unique '
+            f'({override_total} total refs) \u2014 OK: {override_ok}, missing: {len(override_missing)}.')
+
+    # ── CHECK 2b: AI texture audit (DEFERRED — runs on background thread) ─
+    # Build the AI candidate list according to the chosen validation mode:
+    #   MIXED         => audit every referenced texture
+    #   REPLACED_RIOT => audit Riot-original references that should now exist in project
+    #   FULLY_CUSTOM  => audit custom/unknown references (project must own them)
+    ai_payload = None
+    if (all_referenced_tex
+            and checker_settings is not None
+            and getattr(checker_settings, 'use_chatgpt_api', False)
+            and (getattr(checker_settings, 'chatgpt_api_key', '') or '').strip()
+            and project_folder
+            and os.path.isdir(project_folder)):
+
+        if texture_mode == 'REPLACED_RIOT':
+            ai_targets = sorted(riot_tex_set | unknown_tex_set)
+            ai_scope_label = "Riot+unknown (project must own these)"
+        elif texture_mode == 'FULLY_CUSTOM':
+            ai_targets = sorted(custom_tex_set | unknown_tex_set)
+            ai_scope_label = "custom/unknown (project must own these)"
+        else:  # MIXED
+            ai_targets = sorted(all_referenced_tex)
+            ai_scope_label = "all referenced textures"
+
+        try:
+            project_files = list(_iter_project_texture_files(project_folder))
+        except Exception as e:
+            project_files = []
+            add('WARNING', 'AI Audit', f'Failed to scan project files: {e}')
+
+        if ai_targets and project_files:
+            add('INFO', 'AI Audit',
+                f"ChatGPT scope: {ai_scope_label} \u2014 {len(ai_targets)} refs vs "
+                f"{len(project_files)} project file(s). Running in background\u2026")
+            ai_payload = {
+                'targets': ai_targets,
+                'project_files': project_files,
+                'api_key': checker_settings.chatgpt_api_key.strip(),
+                'model': (checker_settings.chatgpt_model or 'gpt-4o-mini').strip(),
+                'materials_path': loaded_materials,
+            }
+        elif not project_files:
+            add('WARNING', 'AI Audit',
+                'No texture files found under project folder \u2014 nothing to match against.')
 
     # ── CHECK 4: Custom bucket grid ───────────────────────────────────────
     if mapgeo_data:
@@ -654,7 +1522,121 @@ def run_checks(project_settings) -> list:
                         f'Could not parse shipping bin: {e}', detail=spath)
                 break
 
-    return issues
+    return issues, ai_payload
+
+
+# ============================================================================
+# Background AI worker (non-blocking)
+# ============================================================================
+
+_ai_worker_state = {
+    'thread': None,
+    'result': None,   # dict from _chatgpt_audit_textures
+    'error': None,    # str
+    'payload': None,  # original payload (for materials_path)
+    'done': False,
+}
+
+
+def _ai_worker_run(payload):
+    import threading
+
+    def _work():
+        try:
+            # Heavy filesystem scan happens here, OFF the main thread
+            project_files = list(_iter_project_texture_files(payload.get('project_folder', '')))
+            if not project_files:
+                _ai_worker_state['error'] = (
+                    'No texture files found under project folder — nothing to match against.'
+                )
+                return
+            res = _chatgpt_audit_textures(
+                payload['targets'],
+                project_files,
+                api_key=payload['api_key'],
+                model=payload['model'],
+            )
+            _ai_worker_state['result'] = res
+            _ai_worker_state['scanned_files'] = len(project_files)
+        except Exception as e:
+            _ai_worker_state['error'] = str(e)
+        finally:
+            _ai_worker_state['done'] = True
+
+    _ai_worker_state.update({'thread': None, 'result': None, 'error': None,
+                             'payload': payload, 'done': False, 'scanned_files': 0})
+    t = threading.Thread(target=_work, name='MapgeoAIAudit', daemon=True)
+    _ai_worker_state['thread'] = t
+    t.start()
+
+
+def _ai_worker_poll():
+    """bpy.app.timers callback: returns interval (s) until next poll, or None to stop."""
+    if not _ai_worker_state.get('done'):
+        return 0.5
+
+    try:
+        scene = bpy.context.scene
+        checker = getattr(scene, 'project_checker', None)
+        if checker is None:
+            return None
+
+        payload = _ai_worker_state.get('payload') or {}
+        materials_path = payload.get('materials_path', '')
+
+        def _add(sev, cat, msg, detail='', fix_id=''):
+            it = checker.issues.add()
+            it.severity = sev
+            it.category = cat
+            it.message = msg
+            it.detail = detail
+            it.file_path = materials_path
+            it.fix_id = fix_id
+            if sev == 'ERROR':
+                checker.error_count += 1
+            elif sev == 'WARNING':
+                checker.warning_count += 1
+            else:
+                checker.info_count += 1
+
+        err = _ai_worker_state.get('error')
+        if err:
+            _add('WARNING', 'AI Audit', f'ChatGPT audit failed: {err}')
+        else:
+            res = _ai_worker_state.get('result') or {}
+            _add('INFO', 'AI Audit',
+                 f"ChatGPT result: {len(res.get('exact', []))} exact, "
+                 f"{len(res.get('fuzzy', []))} fuzzy, "
+                 f"{len(res.get('missing', []))} truly missing.")
+            for item in res.get('fuzzy', []):
+                ref = item.get('ref', '')
+                cand = item.get('candidate', '')
+                if not ref:
+                    continue
+                _add('WARNING', 'AI Audit',
+                     'AI suggests this texture exists under a different path',
+                     detail=f"{ref}  =>  {cand}",
+                     fix_id='MISSING_TEXTURE')
+            for ref in res.get('missing', []):
+                if not ref:
+                    continue
+                _add('ERROR', 'AI Audit',
+                     'AI confirms texture is missing from project',
+                     detail=ref,
+                     fix_id='MISSING_TEXTURE')
+
+        # Force a UI redraw so the new rows appear
+        for area in bpy.context.window.screen.areas:
+            area.tag_redraw()
+    except Exception as e:
+        print(f"[Project Checker] AI poll error: {e}")
+    finally:
+        _ai_worker_state['payload'] = None
+        _ai_worker_state['result'] = None
+        _ai_worker_state['error'] = None
+        _ai_worker_state['thread'] = None
+        _ai_worker_state['done'] = False
+    return None
 
 
 # ============================================================================
@@ -682,7 +1664,7 @@ class PROJ_OT_run_integrity_check(Operator):
         checker.issues.clear()
 
         try:
-            issues = run_checks(settings)
+            issues, ai_payload = run_checks(settings, checker)
         except Exception as e:
             import traceback
             self.report({'ERROR'}, f"Integrity check failed: {e}")
@@ -714,6 +1696,17 @@ class PROJ_OT_run_integrity_check(Operator):
 
         msg = f"Check complete: {errors} error(s), {warnings} warning(s), {infos} info"
         self.report({'WARNING' if errors else 'INFO'}, msg)
+
+        # Kick off the AI audit on a background thread so Blender stays responsive
+        if ai_payload:
+            try:
+                _ai_worker_run(ai_payload)
+                if not bpy.app.timers.is_registered(_ai_worker_poll):
+                    bpy.app.timers.register(_ai_worker_poll, first_interval=0.5)
+                self.report({'INFO'}, "AI audit running in background… results will appear shortly.")
+            except Exception as e:
+                self.report({'WARNING'}, f"Could not start AI audit thread: {e}")
+
         return {'FINISHED'}
 
 
@@ -845,6 +1838,8 @@ class PROJ_OT_fix_issue(Operator):
         item = checker.issues[idx]
         if item.fix_id == 'MISSING_MATERIAL':
             return self._fix_missing_material(context, item.detail)
+        if item.fix_id == 'MISSING_TEXTURE':
+            return self._fix_missing_texture(context, item.detail)
 
         self.report({'WARNING'}, "No auto-fix available for this issue type")
         return {'CANCELLED'}
@@ -879,6 +1874,511 @@ class PROJ_OT_fix_issue(Operator):
             self.report({'INFO'}, f"Removed '{mat_name}' material from {fixed_count} mesh(es)")
         else:
             self.report({'INFO'}, f"No meshes found with '{mat_name}' material")
+        return {'FINISHED'}
+
+    def _fix_missing_texture(self, context, missing_tex):
+        settings = context.scene.project_settings
+        project_root = bpy.path.abspath(settings.project_folder) if settings.project_folder else ""
+        if not project_root or not os.path.isdir(project_root):
+            self.report({'ERROR'}, "Project Folder is not set or invalid")
+            return {'CANCELLED'}
+
+        expected = (missing_tex or '').replace('\\', '/').strip()
+        if not expected:
+            self.report({'ERROR'}, "No texture path in issue detail")
+            return {'CANCELLED'}
+
+        # If another process already resolved it, skip cleanly.
+        if os.path.isfile(os.path.join(project_root, expected.replace('/', os.sep))):
+            self.report({'INFO'}, f"Texture already exists: {expected}")
+            return {'FINISHED'}
+
+        best_rel, score = _best_texture_candidate(expected, project_root)
+        if not best_rel:
+            self.report({'WARNING'}, f"AI Fix: no candidate found for {expected}")
+            return {'CANCELLED'}
+
+        # Safety floor: avoid bad matches.
+        if score < 0.58:
+            self.report({'WARNING'},
+                        f"AI Fix confidence too low ({score:.2f}) for {expected} -> {best_rel}")
+            return {'CANCELLED'}
+
+        try:
+            _dst, mode = _create_texture_alias(project_root, best_rel, expected)
+        except Exception as e:
+            self.report({'ERROR'}, f"AI Fix failed: {e}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"AI Fix ({mode}): {expected} -> source {best_rel} (confidence {score:.2f})")
+        return {'FINISHED'}
+
+
+class PROJ_OT_fix_texture_name_variants(Operator):
+    """Resolve missing textures whose file exists in the same directory under a
+    season-variant name (e.g. ``foo.summer.tex`` instead of ``foo.tex``).
+
+    For every MISSING_TEXTURE issue, looks in the expected directory for files
+    whose stem differs only by extra dot-separated tokens (season tags). If
+    found, creates the bin-expected file (rename or copy) so the engine and
+    Blender both find it.
+    """
+    bl_idname = "project.fix_texture_name_variants"
+    bl_label = "Fix Texture Name Variants"
+    bl_description = (
+        "Find missing textures whose file exists under a season-variant "
+        "name (foo.summer.tex vs foo.tex) and create the expected name"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: EnumProperty(
+        name="Action",
+        description="What to do with the season-variant file",
+        items=[
+            ('COPY', "Copy (keep original)",
+             "Copy the season-variant file to the expected name, keep the original"),
+            ('RENAME', "Rename (replace original)",
+             "Rename the season-variant file to the expected name (only if no other ref needs the original)"),
+        ],
+        default='COPY',
+    )
+    dry_run: BoolProperty(
+        name="Dry Run",
+        description="Only report what would change, do not modify files",
+        default=False,
+    )
+
+    def execute(self, context):
+        import shutil
+        checker = context.scene.project_checker
+        settings = context.scene.project_settings
+
+        project_root = bpy.path.abspath(settings.project_folder) if settings.project_folder else ""
+        if not project_root or not os.path.isdir(project_root):
+            self.report({'ERROR'}, "Project Folder is not set or invalid")
+            return {'CANCELLED'}
+
+        # Collect unique missing-texture refs from the current issue list
+        targets = []
+        seen = set()
+        for issue in checker.issues:
+            if issue.fix_id != 'MISSING_TEXTURE':
+                continue
+            expected = (issue.detail or '').replace('\\', '/').strip()
+            if not expected:
+                continue
+            key = expected.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(expected)
+
+        if not targets:
+            self.report({'WARNING'}, "No missing texture issues to scan")
+            return {'CANCELLED'}
+
+        fixed = 0
+        no_variant = 0
+        already = 0
+        failed = 0
+
+        lines = ["Texture name-variant fix report",
+                 f"Project: {project_root}",
+                 f"Action: {self.action}",
+                 f"Dry run: {self.dry_run}",
+                 f"Targets: {len(targets)}", ""]
+
+        for expected_rel in targets:
+            dst_abs = os.path.join(project_root, expected_rel.replace('/', os.sep))
+            if os.path.isfile(dst_abs):
+                already += 1
+                lines.append(f"[ALREADY] {expected_rel}")
+                continue
+
+            base_no_ext, _ext = os.path.splitext(expected_rel)
+            rel_dir, base_name = os.path.split(base_no_ext)
+            variant_rel = _find_season_variant(project_root, rel_dir, base_name)
+            if not variant_rel:
+                no_variant += 1
+                lines.append(f"[NO_VARIANT] {expected_rel}")
+                continue
+
+            src_abs = os.path.join(project_root, variant_rel.replace('/', os.sep))
+
+            # If src and dst extensions differ, we need conversion not a plain copy.
+            src_ext = os.path.splitext(src_abs)[1].lower()
+            dst_ext = os.path.splitext(dst_abs)[1].lower()
+            need_convert = (src_ext != dst_ext)
+
+            if self.dry_run:
+                tag = "WOULD_CONVERT" if need_convert else f"WOULD_{self.action}"
+                lines.append(f"[{tag}] {expected_rel}  <=  {variant_rel}")
+                fixed += 1
+                continue
+
+            try:
+                os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+                if need_convert:
+                    # Use the existing alias helper which handles TEX<->DDS.
+                    _create_texture_alias(project_root, variant_rel, expected_rel)
+                    lines.append(f"[CONVERTED] {expected_rel}  <=  {variant_rel}")
+                elif self.action == 'RENAME':
+                    os.rename(src_abs, dst_abs)
+                    lines.append(f"[RENAMED] {expected_rel}  <=  {variant_rel}")
+                else:  # COPY
+                    shutil.copy2(src_abs, dst_abs)
+                    lines.append(f"[COPIED] {expected_rel}  <=  {variant_rel}")
+                fixed += 1
+            except Exception as e:
+                failed += 1
+                lines.append(f"[FAIL] {expected_rel}  <=  {variant_rel}: {e}")
+
+        lines.append("")
+        lines.append("Summary")
+        lines.append(f"  Targets:    {len(targets)}")
+        lines.append(f"  Fixed:      {fixed}")
+        lines.append(f"  Already:    {already}")
+        lines.append(f"  No variant: {no_variant}")
+        lines.append(f"  Failed:     {failed}")
+
+        report_text = "\n".join(lines)
+        context.window_manager.clipboard = report_text
+        print("[Project Checker] " + report_text.replace("\n", "\n[Project Checker] "))
+
+        verb = "would fix" if self.dry_run else "fixed"
+        self.report({'INFO'},
+                    f"Name variants: {verb} {fixed}, already {already}, "
+                    f"no variant {no_variant}, failed {failed} (report copied)")
+        return {'FINISHED'}
+
+
+class PROJ_OT_fix_texture_extensions(Operator):
+    """Repair texture files whose extension does not match their actual format.
+
+    Two strategies (selectable):
+      - RENAME: just rename the file extension to match the magic bytes
+                (lossless, fast, recommended).
+      - CONVERT: re-encode the file in-place to match its current extension
+                 (use when the extension is the contract you must keep).
+    """
+    bl_idname = "project.fix_texture_extensions"
+    bl_label = "Fix TEX/DDS Extensions"
+    bl_description = (
+        "Find .tex files that are actually DDS (and .dds files that are "
+        "actually TEX) and repair the mismatch by renaming or re-encoding"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    strategy: EnumProperty(
+        name="Strategy",
+        description="How to fix mismatched texture files",
+        items=[
+            ('RENAME', "Rename to Match Content",
+             "Rename the file extension so it matches the real bytes (lossless, recommended)"),
+            ('CONVERT', "Convert to Match Extension",
+             "Re-encode the file in place so its bytes match the current extension"),
+        ],
+        default='RENAME',
+    )
+    dry_run: BoolProperty(
+        name="Dry Run",
+        description="Only report what would change, do not modify files",
+        default=False,
+    )
+
+    def execute(self, context):
+        settings = context.scene.project_settings
+        project_root = bpy.path.abspath(settings.project_folder) if settings.project_folder else ""
+        if not project_root or not os.path.isdir(project_root):
+            self.report({'ERROR'}, "Project Folder is not set or invalid")
+            return {'CANCELLED'}
+
+        from . import texture_utils
+
+        scanned = 0
+        already_ok = 0
+        repaired = 0
+        failed = 0
+        skipped = 0
+
+        lines = ["TEX/DDS extension repair report",
+                 f"Project: {project_root}",
+                 f"Strategy: {self.strategy}",
+                 f"Dry run: {self.dry_run}", ""]
+
+        def _unique_dst(path: str) -> str:
+            """Return path or path with numeric suffix if it already exists."""
+            if not os.path.exists(path):
+                return path
+            base, ext = os.path.splitext(path)
+            i = 1
+            while True:
+                cand = f"{base}__{i}{ext}"
+                if not os.path.exists(cand):
+                    return cand
+                i += 1
+
+        for root, _dirs, files in os.walk(project_root):
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in ('.tex', '.dds'):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    with open(full, 'rb') as fh:
+                        head = fh.read(8)
+                except Exception as e:
+                    failed += 1
+                    lines.append(f"[READ_FAIL] {full}: {e}")
+                    continue
+                scanned += 1
+
+                if ext == '.tex' and head[:4] == b'TEX\0':
+                    already_ok += 1
+                    continue
+                if ext == '.dds' and head[:4] == b'DDS ':
+                    already_ok += 1
+                    continue
+
+                rel = os.path.relpath(full, project_root)
+
+                # Determine actual format
+                if head[:4] == b'TEX\0':
+                    actual = '.tex'
+                elif head[:4] == b'DDS ':
+                    actual = '.dds'
+                else:
+                    skipped += 1
+                    lines.append(f"[UNKNOWN_FORMAT] {rel} (head={head[:4]!r})")
+                    continue
+
+                if self.strategy == 'RENAME':
+                    new_full = _unique_dst(os.path.splitext(full)[0] + actual)
+                    new_rel = os.path.relpath(new_full, project_root)
+                    if self.dry_run:
+                        lines.append(f"[WOULD_RENAME {ext}->{actual}] {rel}  ->  {new_rel}")
+                        repaired += 1
+                        continue
+                    try:
+                        os.rename(full, new_full)
+                        repaired += 1
+                        lines.append(f"[RENAMED {ext}->{actual}] {rel}  ->  {new_rel}")
+                    except Exception as e:
+                        failed += 1
+                        lines.append(f"[FAIL_RENAME {ext}->{actual}] {rel}: {e}")
+                    continue
+
+                # CONVERT: re-encode bytes in place to match current extension
+                if actual == '.tex' and ext == '.dds':
+                    if self.dry_run:
+                        lines.append(f"[WOULD_CONVERT TEX->DDS] {rel}")
+                        repaired += 1
+                        continue
+                    try:
+                        with open(full, 'rb') as fh:
+                            tex_data = fh.read()
+                        dds_data = texture_utils.TexConverter._tex_to_dds(tex_data)
+                        with open(full, 'wb') as fh:
+                            fh.write(dds_data)
+                        repaired += 1
+                        lines.append(f"[CONVERTED TEX->DDS] {rel}")
+                    except Exception as e:
+                        failed += 1
+                        lines.append(f"[FAIL TEX->DDS] {rel}: {e}")
+                elif actual == '.dds' and ext == '.tex':
+                    if self.dry_run:
+                        lines.append(f"[WOULD_CONVERT DDS->TEX] {rel}")
+                        repaired += 1
+                        continue
+                    try:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(
+                                suffix='.dds', delete=False) as tmp:
+                            with open(full, 'rb') as src:
+                                tmp.write(src.read())
+                            tmp_path = tmp.name
+                        try:
+                            texture_utils.convert_dds_to_tex_file(tmp_path, full)
+                        finally:
+                            try:
+                                os.unlink(tmp_path)
+                            except Exception:
+                                pass
+                        repaired += 1
+                        lines.append(f"[CONVERTED DDS->TEX] {rel}")
+                    except Exception as e:
+                        failed += 1
+                        lines.append(f"[FAIL DDS->TEX] {rel}: {e}")
+
+        lines.append("")
+        lines.append("Summary")
+        lines.append(f"  Scanned:    {scanned}")
+        lines.append(f"  Already OK: {already_ok}")
+        lines.append(f"  Repaired:   {repaired}")
+        lines.append(f"  Failed:     {failed}")
+        lines.append(f"  Skipped:    {skipped}")
+
+        report_text = "\n".join(lines)
+        context.window_manager.clipboard = report_text
+        print("[Project Checker] " + report_text.replace("\n", "\n[Project Checker] "))
+
+        verb = "would repair" if self.dry_run else "repaired"
+        self.report({'INFO'},
+                    f"TEX/DDS {self.strategy.lower()}: {verb} {repaired}, ok {already_ok}, "
+                    f"failed {failed}, skipped {skipped} (report copied)")
+        return {'FINISHED'}
+
+
+class PROJ_OT_fix_all_missing_textures(Operator):
+    """Batch AI fix for all missing texture issues in the current checker list."""
+    bl_idname = "project.fix_all_missing_textures"
+    bl_label = "AI Fix All Missing Textures"
+    bl_description = (
+        "Try to auto-resolve every missing texture by matching the nearest existing "
+        "project texture path and creating aliases"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    rerun_check: BoolProperty(
+        name="Re-run Integrity Check",
+        description="Automatically run integrity check after batch AI fix",
+        default=True,
+    )
+
+    def execute(self, context):
+        checker = context.scene.project_checker
+        settings = context.scene.project_settings
+
+        project_root = bpy.path.abspath(settings.project_folder) if settings.project_folder else ""
+        if not project_root or not os.path.isdir(project_root):
+            self.report({'ERROR'}, "Project Folder is not set or invalid")
+            return {'CANCELLED'}
+
+        min_conf = float(getattr(checker, 'ai_fix_min_confidence', 0.58) or 0.58)
+
+        targets = []
+        seen = set()
+        for issue in checker.issues:
+            if issue.fix_id != 'MISSING_TEXTURE':
+                continue
+            expected = (issue.detail or '').replace('\\', '/').strip()
+            if not expected:
+                continue
+            key = expected.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(expected)
+
+        if not targets:
+            self.report({'WARNING'}, "No missing texture issues to fix")
+            return {'CANCELLED'}
+
+        # Optional: ask ChatGPT for suggested mappings up-front
+        gpt_map = {}
+        gpt_used = False
+        gpt_error = ""
+        if getattr(checker, 'use_chatgpt_api', False) and (checker.chatgpt_api_key or "").strip():
+            try:
+                candidates = list(_iter_project_texture_files(project_root))
+                gpt_map = _chatgpt_match_textures(
+                    targets, candidates,
+                    api_key=checker.chatgpt_api_key.strip(),
+                    model=(checker.chatgpt_model or "gpt-4o-mini").strip(),
+                )
+                gpt_used = True
+            except Exception as e:
+                gpt_error = str(e)
+                print(f"[Project Checker] ChatGPT fallback to local heuristic: {e}")
+
+        fixed = 0
+        already = 0
+        no_candidate = 0
+        low_conf = 0
+        failed = 0
+        gpt_hits = 0
+
+        lines = []
+        lines.append("AI Texture Batch Fix Report")
+        lines.append(f"Project: {project_root}")
+        lines.append(f"Min confidence: {min_conf:.2f}")
+        lines.append(f"Targets: {len(targets)}")
+        if gpt_used:
+            lines.append(f"ChatGPT model: {checker.chatgpt_model} (mappings: {len(gpt_map)})")
+        if gpt_error:
+            lines.append(f"ChatGPT error (using local heuristic): {gpt_error}")
+        lines.append("")
+
+        for expected in targets:
+            dst = os.path.join(project_root, expected.replace('/', os.sep))
+            if os.path.isfile(dst):
+                already += 1
+                lines.append(f"[ALREADY] {expected}")
+                continue
+
+            # Prefer ChatGPT suggestion when available
+            gpt_choice = gpt_map.get(expected.replace('\\', '/').strip().lower(), "")
+            if gpt_choice:
+                try:
+                    _dst, mode = _create_texture_alias(project_root, gpt_choice, expected)
+                    fixed += 1
+                    gpt_hits += 1
+                    lines.append(
+                        f"[FIXED gpt {mode}] {expected}  <=  {gpt_choice}"
+                    )
+                    continue
+                except Exception as e:
+                    lines.append(
+                        f"[GPT_FAIL] {expected}  <=  {gpt_choice}  ({e}) \u2014 trying local"
+                    )
+
+            best_rel, score = _best_texture_candidate(expected, project_root)
+            if not best_rel:
+                no_candidate += 1
+                lines.append(f"[NO_CANDIDATE] {expected}")
+                continue
+
+            if score < min_conf:
+                low_conf += 1
+                lines.append(
+                    f"[LOW_CONF {score:.2f}] {expected}  <=  {best_rel}"
+                )
+                continue
+
+            try:
+                _dst, mode = _create_texture_alias(project_root, best_rel, expected)
+                fixed += 1
+                lines.append(
+                    f"[FIXED {score:.2f} {mode}] {expected}  <=  {best_rel}"
+                )
+            except Exception as e:
+                failed += 1
+                lines.append(
+                    f"[FAILED {score:.2f}] {expected}  <=  {best_rel}  ({e})"
+                )
+
+        lines.append("")
+        lines.append("Summary")
+        lines.append(f"  Fixed: {fixed}  (ChatGPT-driven: {gpt_hits})")
+        lines.append(f"  Already present: {already}")
+        lines.append(f"  Low confidence: {low_conf}")
+        lines.append(f"  No candidate: {no_candidate}")
+        lines.append(f"  Failed: {failed}")
+
+        report_text = "\n".join(lines)
+        context.window_manager.clipboard = report_text
+        print("[Project Checker] " + report_text.replace("\n", "\n[Project Checker] "))
+
+        if self.rerun_check:
+            try:
+                bpy.ops.project.run_integrity_check()
+            except Exception as e:
+                self.report({'WARNING'}, f"Batch done, but re-check failed: {e}")
+
+        self.report(
+            {'INFO'},
+            f"AI batch done: fixed={fixed}, low_conf={low_conf}, no_candidate={no_candidate}, failed={failed} (report copied)")
         return {'FINISHED'}
 
 
@@ -1076,6 +2576,10 @@ class VIEW3D_PT_project_checker(Panel):
         if checker.last_run:
             layout.label(text=f"Last run: {checker.last_run}", icon='TIME')
 
+        mode_box = layout.box()
+        mode_box.label(text="Texture Validation Mode", icon='TEXTURE')
+        mode_box.prop(checker, "texture_project_mode", text="")
+
         # ── Summary ───────────────────────────────────────────────────────
         if checker.last_run:
             sum_row = layout.row(align=True)
@@ -1085,6 +2589,26 @@ class VIEW3D_PT_project_checker(Panel):
             err_col.label(text=f"{checker.error_count} Error(s)",   icon='ERROR')
             sum_row.label(text=f"{checker.warning_count} Warning(s)", icon='QUESTION')
             sum_row.label(text=f"{checker.info_count} Info",          icon='INFO')
+
+            ai_box = layout.box()
+            ai_box.label(text="AI Texture Repair", icon='FILE_REFRESH')
+            ai_box.prop(checker, "ai_fix_min_confidence")
+
+            gpt_box = ai_box.box()
+            gpt_box.prop(checker, "use_chatgpt_api", text="Use ChatGPT API (optional)")
+            sub = gpt_box.column(align=True)
+            sub.enabled = checker.use_chatgpt_api
+            sub.prop(checker, "chatgpt_api_key", text="API Key")
+            sub.prop(checker, "chatgpt_model", text="Model")
+
+            ai_box.operator("project.fix_all_missing_textures",
+                            text="AI Fix All Missing Textures", icon='CHECKMARK')
+
+            fmt_box = ai_box.row(align=True)
+            fmt_box.operator("project.fix_texture_name_variants",
+                             text="Fix Name Variants", icon='SORTALPHA')
+            fmt_box.operator("project.fix_texture_extensions",
+                             text="Fix TEX/DDS Extensions", icon='FILE_REFRESH')
 
             # ── Filter bar ────────────────────────────────────────────────
             layout.prop(checker, "filter_mode", expand=True)
@@ -1142,6 +2666,9 @@ class VIEW3D_PT_project_checker(Panel):
                     if item.fix_id == 'MISSING_MATERIAL':
                         row.operator("project.fix_issue",
                                      text="Fix", icon='CHECKMARK')
+                    elif item.fix_id == 'MISSING_TEXTURE':
+                        row.operator("project.fix_issue",
+                                     text="AI Fix", icon='FILE_REFRESH')
                     elif item.fix_id == 'MISSING_VISIBILITY':
                         row.operator("project.fix_visibility",
                                      text="Fix (Load .bin)", icon='FILEBROWSER')
@@ -1159,6 +2686,9 @@ classes = (
     PROJ_OT_open_issue_file,
     PROJ_OT_select_issue_meshes,
     PROJ_OT_fix_issue,
+    PROJ_OT_fix_all_missing_textures,
+    PROJ_OT_fix_texture_name_variants,
+    PROJ_OT_fix_texture_extensions,
     PROJ_OT_fix_visibility,
     PROJ_UL_check_issues,
     VIEW3D_PT_project_checker,

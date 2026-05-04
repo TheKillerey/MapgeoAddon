@@ -52,9 +52,11 @@ from . import (
     map11_editor,
     character_bin_updater,
     project_checker,
+    asset_finder,
     mapgeo_debug,
     map_objects_import,
     materials_bin_manager,
+    vfx_visualizer,
     utils,
 )
 
@@ -943,11 +945,23 @@ def register():
     except Exception as e:
         print(f"[Project Checker] Registration failed: {e}")
 
+    # Register asset finder / patch locator
+    try:
+        asset_finder.register()
+    except Exception as e:
+        print(f"[Asset Finder] Registration failed: {e}")
+
     # Register materials.bin manager
     try:
         materials_bin_manager.register()
     except Exception as e:
         print(f"[Materials.bin Manager] Registration failed: {e}")
+
+    # Register VFX visualizer
+    try:
+        vfx_visualizer.register()
+    except Exception as e:
+        print(f"[VFX Visualizer] Registration failed: {e}")
 
     # Register mapgeo debug tool
     try:
@@ -980,6 +994,18 @@ def unregister():
         project_checker.unregister()
     except Exception as e:
         print(f"[Project Checker] Unregister failed: {e}")
+
+    # Unregister asset finder
+    try:
+        asset_finder.unregister()
+    except Exception as e:
+        print(f"[Asset Finder] Unregister failed: {e}")
+
+    # Unregister VFX visualizer
+    try:
+        vfx_visualizer.unregister()
+    except Exception as e:
+        print(f"[VFX Visualizer] Unregister failed: {e}")
 
     # Unregister materials.bin manager
     try:
