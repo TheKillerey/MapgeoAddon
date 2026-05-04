@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.6] - 2026-05-04
+
+### Changes
+- Critical fix: Add-on no longer fails to enable with 'cannot import name map11_editor' / 'partially initialized module' error - five addon modules (map11_editor, asset_finder, materials_bin_manager, vfx_visualizer, prey_collections) were never committed to git, so previous release zips were missing them.
+- Project Checker: New ChatGPT-powered texture audit (background thread, batched, 429-aware) integrated into the integrity check.
+- Project Checker: Texture Project Mode (Mixed / Replaced Riot Textures / Fully Custom) now correctly scopes which references get audited.
+- Project Checker: New Fix Name Variants button resolves missing textures whose file exists under a Riot season-suffix name (foo.summer.tex vs foo.tex) via copy/rename, with TEX/DDS conversion when extensions differ.
+- Project Checker: New Fix TEX/DDS Extensions button with rename (lossless, default) or convert (re-encode) strategies for files whose extension does not match their actual format.
+- Project Checker: Stem-aware texture existence check (foo.tex satisfies foo.dds reference and vice versa).
+- Release tooling: release_addon.py now refuses to publish if any module imported by __init__.py is untracked in git, preventing the regression that caused this release.
+
 ## [0.4.5] - 2026-05-01
 
 ### 🐛 Bug Fixes

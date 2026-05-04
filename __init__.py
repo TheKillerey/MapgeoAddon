@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 4, 5),
+    "version": (0, 4, 6),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
