@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.4.7] - 2026-05-10
+
+### Changes
+- LUT recolor pipeline: fix ZIP addon structure (prefix MapgeoAddon/ for correct Blender install)
+- LUT recolor pipeline: switch from allowlist to denylist so characters/particles/icons/grasstint are recolored by default
+- LUT recolor pipeline: remove single-letter SKIP_TOKENS (h/r/m/s/n) that caused false positives on grid-letter filenames like Periph_H
+- LUT recolor pipeline: remove should_skip_by_name from recolor_file, denylist is now sole filter
+- LUT recolor pipeline: CamelCase tokenizer so NormalTexture/SpecularTexture sampler names split correctly
+- WAD tool: download all 9 CommunityDragon hash shards (.0-.8) instead of just 2, load_wad_hashes globs dynamically
+- Project manager: stale WAD cache detection triggers re-extraction when hashes are now available
+- Project manager: new TEXTURES project type with per-variant toggles (diffuse/normal/ORM/spec/emissive/other)
+- Project manager: LUT texture index builder uses exclude-bad sampler classification instead of require-good
+- Release tooling: git archive --prefix=MapgeoAddon/ so installed ZIP has correct top-level folder
+
 ## [0.4.6] - 2026-05-04
 
 ### Changes
