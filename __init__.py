@@ -49,6 +49,7 @@ from . import (
     project_manager,
     map_porter,
     map_patcher,
+    map_auto_updater,
     map11_editor,
     character_bin_updater,
     project_checker,
@@ -927,6 +928,12 @@ def register():
     except Exception as e:
         print(f"[Map Patcher] Registration failed: {e}")
 
+    # Register map auto updater
+    try:
+        map_auto_updater.register()
+    except Exception as e:
+        print(f"[Map Auto Updater] Registration failed: {e}")
+
     # Register map11 editor
     try:
         map11_editor.register()
@@ -1018,6 +1025,12 @@ def unregister():
         mapgeo_debug.unregister()
     except Exception as e:
         print(f"[Mapgeo Debug] Unregister failed: {e}")
+
+    # Unregister map auto updater
+    try:
+        map_auto_updater.unregister()
+    except Exception as e:
+        print(f"[Map Auto Updater] Unregister failed: {e}")
 
     # Unregister map patcher
     try:

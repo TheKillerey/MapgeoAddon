@@ -223,12 +223,17 @@ _hashlist_hashes: dict[int, str] = {}     # From user hashlist files
 _wad_hash_status: str = ""
 _wad_hash_count: int = 0
 
-# CommunityDragon WAD hash file URL
+# CommunityDragon WAD hash file URL (legacy single-file fallback, no longer published)
 _WAD_HASH_URL = "https://raw.githubusercontent.com/CommunityDragon/Data/master/hashes/lol/hashes.game.txt"
-# Split files
+# Split files. CommunityDragon currently publishes hashes.game.txt.0 .. hashes.game.txt.8
+# (more files may be added in the future). We probe each in turn and download every file
+# that exists on the server. Without ALL of them, large swaths of paths (especially
+# assets/maps/...) cannot be resolved and entries fall back to raw/<hex>.<ext>.
+_WAD_HASH_BASE_URL = "https://raw.githubusercontent.com/CommunityDragon/Data/master/hashes/lol"
+_WAD_HASH_MAX_INDEX = 32  # safety upper bound; probing stops on first 404
 _WAD_HASH_URLS = [
-    ("hashes.game.txt.0", "https://raw.githubusercontent.com/CommunityDragon/Data/master/hashes/lol/hashes.game.txt.0"),
-    ("hashes.game.txt.1", "https://raw.githubusercontent.com/CommunityDragon/Data/master/hashes/lol/hashes.game.txt.1"),
+    (f"hashes.game.txt.{i}", f"{_WAD_HASH_BASE_URL}/hashes.game.txt.{i}")
+    for i in range(_WAD_HASH_MAX_INDEX)
 ]
 
 
@@ -275,31 +280,41 @@ def load_wad_hashes() -> int:
     cache_dir = _get_wad_hash_cache_dir()
     total = 0
 
-    for filename, _ in _WAD_HASH_URLS:
-        fp = cache_dir / filename
-        if fp.exists():
-            parsed = _parse_wad_hash_file(fp)
-            _wad_hashes.update(parsed)
-            total += len(parsed)
-            print(f"[WAD Tool] Loaded {len(parsed)} hashes from {filename}")
+    # Load every hashes.game.txt.N that exists on disk (dynamic — server may add more).
+    for fp in sorted(cache_dir.glob("hashes.game.txt.*")):
+        parsed = _parse_wad_hash_file(fp)
+        _wad_hashes.update(parsed)
+        total += len(parsed)
+        print(f"[WAD Tool] Loaded {len(parsed)} hashes from {fp.name}")
+
+    # Legacy single-file (older deployments)
+    legacy = cache_dir / "hashes.game.txt"
+    if legacy.exists():
+        parsed = _parse_wad_hash_file(legacy)
+        _wad_hashes.update(parsed)
+        total += len(parsed)
+        print(f"[WAD Tool] Loaded {len(parsed)} hashes from {legacy.name}")
 
     _wad_hash_count = len(_wad_hashes)
     return total
 
 
 def download_wad_hashes(callback=None) -> int:
-    """Download CommunityDragon WAD hash files. Returns count downloaded."""
+    """Download CommunityDragon WAD hash files. Probes hashes.game.txt.0, .1, .2, ...
+    until a 404 is encountered. Returns number of files downloaded."""
     global _wad_hash_status
     cache_dir = _get_wad_hash_cache_dir()
     downloaded = 0
+    import urllib.request
+    import urllib.error
 
     for i, (filename, url) in enumerate(_WAD_HASH_URLS):
         _wad_hash_status = f"Downloading {filename}..."
         if callback:
-            callback(_wad_hash_status, i / len(_WAD_HASH_URLS))
+            # Progress is approximate — we don't know how many split files exist.
+            callback(_wad_hash_status, min(0.95, i / 10.0))
 
         try:
-            import urllib.request
             req = urllib.request.Request(url, headers={'User-Agent': 'BlenderMapgeoAddon/1.0'})
             with urllib.request.urlopen(req, timeout=120) as response:
                 data = response.read()
@@ -307,15 +322,23 @@ def download_wad_hashes(callback=None) -> int:
             with open(dest, 'wb') as f:
                 f.write(data)
             downloaded += 1
-            print(f"[WAD Tool] Downloaded {filename}")
+            print(f"[WAD Tool] Downloaded {filename} ({len(data)/1024/1024:.1f} MB)")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Reached end of split sequence.
+                print(f"[WAD Tool] No {filename} on server (HTTP 404) — stopping probe.")
+                break
+            print(f"[WAD Tool] Failed to download {filename}: HTTP {e.code}")
         except Exception as e:
             print(f"[WAD Tool] Failed to download {filename}: {e}")
 
-    _wad_hash_status = f"Downloaded {downloaded}/{len(_WAD_HASH_URLS)} files"
+    _wad_hash_status = f"Downloaded {downloaded} hash files"
     if callback:
         callback(_wad_hash_status, 1.0)
 
-    # Reload
+    # Reload cache from disk
+    # Clear in-memory dict so removed/renamed files don't stick around.
+    _wad_hashes.clear()
     load_wad_hashes()
     return downloaded
 

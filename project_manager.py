@@ -98,6 +98,214 @@ HASH_PARENT_NAME = 0xb696a5fe     # "parentName" (for childTechniques)
 HASH_STATIC_MATERIAL_DEF = 0xff9d3409
 
 
+# Texture classification helpers (project copy filters + LUT index generation)
+TEXTURE_EXTENSIONS = {
+    ".tex", ".dds", ".png", ".tga", ".jpg", ".jpeg", ".bmp", ".webp", ".ktx", ".ktx2"
+}
+_TEXTURE_TOKEN_RX = re.compile(r"[^a-z0-9]+")
+# Split CamelCase boundaries BEFORE lowercasing: NormalTexture → Normal_Texture → normal, texture
+_CAMEL_SPLIT_RX = re.compile(
+    r"(?<=[a-zA-Z])(?=[A-Z][a-z])|(?<=[a-z])(?=[A-Z])|"
+    r"(?<=[0-9])(?=[A-Za-z])|(?<=[A-Za-z])(?=[0-9])"
+)
+_TOK_DIFFUSE = {
+    "diffuse", "albedo", "basecolor", "base", "color", "colormap", "main", "maintex",
+    "maintexture", "particle", "atlas", "texture"
+}
+_TOK_NORMAL = {"n", "normal", "normals", "nrm", "normalmap", "bump"}
+_TOK_ORM = {
+    "orm", "rma", "mra", "rmas", "rough", "roughness", "metal", "metallic",
+    "metalness", "ao", "occlusion", "mask", "masks", "packed", "channel"
+}
+_TOK_SPEC = {"spec", "specular", "gloss", "glossiness"}
+_TOK_EMISSIVE = {"emit", "emissive", "emission", "glow", "illum"}
+
+# Tokens that unambiguously indicate a NON-color texture for LUT index purposes.
+# Used by _is_lut_color_sampler (exclude-bad strategy) so that textures whose
+# sampler name does not match any of these are included in the allowlist.
+# This is intentionally broader than _TOK_* which is used for copy filtering.
+_LUT_NON_COLOR_SAMPLER_TOKENS = {
+    # Normal / bump maps
+    "normal", "normals", "nrm", "normalmap", "nm", "bump", "bumpmap",
+    # Roughness / metallic / AO (packed or separate)
+    "orm", "rma", "mra", "rmas", "rmao", "rough", "roughness",
+    "metal", "metallic", "metalness", "metalrough",
+    "ao", "occlusion", "ambient",
+    # Specular / gloss
+    "spec", "specular", "gloss", "glossiness", "specgloss",
+    # Lightmap / shadow
+    "lightmap", "shadowmap", "lm",
+    # Height / displacement / parallax
+    "height", "heightmap", "displacement", "parallax",
+}
+
+
+def _tokenize_texture_text(*parts: str) -> set[str]:
+    tokens: set[str] = set()
+    for part in parts:
+        if not part:
+            continue
+        # Split CamelCase first (before lowercasing) so that e.g.
+        # 'NormalTexture' → 'Normal_Texture' → {'normal', 'texture'}
+        camel_split = _CAMEL_SPLIT_RX.sub("_", part)
+        low = camel_split.lower().replace("\\", "/")
+        for raw in _TEXTURE_TOKEN_RX.split(low):
+            if raw:
+                tokens.add(raw)
+    return tokens
+
+
+def _classify_texture_variant(texture_path: str, sampler_name: str = "") -> str:
+    """Classify a texture as diffuse/normal/orm/spec/emissive/other.
+    Used for project copy variant filtering (TEXTURES project type).
+    """
+    stem = os.path.splitext(os.path.basename(texture_path or ""))[0]
+    tokens = _tokenize_texture_text(stem, sampler_name)
+
+    if tokens & _TOK_NORMAL:
+        return "normal"
+    if tokens & _TOK_ORM:
+        return "orm"
+    if tokens & _TOK_SPEC:
+        return "spec"
+    if tokens & _TOK_EMISSIVE:
+        return "emissive"
+    if tokens & _TOK_DIFFUSE:
+        return "diffuse"
+    return "other"
+
+
+def _is_lut_color_sampler(texture_path: str, sampler_name: str = "") -> bool:
+    """Return True when the texture should be recolored by the LUT.
+
+    Uses an EXCLUDE-BAD strategy: include a texture unless its sampler name or
+    filename clearly indicate it is a non-color map (normal, ORM, specular,
+    lightmap, etc.). This way, textures with generic sampler names like
+    'Texture', 'SplatTexture', 'GroundTexture', 'ParticleTexture' (which do
+    not contain diffuse-indicating keywords) are still included.
+    """
+    stem = os.path.splitext(os.path.basename(texture_path or ""))[0]
+    tokens = _tokenize_texture_text(stem, sampler_name)
+    return not bool(tokens & _LUT_NON_COLOR_SAMPLER_TOKENS)
+
+
+def _normalize_lut_asset_path(path: str) -> str:
+    """Normalize relative asset path for LUT allowlist lookups."""
+    p = (path or "").strip().replace("\\", "/").lower()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _copy_filtered_textures(src_root: str, dst_root: str, allowed_variants: set[str]) -> int:
+    """Copy only texture files matching allowed variant classes. Returns copied count."""
+    copied = 0
+    if not os.path.isdir(src_root):
+        return copied
+
+    for root, _, files in os.walk(src_root):
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in TEXTURE_EXTENSIONS:
+                continue
+            src = os.path.join(root, fname)
+            variant = _classify_texture_variant(fname)
+            if variant not in allowed_variants:
+                continue
+            rel = os.path.relpath(src, src_root)
+            dst = os.path.join(dst_root, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            copied += 1
+    return copied
+
+
+def _build_lut_texture_index_from_bins(cache_dirs: list[str], out_json_path: str) -> dict:
+    """Build a LUT denylist from sampler data inside cached .bin files.
+
+    Scans every .bin in each cache_dir for StaticMaterialDef entries and
+    records which texture paths appear ONLY with non-color samplers
+    (normal, ORM, specular, lightmap …).  Those paths go into the denylist.
+
+    A texture that appears with at least one color sampler (Texture_Color,
+    DiffuseTexture, GroundTexture, ParticleTexture, …) is NOT blocked, even
+    if it also appears under a non-color sampler elsewhere.
+
+    Textures not referenced by any bin at all (characters, particles, icons,
+    grass tint …) are left out of the denylist and therefore get recolored.
+    """
+    from . import propertybin_parser
+
+    bins_scanned = 0
+    bins_failed = 0
+    material_entries = 0
+    # Track per-path classification across all bins.
+    color_paths: set[str] = set()      # seen with ≥1 color sampler
+    non_color_paths: set[str] = set()  # seen with ≥1 non-color sampler
+
+    for cache_dir in cache_dirs:
+        if not cache_dir or not os.path.isdir(cache_dir):
+            continue
+        for root, _, files in os.walk(cache_dir):
+            for fname in files:
+                if not fname.lower().endswith('.bin'):
+                    continue
+                bin_path = os.path.join(root, fname)
+                bins_scanned += 1
+                try:
+                    data = propertybin_parser.parse_bin(bin_path)
+                except Exception:
+                    bins_failed += 1
+                    continue
+
+                for entry in data.get('entries', []):
+                    mat = convert_bin_entry_to_material_dict(entry)
+                    if not mat:
+                        continue
+                    material_entries += 1
+                    for sampler in mat.get('samplerValues', []):
+                        tex_path = (sampler.get('texturePath') or '').strip()
+                        if not tex_path:
+                            continue
+                        ext = os.path.splitext(tex_path)[1].lower()
+                        if ext and ext not in TEXTURE_EXTENSIONS:
+                            continue
+
+                        sampler_name = (sampler.get('textureName') or
+                                        sampler.get('TextureName') or '')
+                        norm = _normalize_lut_asset_path(tex_path)
+                        if not norm:
+                            continue
+                        norm_noext = os.path.splitext(norm)[0]
+
+                        if _is_lut_color_sampler(tex_path, sampler_name):
+                            color_paths.add(norm)
+                            color_paths.add(norm_noext)
+                        else:
+                            non_color_paths.add(norm)
+                            non_color_paths.add(norm_noext)
+
+    # Only block paths that were NEVER seen with a color sampler.
+    denylist_paths = non_color_paths - color_paths
+
+    payload = {
+        'version': 2,
+        'cache_dirs': cache_dirs,
+        'bins_scanned': bins_scanned,
+        'bins_failed': bins_failed,
+        'material_entries': material_entries,
+        'color_count': len(color_paths) // 2,    # approx (with + without ext)
+        'denylist_count': len(denylist_paths),
+        'denylist_paths': sorted(denylist_paths),
+    }
+
+    os.makedirs(os.path.dirname(out_json_path), exist_ok=True)
+    with open(out_json_path, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh, indent=2)
+
+    return payload
+
+
 # ============================================================================
 # League Installation Detection
 # ============================================================================
@@ -509,6 +717,29 @@ def _ensure_riot_wad_cache(league_path: str, map_id: str) -> str:
         except Exception as e:
             print(f"[Project Manager] Failed to clean incomplete cache: {e}")
     
+    # Detect stale cache: built without WAD hashes (huge raw/ folder).
+    # If hashes are now available and raw/ contains lots of files, the cache
+    # is from a session where the CommunityDragon download had not happened
+    # and almost everything went to raw/<hex>.<ext>. Re-extracting now will
+    # resolve those into proper paths (assets/, data/, levels/, ...).
+    if os.path.isdir(cache_dir) and os.path.isfile(marker):
+        try:
+            from . import wad_tool
+            if not wad_tool._wad_hashes:
+                wad_tool.load_wad_hashes()
+            raw_dir = os.path.join(cache_dir, "raw")
+            if wad_tool._wad_hashes and os.path.isdir(raw_dir):
+                # Cheap count without full traversal
+                raw_count = sum(1 for _ in os.scandir(raw_dir))
+                if raw_count > 200:
+                    print(f"[Project Manager] WAD cache has {raw_count} unresolved raw/ files "
+                          f"but {len(wad_tool._wad_hashes)} hashes are now available; re-extracting.")
+                    try:
+                        _rmtree_long_path(cache_dir)
+                    except Exception as e:
+                        print(f"[Project Manager] Failed to clean stale cache: {e}")
+        except Exception as e:
+            print(f"[Project Manager] Stale-cache check failed: {e}")
     if not os.path.isdir(cache_dir):
         try:
             from . import wad_tool
@@ -608,6 +839,23 @@ def _ensure_riot_levels_wad_cache(league_path: str, map_id: str) -> str:
         except Exception as e:
             print(f"[Project Manager] Failed to clean incomplete LEVELS cache: {e}")
     
+    # Detect stale cache built without resolved hashes (large raw/ folder).
+    if os.path.isdir(cache_dir) and os.path.isfile(marker):
+        try:
+            from . import wad_tool
+            if not wad_tool._wad_hashes:
+                wad_tool.load_wad_hashes()
+            raw_dir = os.path.join(cache_dir, "raw")
+            if wad_tool._wad_hashes and os.path.isdir(raw_dir):
+                raw_count = sum(1 for _ in os.scandir(raw_dir))
+                if raw_count > 200:
+                    print(f"[Project Manager] LEVELS cache has {raw_count} unresolved raw/ files; re-extracting.")
+                    try:
+                        _rmtree_long_path(cache_dir)
+                    except Exception as e:
+                        print(f"[Project Manager] Failed to clean stale LEVELS cache: {e}")
+        except Exception as e:
+            print(f"[Project Manager] Stale LEVELS-cache check failed: {e}")
     if not os.path.isdir(cache_dir):
         try:
             from . import wad_tool
@@ -1540,6 +1788,39 @@ class ProjectSettings(PropertyGroup):
             ('CUSTOM', "Custom", "Use custom-created bucket grids from the scene"),
         ],
         default='ORIGINAL',
+    )
+
+    # ── LUT Color Grading ──
+    lut_path: StringProperty(
+        name="LUT (.cube)",
+        description="Path to a .cube 3D LUT file used to recolor all color textures in the project",
+        subtype='FILE_PATH',
+        default="",
+    )
+    lut_status: StringProperty(
+        name="LUT Status",
+        default="",
+    )
+    lut_skip_grayscale: BoolProperty(
+        name="Skip Grayscale Textures",
+        description="Skip textures that are already (near-)grayscale (masks, AO baked to grayscale, etc.)",
+        default=True,
+    )
+    lut_dry_run: BoolProperty(
+        name="Dry Run",
+        description="Only count files that would be recolored; do not modify anything",
+        default=False,
+    )
+    lut_use_texture_index: BoolProperty(
+        name="Use LUT Texture Index",
+        description="Only recolor textures listed in the generated LUT texture index (bin sampler-based)",
+        default=True,
+    )
+    lut_texture_index_path: StringProperty(
+        name="LUT Texture Index",
+        description="Path to LUT texture index JSON generated from cached bin sampler data",
+        subtype='FILE_PATH',
+        default="",
     )
 
 
@@ -3791,6 +4072,327 @@ def _prey_files_exist(materials_path: str) -> bool:
     return os.path.isfile(manifest)
 
 
+# ============================================================================
+# LUT Color Grading Operators
+# ============================================================================
+
+def _load_lut_denylist(index_path: str) -> set[str]:
+    """Load the denylist from a texture index JSON (v2+).  Returns empty set
+    for missing/invalid files — empty denylist means recolor everything."""
+    with open(index_path, 'r', encoding='utf-8') as fh:
+        payload = json.load(fh)
+    # v1 files had an 'allowlist_paths' with opposite semantics — ignore them.
+    if payload.get('version', 1) < 2:
+        return set()
+    arr = payload.get('denylist_paths', [])
+    if not isinstance(arr, list):
+        return set()
+    return {_normalize_lut_asset_path(p) for p in arr if isinstance(p, str) and p.strip()}
+
+
+class PROJECT_OT_build_lut_texture_index(Operator):
+    """Build LUT texture allowlist from cached .bin sampler data."""
+    bl_idname = "project.build_lut_texture_index"
+    bl_label = "Build LUT Texture Index"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.project_settings
+        return bool(s.project_folder)
+
+    def execute(self, context):
+        s = context.scene.project_settings
+        project_folder = bpy.path.abspath(s.project_folder)
+        if not os.path.isdir(project_folder):
+            self.report({'ERROR'}, f"Project folder not found: {project_folder}")
+            return {'CANCELLED'}
+
+        map_id = (s.project_map_id or "").strip()
+        if not map_id:
+            m = re.search(r"(map\d+)", project_folder.replace('\\', '/'), flags=re.IGNORECASE)
+            map_id = m.group(1) if m else ""
+        if not map_id:
+            self.report({'ERROR'}, "Could not determine map id. Scan project first or use a MapXX project path.")
+            return {'CANCELLED'}
+
+        map_id_title = map_id[0].upper() + map_id[1:] if map_id else map_id
+        cache_root = _get_wad_cache_root()
+        cache_dirs = [
+            os.path.join(cache_root, map_id_title),
+            os.path.join(cache_root, f"{map_id_title}LEVELS"),
+        ]
+        cache_dirs = [d for d in cache_dirs if os.path.isdir(d)]
+        if not cache_dirs:
+            self.report({'ERROR'},
+                        f"No WAD cache folders found for {map_id_title}. Extract Riot WAD cache first.")
+            return {'CANCELLED'}
+
+        out_path = bpy.path.abspath(s.lut_texture_index_path) if s.lut_texture_index_path else ""
+        if not out_path:
+            out_path = os.path.join(project_folder, "_lut_texture_index.json")
+
+        try:
+            stats = _build_lut_texture_index_from_bins(cache_dirs, out_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to build LUT texture index: {exc}")
+            return {'CANCELLED'}
+
+        s.lut_texture_index_path = out_path
+        msg = (f"LUT index built: {stats['denylist_count']} denied paths "
+               f"({stats['color_count']} color) "
+               f"from {stats['bins_scanned']} bins ({stats['bins_failed']} parse failures)")
+        s.lut_status = msg
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class PROJECT_OT_apply_lut(Operator):
+    """Recolor every color/diffuse texture in the project folder using a .cube 3D LUT.
+
+    Skips normal/mask/roughness/AO/height/emissive maps by filename, and any
+    image that is already (near-)grayscale. Originals are backed up to a
+    `_lut_backup/` mirror folder beside the project root.
+    """
+    bl_idname = "project.apply_lut"
+    bl_label = "Apply LUT to Project"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.project_settings
+        return bool(s.project_folder) and bool(s.lut_path)
+
+    def execute(self, context):
+        try:
+            from . import lut_recolor
+        except ImportError:
+            import lut_recolor  # type: ignore
+
+        s = context.scene.project_settings
+        folder = bpy.path.abspath(s.project_folder)
+        lut_path = bpy.path.abspath(s.lut_path)
+
+        if not os.path.isdir(folder):
+            self.report({'ERROR'}, f"Project folder not found: {folder}")
+            return {'CANCELLED'}
+        if not os.path.isfile(lut_path):
+            self.report({'ERROR'}, f"LUT file not found: {lut_path}")
+            return {'CANCELLED'}
+        if not lut_path.lower().endswith('.cube'):
+            self.report({'ERROR'}, "LUT file must be a .cube 3D LUT")
+            return {'CANCELLED'}
+
+        denylist_paths = None
+        if s.lut_use_texture_index:
+            idx = bpy.path.abspath(s.lut_texture_index_path) if s.lut_texture_index_path else ""
+            if not idx:
+                idx = os.path.join(folder, "_lut_texture_index.json")
+            if not os.path.isfile(idx):
+                self.report({'ERROR'},
+                            f"LUT texture index not found: {idx}. Build it first in Color Grading panel.")
+                return {'CANCELLED'}
+            try:
+                denylist_paths = _load_lut_denylist(idx)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Failed to read LUT texture index: {exc}")
+                return {'CANCELLED'}
+            # Empty denylist is valid — means recolor everything (no blocks).
+
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        last_pct = -1
+
+        def progress_cb(i, total, path):
+            nonlocal last_pct
+            if total <= 0: return
+            pct = int(i * 100 / total)
+            if pct != last_pct:
+                wm.progress_update(pct)
+                last_pct = pct
+
+        try:
+            stats = lut_recolor.recolor_folder(
+                folder, lut_path,
+                dry_run=s.lut_dry_run,
+                progress_cb=progress_cb,
+                denylist_paths=denylist_paths,
+            )
+        except Exception as exc:
+            wm.progress_end()
+            self.report({'ERROR'}, f"LUT apply failed: {exc}")
+            s.lut_status = f"Error: {exc}"
+            return {'CANCELLED'}
+        wm.progress_end()
+
+        mode = "DRY-RUN " if s.lut_dry_run else ""
+        msg = (f"{mode}Recolored {stats['recolored']}/{stats['total']} "
+               f"(skipped {stats.get('skip-index', 0)} by denylist, "
+               f"{stats['skip-grayscale']} grayscale, "
+               f"{stats['errors']} errors)")
+        s.lut_status = msg
+        self.report({'INFO'}, msg)
+
+        if stats.get('details'):
+            print("[LUT] Errors:")
+            for d in stats['details'][:50]:
+                print(f"    {d}")
+        return {'FINISHED'}
+
+
+class PROJECT_OT_restore_lut_backup(Operator):
+    """Restore textures from `_lut_backup/` (undoes a previous Apply LUT)"""
+    bl_idname = "project.restore_lut_backup"
+    bl_label = "Restore Originals"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.project_settings
+        if not s.project_folder:
+            return False
+        backup = os.path.join(bpy.path.abspath(s.project_folder), "_lut_backup")
+        return os.path.isdir(backup)
+
+    def execute(self, context):
+        s = context.scene.project_settings
+        folder = bpy.path.abspath(s.project_folder)
+        backup = os.path.join(folder, "_lut_backup")
+        if not os.path.isdir(backup):
+            self.report({'ERROR'}, "No _lut_backup folder found")
+            return {'CANCELLED'}
+
+        restored = 0
+        for r, _, files in os.walk(backup):
+            for f in files:
+                src = os.path.join(r, f)
+                rel = os.path.relpath(src, backup)
+                dst = os.path.join(folder, rel)
+                if os.path.isfile(dst):
+                    try:
+                        shutil.copy2(src, dst)
+                        restored += 1
+                    except OSError as exc:
+                        print(f"[LUT restore] failed for {dst}: {exc}")
+        s.lut_status = f"Restored {restored} originals from _lut_backup"
+        self.report({'INFO'}, s.lut_status)
+        return {'FINISHED'}
+
+
+class PROJECT_OT_clear_lut_backup(Operator):
+    """Delete the `_lut_backup/` folder (cannot undo Apply LUT after this)"""
+    bl_idname = "project.clear_lut_backup"
+    bl_label = "Clear Backup"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.project_settings
+        if not s.project_folder:
+            return False
+        backup = os.path.join(bpy.path.abspath(s.project_folder), "_lut_backup")
+        return os.path.isdir(backup)
+
+    def execute(self, context):
+        s = context.scene.project_settings
+        backup = os.path.join(bpy.path.abspath(s.project_folder), "_lut_backup")
+        try:
+            shutil.rmtree(backup)
+        except OSError as exc:
+            self.report({'ERROR'}, f"Failed to delete backup: {exc}")
+            return {'CANCELLED'}
+        s.lut_status = "Backup folder deleted"
+        self.report({'INFO'}, s.lut_status)
+        return {'FINISHED'}
+
+
+class PROJECT_OT_apply_lut_to_root(Operator):
+    """Recolor every project under the parent folder of the current Project Folder.
+
+    Useful when you have a multi-variant mod with sibling project folders
+    (e.g. day/night/winter versions) sharing one .cube LUT.
+    """
+    bl_idname = "project.apply_lut_to_root"
+    bl_label = "Apply LUT to All Sibling Projects"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.project_settings
+        return bool(s.project_folder) and bool(s.lut_path)
+
+    def execute(self, context):
+        try:
+            from . import lut_recolor
+        except ImportError:
+            import lut_recolor  # type: ignore
+
+        s = context.scene.project_settings
+        folder = bpy.path.abspath(s.project_folder)
+        lut_path = bpy.path.abspath(s.lut_path)
+        parent = os.path.dirname(os.path.normpath(folder))
+        if not os.path.isdir(parent):
+            self.report({'ERROR'}, f"Parent folder not found: {parent}")
+            return {'CANCELLED'}
+
+        siblings = [os.path.join(parent, d) for d in os.listdir(parent)
+                    if os.path.isdir(os.path.join(parent, d))]
+        if not siblings:
+            self.report({'WARNING'}, "No sibling project folders found")
+            return {'CANCELLED'}
+
+        wm = context.window_manager
+        wm.progress_begin(0, len(siblings))
+        totals = {"recolored": 0, "skip-index": 0, "skip-grayscale": 0, "errors": 0}
+        for i, sib in enumerate(siblings):
+            wm.progress_update(i)
+            print(f"[LUT] === Applying to {sib} ===")
+
+            denylist_paths = None
+            if s.lut_use_texture_index:
+                idx = bpy.path.abspath(s.lut_texture_index_path) if s.lut_texture_index_path else ""
+                if not idx:
+                    idx = os.path.join(sib, "_lut_texture_index.json")
+                if not os.path.isfile(idx):
+                    print(f"[LUT]   missing texture index: {idx}")
+                    totals["errors"] += 1
+                    continue
+                try:
+                    denylist_paths = _load_lut_denylist(idx)
+                except Exception as exc:
+                    print(f"[LUT]   invalid texture index {idx}: {exc}")
+                    totals["errors"] += 1
+                    continue
+                # Empty denylist is valid — recolor everything.
+
+            try:
+                st = lut_recolor.recolor_folder(
+                    sib,
+                    lut_path,
+                    dry_run=s.lut_dry_run,
+                    denylist_paths=denylist_paths,
+                )
+            except Exception as exc:
+                print(f"[LUT]   error: {exc}")
+                totals["errors"] += 1
+                continue
+            for k in totals:
+                totals[k] += st.get(k, 0)
+            print(f"[LUT]   recolored={st['recolored']} "
+                  f"skipped-deny={st.get('skip-index', 0)} "
+                  f"skipped-gray={st['skip-grayscale']} errors={st['errors']}")
+        wm.progress_end()
+
+        mode = "DRY-RUN " if s.lut_dry_run else ""
+        msg = (f"{mode}{len(siblings)} projects: recolored={totals['recolored']} "
+               f"skip-deny={totals['skip-index']} "
+               f"skip-gray={totals['skip-grayscale']} "
+               f"errors={totals['errors']}")
+        s.lut_status = msg
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class PROJECT_OT_convert_to_prey(Operator):
     """Convert .materials.bin to editable .prey.* JSON files"""
     bl_idname = "project.convert_to_prey"
@@ -4046,6 +4648,70 @@ class VIEW3D_PT_league_tools_legacy_materials(Panel):
         act = layout.row(align=True)
         act.scale_y = 1.2
         act.operator("project.update_legacy_materials", text="Update Legacy .bin", icon='FILE_REFRESH')
+
+
+class VIEW3D_PT_color_grading(Panel):
+    """Color-grade all color/diffuse textures in the project using a .cube LUT."""
+    bl_label = "Color Grading (LUT)"
+    bl_idname = "VIEW3D_PT_color_grading"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_parent_id = "VIEW3D_PT_project_manager"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = getattr(context.scene, "project_settings", None)
+        if s is None:
+            layout.label(text="Project settings not available", icon='ERROR')
+            return
+
+        box = layout.box()
+        box.label(text=".cube LUT", icon='COLOR')
+        row = box.row(align=True)
+        row.prop(s, "lut_path", text="")
+
+        # Status / info
+        if s.lut_path:
+            lp = bpy.path.abspath(s.lut_path)
+            if os.path.isfile(lp):
+                box.label(text=os.path.basename(lp), icon='CHECKMARK')
+            else:
+                box.label(text="LUT file not found", icon='ERROR')
+
+        if not s.project_folder:
+            layout.label(text="Set Project Folder above first", icon='INFO')
+            return
+
+        box = layout.box()
+        box.label(text="Options", icon='SETTINGS')
+        box.prop(s, "lut_dry_run")
+        box.prop(s, "lut_use_texture_index")
+        idx_row = box.row(align=True)
+        idx_row.prop(s, "lut_texture_index_path", text="Index JSON")
+        box.operator("project.build_lut_texture_index", icon='FILE_CACHE')
+
+        # Apply buttons
+        col = layout.column(align=True)
+        col.scale_y = 1.2
+        col.operator("project.apply_lut",
+                     text="Apply LUT to This Project",
+                     icon='IMAGE_DATA')
+        col.operator("project.apply_lut_to_root",
+                     text="Apply to All Sibling Projects",
+                     icon='OUTLINER')
+
+        # Backup management
+        backup = os.path.join(bpy.path.abspath(s.project_folder), "_lut_backup")
+        if os.path.isdir(backup):
+            row = layout.row(align=True)
+            row.operator("project.restore_lut_backup", icon='LOOP_BACK')
+            row.operator("project.clear_lut_backup", icon='TRASH')
+
+        if s.lut_status:
+            box = layout.box()
+            box.label(text=s.lut_status, icon='INFO')
 
 
 class PROJECT_OT_save_all_to_prey(Operator):
@@ -4331,9 +4997,19 @@ class PROJECT_OT_create_project(Operator):
             ('FULLY', "Full",
              "Complete project with all files: mapgeo, materials.bin, "
              "assets (textures), data and levels folders"),
+            ('TEXTURES', "Textures Only",
+             "Copy mapgeo + materials.bin and only texture files from assets/ "
+             "with selectable variant filters (diffuse/normal/ORM/spec/emissive/other)."),
         ],
         default='EMPTY',
     )
+
+    copy_tex_diffuse: BoolProperty(name="Diffuse / Color", default=True)
+    copy_tex_normal: BoolProperty(name="Normal Maps", default=False)
+    copy_tex_orm: BoolProperty(name="Roughness/Metal/AO (Packed)", default=False)
+    copy_tex_spec: BoolProperty(name="Spec / Gloss", default=False)
+    copy_tex_emissive: BoolProperty(name="Emissive", default=False)
+    copy_tex_other: BoolProperty(name="Other / Unknown", default=False)
 
     source_map: EnumProperty(
         name="Source Map",
@@ -4383,9 +5059,22 @@ class PROJECT_OT_create_project(Operator):
         elif self.project_type == 'SEMI':
             desc_box.label(text="Copies mapgeo + materials.bin from source.", icon='INFO')
             desc_box.label(text="No asset textures or level data copied.")
+        elif self.project_type == 'TEXTURES':
+            desc_box.label(text="Copies mapgeo + materials.bin + filtered textures.", icon='INFO')
+            desc_box.label(text="No data/levels tree copy. Choose variants below.")
         else:
             desc_box.label(text="Full copy: mapgeo, materials, assets,", icon='INFO')
             desc_box.label(text="data and levels folders from source WAD.")
+
+        if self.project_type == 'TEXTURES':
+            tbox = layout.box()
+            tbox.label(text="Texture Variants", icon='TEXTURE')
+            tbox.prop(self, "copy_tex_diffuse")
+            tbox.prop(self, "copy_tex_normal")
+            tbox.prop(self, "copy_tex_orm")
+            tbox.prop(self, "copy_tex_spec")
+            tbox.prop(self, "copy_tex_emissive")
+            tbox.prop(self, "copy_tex_other")
 
         layout.separator()
         layout.prop(self, "source_map")
@@ -4542,6 +5231,44 @@ class PROJECT_OT_create_project(Operator):
                 if os.path.isdir(src_levels_assets):
                     shutil.copytree(src_levels_assets, dst_assets, dirs_exist_ok=True)
                     created_files.append("levels assets/")
+
+        # ────────────────────── TEXTURES ──────────────────────
+        elif self.project_type == 'TEXTURES':
+            if src_mapgeo and os.path.isfile(src_mapgeo):
+                shutil.copy2(src_mapgeo, dst_mapgeo)
+                created_files.append("mapgeo")
+            if src_materials and os.path.isfile(src_materials):
+                shutil.copy2(src_materials, dst_materials)
+                created_files.append("materials.bin")
+
+            allowed_variants = set()
+            if self.copy_tex_diffuse:
+                allowed_variants.add("diffuse")
+            if self.copy_tex_normal:
+                allowed_variants.add("normal")
+            if self.copy_tex_orm:
+                allowed_variants.add("orm")
+            if self.copy_tex_spec:
+                allowed_variants.add("spec")
+            if self.copy_tex_emissive:
+                allowed_variants.add("emissive")
+            if self.copy_tex_other:
+                allowed_variants.add("other")
+
+            if not allowed_variants:
+                self.report({'ERROR'}, "Textures-only project: enable at least one texture variant")
+                return {'CANCELLED'}
+
+            dst_assets = os.path.join(map_root, "assets")
+            src_assets = os.path.join(cache_dir, "assets")
+            copied = _copy_filtered_textures(src_assets, dst_assets, allowed_variants)
+
+            levels_cache = _ensure_riot_levels_wad_cache(league_path, map_id)
+            if levels_cache and os.path.isdir(levels_cache):
+                src_levels_assets = os.path.join(levels_cache, "assets")
+                copied += _copy_filtered_textures(src_levels_assets, dst_assets, allowed_variants)
+
+            created_files.append(f"textures:{copied}")
 
         # ── Point project manager at new project ──
         settings.project_folder = project_dir
@@ -5213,6 +5940,11 @@ classes = (
     PROJECT_OT_export_all,
     PROJECT_OT_extract_riot_wad,
     PROJECT_OT_clean_wad_cache,
+    PROJECT_OT_build_lut_texture_index,
+    PROJECT_OT_apply_lut,
+    PROJECT_OT_apply_lut_to_root,
+    PROJECT_OT_restore_lut_backup,
+    PROJECT_OT_clear_lut_backup,
     PROJECT_OT_convert_to_prey,
     PROJECT_OT_rebuild_from_prey,
     PROJECT_OT_open_prey_folder,
@@ -5229,6 +5961,7 @@ classes = (
     PROJECT_OT_duplicate_prey_entry,
     PROJECT_UL_variant_list,
     VIEW3D_PT_project_manager,
+    VIEW3D_PT_color_grading,
     VIEW3D_PT_prey_categories,
     VIEW3D_PT_league_tools_legacy_materials,
 )

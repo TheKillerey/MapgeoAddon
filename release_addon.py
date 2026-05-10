@@ -143,9 +143,22 @@ def ensure_init_imports_tracked() -> None:
 
 
 def build_release_zip(tag: str) -> pathlib.Path:
+    """Build a Blender-installable ZIP.
+
+    Blender requires the ZIP to contain a single top-level folder whose name
+    matches the addon (i.e. MapgeoAddon/__init__.py must be the entry point).
+    ``git archive`` alone produces a flat ZIP, so we use its ``--prefix``
+    option to wrap everything inside ``MapgeoAddon/``.
+    """
     RELEASES_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = RELEASES_DIR / f"MapgeoAddon-v{tag.lstrip('v')}.zip"
-    run(["git", "archive", "--format=zip", "--output", str(zip_path), tag])
+    run([
+        "git", "archive",
+        "--format=zip",
+        "--prefix=MapgeoAddon/",
+        "--output", str(zip_path),
+        tag,
+    ])
     return zip_path
 
 
