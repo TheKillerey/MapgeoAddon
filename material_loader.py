@@ -1418,6 +1418,22 @@ class MaterialLoader:
                                           lightmap_texture, lightmap_color_scale, has_baked_lighting)
         elif shader_name == '4TextureBlend_WorldProjected':
             self._build_4texture_blend(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name in ('ENV_SimpleFoliage', 'ENV_TreeCanopy', 'ENV_TreeCanopy_AlphaTest',
+                              'ENV_TreeCanopy_DoubleSided', 'ENV_TreeCanopy_Lod',
+                              'DefaultEnv_Flag_Wave', 'Cloth_Base_StaticMesh'):
+            self._build_foliage_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name == 'TFT_Skybox':
+            self._build_skybox_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name.startswith('SRX_Blend_') and shader_name != 'SRX_Blend_Ocean':
+            self._build_srx_blend_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name in ('DefaultEnv_Transition', 'TFT_Materialize_Static', 'TFT_Blink',
+                              'DefaultEnv_Dissolve'):
+            self._build_transition_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
+        elif shader_name in ('ENV_DarkstarBase', 'FlickerAlpha_FlipBook',
+                              'TFT_Glitch_Static', 'TFT_Scrolling_Delay',
+                              'TFT_ScreenSpace_Masked_WPO', 'TFT_FlowMap_Masked',
+                              'TFT_Env_Shine_Float_VertexColor'):
+            self._build_scrolling_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data)
         else:
             # Default path: all DefaultEnv_Flat variants and most other shaders
             self._build_default_shader(bl_mat, nodes, links, bsdf_node, output_node, mat_data,
@@ -2238,6 +2254,7 @@ class MaterialLoader:
                 tinted_color_output = grass_tint_mix.outputs[2]
         
         # Load lightmap texture if available
+        lightmap_connected = False
         lightmap_node = None
         if has_baked_lighting and lightmap_texture and self.assets_folder:
             lightmap_node = self._load_texture_node(bl_mat, nodes, links, lightmap_texture, "LightmapUV")
@@ -2273,6 +2290,7 @@ class MaterialLoader:
             # → Emission (baked lighting from lightmap)
             links.new(final_mix.outputs[2], bsdf_node.inputs['Emission Color'])
             bsdf_node.inputs['Emission Strength'].default_value = 1.0
+            lightmap_connected = True
             # Route diffuse to Base Color so material also responds to scene
             # lights (sun, sky, ambient). Without this, lightmapped materials
             # are pure self-lit and ignore all scene lighting.
@@ -2323,9 +2341,12 @@ class MaterialLoader:
 
         # SRX_DynamicEffect / DefaultEnv_Flat: when Emission_Tex is not assigned,
         # keep emission disabled instead of defaulting to 1.0.
+        # Exception: when a lightmap is driving Emission, leave it on — the
+        # baked lighting is the legitimate emission source for these shaders.
         force_zero_emission_without_tex = (
             shader_name in ('SRX_DynamicEffect', 'DefaultEnv_Flat') and
-            not has_primary_emission_tex
+            not has_primary_emission_tex and
+            not lightmap_connected
         )
 
         if force_zero_emission_without_tex:
@@ -2346,6 +2367,104 @@ class MaterialLoader:
                     elif not force_zero_emission_without_tex:
                         bsdf_node.inputs['Emission Strength'].default_value = 1.0
         
+        # SRX_DynamicEffect: additive FX emission, decoded from the game's
+        # DX11 pixel shader (srx_dynamiceffect.ps):
+        #   rgb += (Mask_Tex.G × FLOW_Color)² × fan_pulse(time)      [pit glow pulse]
+        #   rgb += Mask_Tex.R × Emission_Tex(rotating UV) × EMISSION_EmissionColor
+        # Static preview: pulse ≈ 0.5 average, no UV rotation.
+        if shader_name == 'SRX_DynamicEffect':
+            mask_path = self._get_sampler_path(mat_data, 'Mask_Tex')
+            emis_path = self._get_sampler_path(mat_data, 'Emission_Tex')
+            flow_color = self._get_param(mat_data, 'FLOW_Color')
+            emis_color = self._get_param(mat_data, 'EMISSION_EmissionColor')
+
+            def _fx_nonblack(col):
+                return (col and len(col) >= 3 and
+                        (col[0] > 0.01 or col[1] > 0.01 or col[2] > 0.01))
+
+            want_flow = _fx_nonblack(flow_color)
+            want_emis = (emis_path and not self._is_placeholder_texture_path(emis_path)
+                         and _fx_nonblack(emis_color))
+
+            flow_mask = None
+            if (want_flow or want_emis) and mask_path and not self._is_placeholder_texture_path(mask_path):
+                flow_mask = self._load_texture_node(bl_mat, nodes, links, mask_path, "UVMap")
+
+            if flow_mask:
+                # Mask_Tex is a packed channel map: G gates the FLOW pulse,
+                # R gates the animated emission texture.
+                flow_mask.location = (-900, -500)
+                flow_mask.label = "FX Mask (R=emission, G=flow)"
+                if flow_mask.image:
+                    flow_mask.image.colorspace_settings.name = 'Non-Color'
+                sep = nodes.new('ShaderNodeSeparateColor')
+                sep.location = (-700, -500)
+                links.new(flow_mask.outputs['Color'], sep.inputs['Color'])
+
+                emission_outputs = []
+
+                if want_flow:
+                    # (G × C)² × pulse  →  C² scaled by G² × 0.5 (pulse average)
+                    g_sq = nodes.new('ShaderNodeMath')
+                    g_sq.operation = 'POWER'
+                    g_sq.location = (-500, -450)
+                    g_sq.label = "FLOW G²"
+                    links.new(sep.outputs['Green'], g_sq.inputs[0])
+                    g_sq.inputs[1].default_value = 2.0
+                    g_half = nodes.new('ShaderNodeMath')
+                    g_half.operation = 'MULTIPLY'
+                    g_half.location = (-350, -450)
+                    g_half.label = "× pulse avg"
+                    links.new(g_sq.outputs[0], g_half.inputs[0])
+                    g_half.inputs[1].default_value = 0.5
+                    flow_scale = nodes.new('ShaderNodeVectorMath')
+                    flow_scale.operation = 'SCALE'
+                    flow_scale.location = (-200, -450)
+                    flow_scale.label = "FLOW_Color² × G² × pulse"
+                    flow_scale.inputs[0].default_value = (
+                        float(flow_color[0]) ** 2,
+                        float(flow_color[1]) ** 2,
+                        float(flow_color[2]) ** 2)
+                    links.new(g_half.outputs[0], flow_scale.inputs['Scale'])
+                    emission_outputs.append(flow_scale.outputs['Vector'])
+
+                if want_emis:
+                    emis_tex = self._load_texture_node(bl_mat, nodes, links, emis_path, "UVMap")
+                    if emis_tex:
+                        emis_tex.location = (-700, -750)
+                        emis_tex.label = "Emission_Tex (rotates in-game)"
+                        emis_mix = nodes.new('ShaderNodeMix')
+                        emis_mix.data_type = 'RGBA'
+                        emis_mix.blend_type = 'MULTIPLY'
+                        emis_mix.location = (-450, -750)
+                        emis_mix.inputs['Factor'].default_value = 1.0
+                        emis_mix.label = "× EMISSION_EmissionColor"
+                        links.new(emis_tex.outputs['Color'], emis_mix.inputs[6])
+                        emis_mix.inputs[7].default_value = (
+                            float(emis_color[0]), float(emis_color[1]),
+                            float(emis_color[2]), 1.0)
+                        emis_scale = nodes.new('ShaderNodeVectorMath')
+                        emis_scale.operation = 'SCALE'
+                        emis_scale.location = (-200, -750)
+                        emis_scale.label = "× Mask R"
+                        links.new(emis_mix.outputs[2], emis_scale.inputs[0])
+                        links.new(sep.outputs['Red'], emis_scale.inputs['Scale'])
+                        emission_outputs.append(emis_scale.outputs['Vector'])
+
+                if emission_outputs:
+                    if len(emission_outputs) == 2:
+                        add = nodes.new('ShaderNodeVectorMath')
+                        add.operation = 'ADD'
+                        add.location = (-50, -600)
+                        add.label = "FLOW + Emission"
+                        links.new(emission_outputs[0], add.inputs[0])
+                        links.new(emission_outputs[1], add.inputs[1])
+                        final_out = add.outputs['Vector']
+                    else:
+                        final_out = emission_outputs[0]
+                    links.new(final_out, bsdf_node.inputs['Emission Color'])
+                    bsdf_node.inputs['Emission Strength'].default_value = 1.0
+
         # Starting_Color / Color fallback for base color (when no texture)
         if not diffuse_path and not tint_color:
             starting_color = (self._get_param(mat_data, 'Starting_Color') or
@@ -2529,13 +2648,18 @@ class MaterialLoader:
     def _build_faelights_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
         """
         Indicator_Faelights: simple emissive indicator with tint color.
+
+        In-game this blends with DST_ALPHA against opaque terrain, so the
+        overlay is barely visible until the indicator FX triggers. Keep the
+        preview faint — these meshes cover whole jungle quadrants.
         """
         tint = self._get_param(mat_data, 'TintColor', [0, 1, 1, 0.1])
-        
+        tint_alpha = tint[3] if len(tint) > 3 else 0.1
+
         bsdf_node.inputs['Base Color'].default_value = (0.0, 0.0, 0.0, 1.0)
         bsdf_node.inputs['Emission Color'].default_value = (tint[0], tint[1], tint[2], 1.0)
-        bsdf_node.inputs['Emission Strength'].default_value = 2.0
-        bsdf_node.inputs['Alpha'].default_value = tint[3] if len(tint) > 3 else 0.1
+        bsdf_node.inputs['Emission Strength'].default_value = min(tint_alpha * 2.0, 1.0)
+        bsdf_node.inputs['Alpha'].default_value = tint_alpha
     
     def _build_baked_terrain(self, bl_mat, nodes, links, bsdf_node, output_node, 
                              mat_data, lightmap_texture, lightmap_color_scale, has_baked_lighting,
@@ -2832,7 +2956,297 @@ class MaterialLoader:
         # Connect final color to BSDF
         if current_color:
             links.new(current_color, bsdf_node.inputs['Base Color'])
-    
+
+    def _build_foliage_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        ENV_SimpleFoliage / ENV_TreeCanopy / DefaultEnv_Flag_Wave / Cloth_Base_StaticMesh
+        Double-sided, alpha clip, optional subsurface scatter.
+        """
+        bl_mat.use_backface_culling = False
+
+        diffuse_path = (self._get_sampler_path(mat_data, 'DiffuseTexture') or
+                        self._get_sampler_path(mat_data, 'Diffuse_Texture'))
+        if diffuse_path:
+            tex = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap")
+            if tex:
+                tex.location = (-500, 200)
+                links.new(tex.outputs['Color'], bsdf_node.inputs['Base Color'])
+                links.new(tex.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+
+        bsdf_node.inputs['Roughness'].default_value = 0.9
+        bsdf_node.inputs['Specular IOR Level'].default_value = 0.05
+        bsdf_node.inputs['Subsurface Weight'].default_value = 0.15
+        bsdf_node.inputs['Subsurface Radius'].default_value = (0.1, 0.5, 0.1)
+
+        tint = self._get_param(mat_data, 'TintColor')
+        if tint and len(tint) >= 3:
+            bsdf_node.inputs['Subsurface Tint'].default_value = (
+                min(tint[0] * 2, 1.0), min(tint[1] * 2, 1.0), min(tint[2] * 2, 1.0), 1.0)
+
+    def _build_skybox_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        TFT_Skybox: unlit background — pure Emission, no lighting contribution.
+        """
+        nodes.clear()
+        out_node = nodes.new('ShaderNodeOutputMaterial')
+        out_node.location = (400, 0)
+        emit_node = nodes.new('ShaderNodeEmission')
+        emit_node.location = (100, 0)
+        emit_node.inputs['Strength'].default_value = 1.0
+
+        diffuse_path = (self._get_sampler_path(mat_data, 'DiffuseTexture') or
+                        self._get_sampler_path(mat_data, 'Diffuse_Texture'))
+        if diffuse_path:
+            tex = self._load_texture_from_path(bl_mat, nodes, diffuse_path)
+            if tex:
+                tex.location = (-300, 0)
+                uv = nodes.new('ShaderNodeTexCoord')
+                uv.location = (-500, 0)
+                links.new(uv.outputs['UV'], tex.inputs['Vector'])
+                links.new(tex.outputs['Color'], emit_node.inputs['Color'])
+        else:
+            emit_node.inputs['Color'].default_value = (0.05, 0.1, 0.3, 1.0)
+
+        links.new(emit_node.outputs['Emission'], out_node.inputs['Surface'])
+        bl_mat.surface_render_method = 'DITHERED'
+
+    def _build_srx_blend_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        SRX_Blend_* (Infernal / Hextech / Cloud / Chemtech / Earth / etc.)
+
+        Diffuse × Tint_Color (League ×2 convention), alpha-blended decal
+        variants read the diffuse alpha (sharpened by AlphaPower), emission
+        comes from EmissionMaskTex × EmissionColor or Mask_Texture × Glow_Color.
+        A theme tint is only used when the material carries no tint param.
+        """
+        shader_lower = self._get_shader_short_name(mat_data).lower()
+        is_decal = 'decal' in shader_lower or 'puddle' in shader_lower
+
+        bsdf_node.inputs['Roughness'].default_value = 0.75
+        bsdf_node.inputs['Specular IOR Level'].default_value = 0.2
+
+        # --- Diffuse ---
+        diffuse_sampler = (self._get_sampler_data(mat_data, 'DiffuseTexture') or
+                           self._get_sampler_data(mat_data, 'Diffuse_Texture'))
+        diffuse_path = (self._get_sampler_path(mat_data, 'DiffuseTexture') or
+                        self._get_sampler_path(mat_data, 'Diffuse_Texture'))
+        diffuse_extension = 'CLIP' if self._sampler_needs_clip(diffuse_sampler) else 'REPEAT'
+        diff_tex = None
+        if diffuse_path:
+            diff_tex = self._load_texture_node(bl_mat, nodes, links, diffuse_path,
+                                               "UVMap", diffuse_extension)
+            if diff_tex:
+                diff_tex.location = (-700, 200)
+
+        # --- Tint: material param wins, theme tint only as fallback ---
+        param_tint = (self._get_param(mat_data, 'Tint_Color') or
+                      self._get_param(mat_data, 'TintColor') or
+                      self._get_param(mat_data, 'BaseTex_TintColor'))
+        tint_rgb = None
+        if param_tint and len(param_tint) >= 3 and any(c > 0.001 for c in param_tint[:3]):
+            tint_rgb = (min(param_tint[0] * 2.0, 1.0),
+                        min(param_tint[1] * 2.0, 1.0),
+                        min(param_tint[2] * 2.0, 1.0))
+            if all(abs(c - 1.0) < 0.02 for c in tint_rgb):
+                tint_rgb = None  # neutral — skip the multiply
+        elif not is_decal:
+            _TINTS = {
+                'infernal': (1.0, 0.3, 0.05),
+                'hextech':  (0.05, 0.5, 1.0),
+                'ocean':    (0.0, 0.4, 0.8),
+                'cloud':    (0.7, 0.85, 1.0),
+                'chemtech': (0.3, 0.9, 0.2),
+                'earth':    (0.5, 0.35, 0.15),
+            }
+            for key, col in _TINTS.items():
+                if key in shader_lower:
+                    tint_rgb = col
+                    break
+
+        color_output = diff_tex.outputs['Color'] if diff_tex else None
+        if tint_rgb is not None and color_output is not None:
+            tint_mix = nodes.new('ShaderNodeMix')
+            tint_mix.data_type = 'RGBA'
+            tint_mix.blend_type = 'MULTIPLY'
+            tint_mix.location = (-300, 200)
+            tint_mix.inputs['Factor'].default_value = 1.0
+            tint_mix.label = f"Tint ({tint_rgb[0]:.2f}, {tint_rgb[1]:.2f}, {tint_rgb[2]:.2f})"
+            tint_mix.inputs[7].default_value = (*tint_rgb, 1.0)
+            links.new(color_output, tint_mix.inputs[6])
+            color_output = tint_mix.outputs[2]
+
+        if color_output is not None:
+            links.new(color_output, bsdf_node.inputs['Base Color'])
+        elif tint_rgb is not None:
+            bsdf_node.inputs['Base Color'].default_value = (*tint_rgb, 1.0)
+
+        # --- Alpha: blended/clipped variants read the diffuse alpha channel ---
+        # AlphaPower remaps it like the game shader (alpha ^ AlphaPower).
+        blend_state = self._get_primary_pass_blend_state(mat_data)
+        if diff_tex and (blend_state['blendEnable'] or diffuse_extension == 'CLIP'):
+            alpha_output = diff_tex.outputs['Alpha']
+            alpha_power = self._get_param(mat_data, 'AlphaPower')
+            if (alpha_power and alpha_power[0] > 0.001
+                    and abs(alpha_power[0] - 1.0) > 0.001):
+                pow_node = nodes.new('ShaderNodeMath')
+                pow_node.operation = 'POWER'
+                pow_node.use_clamp = True
+                pow_node.location = (-300, -50)
+                pow_node.label = f"Alpha ^ {alpha_power[0]:.2f}"
+                links.new(alpha_output, pow_node.inputs[0])
+                pow_node.inputs[1].default_value = alpha_power[0]
+                alpha_output = pow_node.outputs[0]
+            links.new(alpha_output, bsdf_node.inputs['Alpha'])
+
+        # --- Emission ---
+        def _nonblack(col):
+            return (col and len(col) >= 3 and
+                    (col[0] > 0.01 or col[1] > 0.01 or col[2] > 0.01))
+
+        emission_color = self._get_param(mat_data, 'EmissionColor')
+        glow_color = self._get_param(mat_data, 'Glow_Color')
+        emis_mask_path = self._get_sampler_path(mat_data, 'EmissionMaskTex')
+        mask_path = self._get_sampler_path(mat_data, 'Mask_Texture')
+
+        emis_built = False
+        if (emis_mask_path and not self._is_placeholder_texture_path(emis_mask_path)
+                and _nonblack(emission_color)):
+            mask_tex = self._load_texture_node(bl_mat, nodes, links, emis_mask_path, "UVMap")
+            if mask_tex:
+                mask_tex.location = (-700, -250)
+                mask_tex.label = "Emission Mask"
+                if mask_tex.image:
+                    mask_tex.image.colorspace_settings.name = 'Non-Color'
+                emis_mix = nodes.new('ShaderNodeMix')
+                emis_mix.data_type = 'RGBA'
+                emis_mix.blend_type = 'MULTIPLY'
+                emis_mix.location = (-300, -250)
+                emis_mix.inputs['Factor'].default_value = 1.0
+                emis_mix.label = "Mask × EmissionColor"
+                links.new(mask_tex.outputs['Color'], emis_mix.inputs[6])
+                emis_mix.inputs[7].default_value = (emission_color[0], emission_color[1],
+                                                    emission_color[2], 1.0)
+                links.new(emis_mix.outputs[2], bsdf_node.inputs['Emission Color'])
+                bsdf_node.inputs['Emission Strength'].default_value = 1.0
+                emis_built = True
+
+        if (not emis_built and mask_path
+                and not self._is_placeholder_texture_path(mask_path)
+                and _nonblack(glow_color)):
+            # Mask alpha gates the glow; Glow_Min_Max midpoint sets the strength.
+            mask_tex = self._load_texture_node(bl_mat, nodes, links, mask_path, "UVMap")
+            if mask_tex:
+                mask_tex.location = (-700, -250)
+                mask_tex.label = "Glow Mask"
+                bsdf_node.inputs['Emission Color'].default_value = (
+                    glow_color[0], glow_color[1], glow_color[2], 1.0)
+                glow_strength = 1.0
+                glow_mm = self._get_param(mat_data, 'Glow_Min_Max')
+                if glow_mm and len(glow_mm) >= 2:
+                    glow_strength = (float(glow_mm[0]) + float(glow_mm[1])) * 0.5
+                strength_mul = nodes.new('ShaderNodeMath')
+                strength_mul.operation = 'MULTIPLY'
+                strength_mul.location = (-300, -400)
+                strength_mul.label = "Glow strength"
+                links.new(mask_tex.outputs['Alpha'], strength_mul.inputs[0])
+                strength_mul.inputs[1].default_value = glow_strength
+                links.new(strength_mul.outputs[0], bsdf_node.inputs['Emission Strength'])
+                emis_built = True
+
+        # --- Noise_Texture / EmissionTex drive the animated wave/scroll FX
+        # in-game. Keep them loaded and labelled for editing, but leave them
+        # unconnected — piping raw noise into emission just adds wrong static glow.
+        for fx_name, fx_y in (('Noise_Texture', -600), ('EmissionTex', -800)):
+            fx_path = self._get_sampler_path(mat_data, fx_name)
+            if fx_path and not self._is_placeholder_texture_path(fx_path):
+                fx_tex = self._load_texture_from_path(bl_mat, nodes, fx_path)
+                if fx_tex:
+                    fx_tex.location = (-700, fx_y)
+                    fx_tex.label = f"{fx_name} (FX, not previewed)"
+                    if fx_tex.image:
+                        fx_tex.image.colorspace_settings.name = 'Non-Color'
+
+    def _build_transition_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        DefaultEnv_Transition / TFT_Materialize_Static / TFT_Blink / DefaultEnv_Dissolve
+        Uses a noise/mask texture to drive alpha for dissolve effects.
+        """
+        bl_mat.surface_render_method = 'BLENDED'
+        bl_mat.show_transparent_back = False
+
+        bsdf_node.inputs['Roughness'].default_value = 0.8
+
+        diffuse_path = (self._get_sampler_path(mat_data, 'DiffuseTexture') or
+                        self._get_sampler_path(mat_data, 'Diffuse_Texture') or
+                        self._get_sampler_path(mat_data, 'Color_Texture'))
+        if diffuse_path:
+            diff_tex = self._load_texture_node(bl_mat, nodes, links, diffuse_path, "UVMap")
+            if diff_tex:
+                diff_tex.location = (-700, 200)
+                links.new(diff_tex.outputs['Color'], bsdf_node.inputs['Base Color'])
+
+        noise_path = (self._get_sampler_path(mat_data, 'Noise_Texture') or
+                      self._get_sampler_path(mat_data, 'Mask_Texture'))
+        if noise_path:
+            noise_tex = self._load_texture_node(bl_mat, nodes, links, noise_path, "UVMap")
+            if noise_tex:
+                noise_tex.location = (-700, -200)
+                if noise_tex.image:
+                    noise_tex.image.colorspace_settings.name = 'Non-Color'
+                links.new(noise_tex.outputs['Color'], bsdf_node.inputs['Alpha'])
+        else:
+            # Fallback: use material alpha parameter
+            alpha_val = self._get_param(mat_data, 'Final_Alpha', [0.5])
+            bsdf_node.inputs['Alpha'].default_value = alpha_val[0] if alpha_val else 0.5
+
+    def _build_scrolling_shader(self, bl_mat, nodes, links, bsdf_node, output_node, mat_data):
+        """
+        ENV_DarkstarBase / FlickerAlpha_FlipBook / TFT_Glitch_Static /
+        TFT_Scrolling_Delay / TFT_ScreenSpace_Masked_WPO / TFT_FlowMap_Masked /
+        TFT_Env_Shine_Float_VertexColor
+        Principled BSDF with a UV Mapping node so artists can adjust scroll/tile in-editor.
+        """
+        bsdf_node.inputs['Roughness'].default_value = 0.6
+        bsdf_node.inputs['Specular IOR Level'].default_value = 0.2
+
+        uv_node = nodes.new('ShaderNodeTexCoord')
+        uv_node.location = (-900, 50)
+        map_node = nodes.new('ShaderNodeMapping')
+        map_node.location = (-700, 50)
+        links.new(uv_node.outputs['UV'], map_node.inputs['Vector'])
+
+        # Store scroll speed as mapping Scale so it's easily tweaked
+        scroll = (self._get_param(mat_data, 'ScrollSpeed') or
+                  self._get_param(mat_data, 'Scroll_Speed') or
+                  self._get_param(mat_data, 'UV_Speed'))
+        if scroll and len(scroll) >= 2:
+            map_node.inputs['Scale'].default_value = (scroll[0], scroll[1], 1.0)
+            map_node.label = f"Scroll ({scroll[0]:.2f}, {scroll[1]:.2f})"
+
+        diffuse_path = (self._get_sampler_path(mat_data, 'DiffuseTexture') or
+                        self._get_sampler_path(mat_data, 'Diffuse_Texture') or
+                        self._get_sampler_path(mat_data, 'ScrollingA_Texture') or
+                        self._get_sampler_path(mat_data, 'Color_Texture'))
+        if diffuse_path:
+            diff_tex = self._load_texture_from_path(bl_mat, nodes, diffuse_path)
+            if diff_tex:
+                diff_tex.location = (-450, 200)
+                links.new(map_node.outputs['Vector'], diff_tex.inputs['Vector'])
+                links.new(diff_tex.outputs['Color'], bsdf_node.inputs['Base Color'])
+                links.new(diff_tex.outputs['Color'], bsdf_node.inputs['Emission Color'])
+                bsdf_node.inputs['Emission Strength'].default_value = 0.5
+                links.new(diff_tex.outputs['Alpha'], bsdf_node.inputs['Alpha'])
+
+        mask_path = (self._get_sampler_path(mat_data, 'Mask_Texture') or
+                     self._get_sampler_path(mat_data, 'Noise_Texture'))
+        if mask_path:
+            mask_tex = self._load_texture_from_path(bl_mat, nodes, mask_path)
+            if mask_tex:
+                mask_tex.location = (-450, -200)
+                if mask_tex.image:
+                    mask_tex.image.colorspace_settings.name = 'Non-Color'
+                links.new(map_node.outputs['Vector'], mask_tex.inputs['Vector'])
+
     def _load_texture(self, material, nodes, links, texture_path: str, bsdf_node) -> Optional[bpy.types.Node]:
         """Legacy method - load texture and connect to BSDF directly"""
         tex_node = self._load_texture_node(material, nodes, links, texture_path, "UVMap")

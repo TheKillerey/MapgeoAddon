@@ -134,6 +134,7 @@ class VertexBuffer:
     data: bytes
     description: Optional[VertexBufferDescription] = None  # Set when mesh references it
     vertex_count: int = 0
+    visibility: EnvironmentVisibility = EnvironmentVisibility.ALL_LAYERS
 
 @dataclass
 class IndexBuffer:
@@ -196,8 +197,9 @@ class Mesh:
     render_flags: int = 0  # Version 11+: additional render flags
     disable_backface_culling: bool = False  # Whether backface culling is disabled
     
-    # Version 18+ unknown field
-    unknown_version18_int: int = 0
+    # Version 18+ render region hash (FNV hash of the render region this
+    # mesh belongs to; 0 = no region)
+    render_region_hash: int = 0
     
     # Version 15+ visibility controller
     visibility_controller_path_hash: int = 0
@@ -208,6 +210,7 @@ class Mesh:
     # Lightmap channels
     baked_light: Optional[LightChannel] = None  # BAKED_LIGHT channel
     stationary_light: Optional[LightChannel] = None  # STATIONARY_LIGHT channel
+    baked_paint: Optional[LightChannel] = None  # BAKED_PAINT channel (version 12-16)
     
     # Texture overrides (version >= 17)
     texture_overrides: List['TextureOverride'] = field(default_factory=list)
@@ -218,9 +221,19 @@ class Mesh:
     
     # Spherical harmonics (version < 9): 9 Vector3 coefficients
     spherical_harmonics: List[Tuple[float, float, float]] = field(default_factory=list)
-    
+
     # Point light position (version < 7 with separate point lights)
     point_light: Optional[Tuple[float, float, float]] = None
+
+    # Backward-compat alias: older addon versions used this name for
+    # render_region_hash. Keeps mixed-version sessions/scripts working.
+    @property
+    def unknown_version18_int(self) -> int:
+        return self.render_region_hash
+
+    @unknown_version18_int.setter
+    def unknown_version18_int(self, value: int):
+        self.render_region_hash = int(value)
 
 @dataclass
 class TextureOverride:
@@ -248,7 +261,9 @@ class GeometryBucket:
 class BucketGrid:
     """Bucketed geometry scene graph for spatial partitioning"""
     path_hash: int = 0  # VisibilityControllerPathHash (version >= 15)
-    unknown_v18_float: float = 0.0  # Unknown float (version >= 18)
+    # Version 18+ render region hash. Stored in the file as 4 raw bytes that
+    # happen to sit where older tools read a float — it is a uint32 FNV hash.
+    render_region_hash: int = 0
     min_x: float = 0.0
     min_z: float = 0.0
     max_x: float = 0.0
@@ -266,6 +281,17 @@ class BucketGrid:
     indices: List[int] = field(default_factory=list)
     buckets: List[List[GeometryBucket]] = field(default_factory=list)  # 2D grid [row][col]
     face_visibility_flags: List[int] = field(default_factory=list)  # Per-face visibility
+
+    # Backward-compat alias: older addon versions exposed the render region
+    # hash as a float (raw bits reinterpreted). Old code reads/writes the
+    # float view; the canonical value stays in render_region_hash.
+    @property
+    def unknown_v18_float(self) -> float:
+        return struct.unpack('<f', struct.pack('<I', self.render_region_hash & 0xFFFFFFFF))[0]
+
+    @unknown_v18_float.setter
+    def unknown_v18_float(self, value: float):
+        self.render_region_hash = struct.unpack('<I', struct.pack('<f', float(value)))[0]
 
 @dataclass
 class PlanarReflector:
@@ -370,14 +396,15 @@ class MapgeoParser:
         vertex_buffer_count = struct.unpack('<I', stream.read(4))[0]
         
         for _ in range(vertex_buffer_count):
+            visibility = EnvironmentVisibility.ALL_LAYERS
             if version >= 13:
                 visibility = struct.unpack('<B', stream.read(1))[0]
-            
+
             buffer_size = struct.unpack('<I', stream.read(4))[0]
             buffer_data = stream.read(buffer_size)
-            
+
             # Vertex buffer doesn't have description yet - meshes will link them
-            vb = VertexBuffer(buffer_data)
+            vb = VertexBuffer(buffer_data, visibility=visibility)
             mapgeo.vertex_buffers.append(vb)
         
         # Read index buffers
@@ -428,9 +455,9 @@ class MapgeoParser:
             if version >= 13:
                 mesh.visibility = struct.unpack('<B', stream.read(1))[0]
             
-            # Version 18+ unknown int
+            # Version 18+ render region hash
             if version >= 18:
-                mesh.unknown_version18_int = struct.unpack('<I', stream.read(4))[0]
+                mesh.render_region_hash = struct.unpack('<I', stream.read(4))[0]
             
             # Version 15+ visibility controller path hash
             if version >= 15:
@@ -508,9 +535,10 @@ class MapgeoParser:
             # Version >= 9: Read stationary light channel
             mesh.stationary_light = self._read_light_channel(stream)
             
-            # Version >= 12 && < 17: Read baked paint channel
+            # Version >= 12 && < 17: Read baked paint channel (stored so it
+            # round-trips; older code discarded it and wrote back empty)
             if version >= 12 and version < 17:
-                self._read_light_channel(stream)  # baked paint (not stored)
+                mesh.baked_paint = self._read_light_channel(stream)
             
             # Version >= 17: Read texture overrides
             if version >= 17:
@@ -580,7 +608,7 @@ class MapgeoParser:
                 grid.path_hash = struct.unpack('<I', stream.read(4))[0]
             
             if version >= 18:
-                grid.unknown_v18_float = struct.unpack('<f', stream.read(4))[0]
+                grid.render_region_hash = struct.unpack('<I', stream.read(4))[0]
             
             grid.min_x, grid.min_z, grid.max_x, grid.max_z = struct.unpack('<4f', stream.read(16))
             grid.max_stickout_x, grid.max_stickout_z = struct.unpack('<2f', stream.read(8))
@@ -707,16 +735,17 @@ class MapgeoParser:
                 stream.write(struct.pack('<I', elem.format))
                 # Offset is not written, it's calculated on read
             
-            # Pad unused elements (8 bytes each: name + format)
+            # Pad unused elements (8 bytes each). Riot pads with
+            # name=POSITION(0), format=XYZW_FLOAT32(3).
             for _ in range(15 - len(desc.elements)):
-                stream.write(struct.pack('<II', 0, 0))
+                stream.write(struct.pack('<II', 0, 3))
         
         # Write vertex buffers
         stream.write(struct.pack('<I', len(mapgeo.vertex_buffers)))
         
         for vb in mapgeo.vertex_buffers:
             if mapgeo.version >= 13:
-                stream.write(struct.pack('<B', EnvironmentVisibility.ALL_LAYERS))
+                stream.write(struct.pack('<B', vb.visibility))
             
             stream.write(struct.pack('<I', len(vb.data)))
             stream.write(vb.data)
@@ -776,9 +805,9 @@ class MapgeoParser:
             if mapgeo.version >= 13:
                 stream.write(struct.pack('<B', mesh.visibility))
             
-            # Version 18+ unknown int
+            # Version 18+ render region hash
             if mapgeo.version >= 18:
-                stream.write(struct.pack('<I', mesh.unknown_version18_int))
+                stream.write(struct.pack('<I', mesh.render_region_hash))
             
             # Version 15+ visibility controller
             if mapgeo.version >= 15:
@@ -846,8 +875,8 @@ class MapgeoParser:
                 self._write_light_channel(stream, mesh.stationary_light)
                 
                 if mapgeo.version >= 12 and mapgeo.version < 17:
-                    # Empty baked paint channel
-                    self._write_light_channel(stream, None)
+                    # Baked paint channel (preserve original if we parsed one)
+                    self._write_light_channel(stream, mesh.baked_paint)
                 
                 if mapgeo.version >= 17:
                     # Texture overrides
@@ -880,7 +909,7 @@ class MapgeoParser:
                 stream.write(struct.pack('<I', grid.path_hash))
             
             if mapgeo.version >= 18:
-                stream.write(struct.pack('<f', grid.unknown_v18_float))
+                stream.write(struct.pack('<I', grid.render_region_hash))
             
             stream.write(struct.pack('<4f', grid.min_x, grid.min_z, grid.max_x, grid.max_z))
             stream.write(struct.pack('<2f', grid.max_stickout_x, grid.max_stickout_z))

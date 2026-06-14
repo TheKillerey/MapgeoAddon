@@ -15,6 +15,7 @@ Hash Resolution:
 """
 
 import bpy
+import json
 import os
 import struct
 import gzip
@@ -872,14 +873,38 @@ def repack_wad(source_dir: str, output_filepath: str, version: int = 3,
     source_path = Path(source_dir)
     file_list: list[tuple[int, str, str]] = []  # (hash, rel_path, abs_path)
 
+    # Pre-scan every directory for hashed_bins.json (from the character bin updater).
+    # Files stored under a hash name need to be packed under their real CDragon path hash
+    # so the game engine can find them.  We also build a claimed-hash set so that a
+    # real-path duplicate of a hash file is not packed twice.
+    _dir_hb: dict[str, dict] = {}   # dir_path -> {hash_fname: real_cdg_path}
+    _hashed_claimed: set[int] = set()  # path_hashes already owned by a hash file
+    for _hb_root, _hb_dirs, _hb_files in os.walk(source_path):
+        if "hashed_bins.json" in _hb_files:
+            _hb_path = os.path.join(str(_hb_root), "hashed_bins.json")
+            try:
+                with open(_hb_path, "r", encoding="utf-8") as _hbf:
+                    _hb_data = json.load(_hbf)
+                _dir_hb[str(_hb_root)] = _hb_data
+                for _hb_fname, _hb_real in _hb_data.items():
+                    if os.path.isfile(os.path.join(str(_hb_root), _hb_fname)):
+                        _hashed_claimed.add(xxhash64_path(_hb_real))
+            except (ValueError, OSError):
+                pass
+
     for root, dirs, files in os.walk(source_path):
+        root_str = str(root)
+        dir_hb = _dir_hb.get(root_str, {})
         for fname in files:
+            # Skip hashed_bins.json — it's metadata, not game data
+            if fname == "hashed_bins.json":
+                continue
+
             abs_path = os.path.join(root, fname)
             rel_path = os.path.relpath(abs_path, source_dir).replace('\\', '/')
 
-            # Check if it's a raw/ hex-named file
+            # Check if it's a raw/ hex-named file (existing convention for unknown paths)
             if rel_path.startswith('raw/'):
-                # Try to parse hex hash from filename
                 basename = os.path.splitext(os.path.basename(rel_path))[0]
                 try:
                     path_hash = int(basename, 16)
@@ -888,13 +913,27 @@ def repack_wad(source_dir: str, output_filepath: str, version: int = 3,
                 except ValueError:
                     pass
 
+            # hashed_bins.json lookup — hash file for a CDragon path that exceeds
+            # the NTFS 255-char filename limit.  Use the real CDragon path hash.
+            if fname in dir_hb:
+                real_cdg_path = dir_hb[fname]
+                path_hash = xxhash64_path(real_cdg_path)
+                file_list.append((path_hash, rel_path, abs_path))
+                continue
+
             # Normal file — look up hash
             key = rel_path.lower()
             if key in path_to_hash:
                 path_hash = path_to_hash[key]
             else:
-                # Compute new hash
                 path_hash = xxhash64_path(rel_path)
+
+            # Skip if a hashed_bins entry already covers this CDragon path
+            # (avoids duplicate WAD entries when both the hash file and the
+            # real-path file happen to be on disk after a partial update run)
+            if path_hash in _hashed_claimed:
+                print(f"[WAD] Skipping duplicate (covered by hashed_bins): {rel_path}")
+                continue
 
             file_list.append((path_hash, rel_path, abs_path))
 

@@ -220,6 +220,12 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 context.window_manager.progress_update(100)
                 context.window_manager.progress_end()
             
+            oversized = getattr(self, "_oversized_meshes", [])
+            if oversized:
+                self.report({'WARNING'},
+                            f"Skipped {len(oversized)} mesh(es) over the 65,535-vertex "
+                            f"limit: {', '.join(oversized[:5])}"
+                            + (" …" if len(oversized) > 5 else ""))
             self.report({'INFO'}, f"Successfully exported to {os.path.basename(self.filepath)} "
                         f"({len(objects)} meshes, {len(mapgeo.bucket_grids)} bucket grids)")
             return {'FINISHED'}
@@ -384,7 +390,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         
         mapgeo = mapgeo_parser.MapgeoFile()
         mapgeo.version = self.export_version
-        
+        self._oversized_meshes = []
+
         # Check if we have cached VB descriptions from import (for structure preservation)
         have_vb_cache = bool(import_mapgeo._imported_vb_descriptions_cache)
         
@@ -402,7 +409,17 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 
                 if mesh is None or not mesh.vertices:
                     continue
-                
+
+                # Mapgeo index buffers are u16: a mesh with more than 65535
+                # vertices cannot be addressed and would corrupt the export.
+                if len(mesh.vertices) > 65535:
+                    self._oversized_meshes.append(f"{obj.name} ({len(mesh.vertices):,} verts)")
+                    print(f"ERROR: Skipping '{obj.name}': {len(mesh.vertices):,} vertices "
+                          f"exceed the mapgeo u16 index limit (65,535). Split the mesh.")
+                    if eval_obj is not None:
+                        eval_obj.to_mesh_clear()
+                    continue
+
                 # Triangulate if needed
                 if self.triangulate:
                     bm = bmesh.new()
@@ -427,19 +444,22 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     except (json.JSONDecodeError, TypeError):
                         stream_elements = None
                 
+                # Buffer visibility mirrors mesh layer visibility (Riot writes
+                # the same flags on vertex and index buffers).
+                buf_visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility",
+                                         mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
+
                 if stream_elements and len(stream_elements) == decl_count and decl_count > 1:
                     # Multi-stream: create separate vertex buffers per stream
                     vertex_buffers = self.create_multi_stream_vertex_buffers(mesh, obj, stream_elements)
                     first_vb_id = len(mapgeo.vertex_buffers)
                     vb_ids = []
                     for vb in vertex_buffers:
+                        vb.visibility = buf_visibility
                         vb_ids.append(len(mapgeo.vertex_buffers))
                         mapgeo.vertex_buffers.append(vb)
-                    
-                    # Create index buffer (inherit mesh visibility for environment layering)
-                    ib_visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility",
-                                            mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
-                    index_buffer = self.create_index_buffer(mesh, visibility=ib_visibility, obj=obj)
+
+                    index_buffer = self.create_index_buffer(mesh, visibility=buf_visibility, obj=obj)
                     index_buffer_id = len(mapgeo.index_buffers)
                     mapgeo.index_buffers.append(index_buffer)
                     
@@ -452,13 +472,11 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 else:
                     # Single-stream: create one vertex buffer (original behavior)
                     vertex_buffer = self.create_vertex_buffer(mesh, obj)
+                    vertex_buffer.visibility = buf_visibility
                     vertex_buffer_id = len(mapgeo.vertex_buffers)
                     mapgeo.vertex_buffers.append(vertex_buffer)
-                    
-                    # Create index buffer (inherit mesh visibility for environment layering)
-                    ib_visibility = obj.get("visibility_layer", obj.get("mapgeo_visibility",
-                                            mapgeo_parser.EnvironmentVisibility.ALL_LAYERS))
-                    index_buffer = self.create_index_buffer(mesh, visibility=ib_visibility, obj=obj)
+
+                    index_buffer = self.create_index_buffer(mesh, visibility=buf_visibility, obj=obj)
                     index_buffer_id = len(mapgeo.index_buffers)
                     mapgeo.index_buffers.append(index_buffer)
                     
@@ -486,6 +504,14 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 traceback.print_exc()
                 continue
         
+        # -----------------------------------------------------------------
+        # Deduplicate identical buffers (Riot's instancing optimization).
+        # Repeated props (bushes, rocks, ...) have byte-identical local
+        # geometry and only differ by transform_matrix; the original files
+        # share one vertex/index buffer between all instances.
+        # -----------------------------------------------------------------
+        self.deduplicate_buffers(mapgeo)
+
         # Populate sampler_defs from import cache
         sampler_defs_data = list(import_mapgeo._imported_sampler_defs_cache)
         if sampler_defs_data:
@@ -529,7 +555,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             # Build description lookup by element names
             desc_lookup = {}
             for desc_idx, desc in enumerate(mapgeo.vertex_buffer_descriptions):
-                key = tuple(e.name for e in desc.elements)
+                key = tuple((e.name, e.format) for e in desc.elements)
                 desc_lookup[key] = desc_idx
             
             for mesh_entry in mapgeo.meshes:
@@ -546,7 +572,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     if vb_id < len(mapgeo.vertex_buffers):
                         vb = mapgeo.vertex_buffers[vb_id]
                         if vb.description:
-                            key = tuple(e.name for e in vb.description.elements)
+                            # Match by name AND format: binding a float32 buffer to a
+                            # cached half-float description would corrupt the layout.
+                            key = tuple((e.name, e.format) for e in vb.description.elements)
                             if key in desc_lookup:
                                 mesh_entry.vertex_declaration_id = desc_lookup[key]
                             else:
@@ -600,18 +628,30 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 old_to_new[old_idx] = dedup_key_to_idx[key]
 
             if len(dedup_descs) < old_count:
-                mapgeo.vertex_buffer_descriptions = dedup_descs
-                # Remap mesh vertex_declaration_id references
+                # Multi-stream meshes reference a CONSECUTIVE run of descriptions
+                # [id .. id+count-1]; dedup may break that adjacency. Verify every
+                # multi-stream run survives the remap, otherwise keep the original
+                # (bloated but correct) description list.
+                adjacency_ok = True
                 for mesh_entry in mapgeo.meshes:
-                    old_id = mesh_entry.vertex_declaration_id
                     if mesh_entry.vertex_declaration_count > 1:
-                        # Multi-stream: remap the base index, consecutive descs stay consecutive
+                        base = mesh_entry.vertex_declaration_id
+                        new_run = [old_to_new.get(base + k) for k in range(mesh_entry.vertex_declaration_count)]
+                        if (None in new_run
+                                or new_run != list(range(new_run[0], new_run[0] + len(new_run)))):
+                            adjacency_ok = False
+                            break
+
+                if adjacency_ok:
+                    mapgeo.vertex_buffer_descriptions = dedup_descs
+                    for mesh_entry in mapgeo.meshes:
+                        old_id = mesh_entry.vertex_declaration_id
                         if old_id in old_to_new:
                             mesh_entry.vertex_declaration_id = old_to_new[old_id]
-                    else:
-                        if old_id in old_to_new:
-                            mesh_entry.vertex_declaration_id = old_to_new[old_id]
-                print(f"Post-pass VBD dedup: {old_count} -> {len(dedup_descs)} descriptions")
+                    print(f"Post-pass VBD dedup: {old_count} -> {len(dedup_descs)} descriptions")
+                else:
+                    print("Post-pass VBD dedup skipped: would break a multi-stream "
+                          "description run (keeping original descriptions)")
 
         # Ensure standard sampler defs are present
         sampler_names = {sd.name for sd in mapgeo.sampler_defs}
@@ -625,6 +665,72 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
 
         return mapgeo
     
+    def deduplicate_buffers(self, mapgeo):
+        """Share identical vertex/index buffers between meshes (instancing).
+
+        Buffers are considered identical when their raw bytes match — for
+        vertex buffers the layout description must match too, for index
+        buffers the visibility flags must match (both are written per-buffer
+        in the file).
+        """
+        import hashlib
+
+        def _digest(data):
+            return hashlib.sha1(data).digest()
+
+        # Vertex buffers. Visibility is intentionally NOT part of the key:
+        # when instances live on different layers Riot still shares one
+        # buffer and merges (ORs) the layer visibility flags.
+        vb_old_to_new = {}
+        seen_vbs = {}
+        new_vbs = []
+        for i, vb in enumerate(mapgeo.vertex_buffers):
+            desc_key = None
+            if vb.description is not None:
+                desc_key = (vb.description.usage,
+                            tuple((e.name, e.format) for e in vb.description.elements))
+            key = (desc_key, len(vb.data), _digest(vb.data))
+            if key in seen_vbs:
+                shared = new_vbs[seen_vbs[key]]
+                shared.visibility = int(shared.visibility) | int(vb.visibility)
+                vb_old_to_new[i] = seen_vbs[key]
+            else:
+                seen_vbs[key] = len(new_vbs)
+                vb_old_to_new[i] = len(new_vbs)
+                new_vbs.append(vb)
+
+        # Index buffers (same visibility-merging rule)
+        ib_old_to_new = {}
+        seen_ibs = {}
+        new_ibs = []
+        for i, ib in enumerate(mapgeo.index_buffers):
+            key = (len(ib.data), _digest(ib.data))
+            if key in seen_ibs:
+                shared = new_ibs[seen_ibs[key]]
+                shared.visibility = int(shared.visibility) | int(ib.visibility)
+                ib_old_to_new[i] = seen_ibs[key]
+            else:
+                seen_ibs[key] = len(new_ibs)
+                ib_old_to_new[i] = len(new_ibs)
+                new_ibs.append(ib)
+
+        vb_saved = len(mapgeo.vertex_buffers) - len(new_vbs)
+        ib_saved = len(mapgeo.index_buffers) - len(new_ibs)
+        if not vb_saved and not ib_saved:
+            return
+
+        saved_bytes = (sum(len(vb.data) for vb in mapgeo.vertex_buffers)
+                       - sum(len(vb.data) for vb in new_vbs)
+                       + sum(len(ib.data) for ib in mapgeo.index_buffers)
+                       - sum(len(ib.data) for ib in new_ibs))
+        mapgeo.vertex_buffers = new_vbs
+        mapgeo.index_buffers = new_ibs
+        for mesh_entry in mapgeo.meshes:
+            mesh_entry.vertex_buffer_ids = [vb_old_to_new[v] for v in mesh_entry.vertex_buffer_ids]
+            mesh_entry.index_buffer_id = ib_old_to_new[mesh_entry.index_buffer_id]
+        print(f"Buffer dedup (instancing): {vb_saved} vertex + {ib_saved} index "
+              f"buffer(s) shared, {saved_bytes:,} bytes saved")
+
     def create_multi_stream_vertex_buffers(self, mesh, obj, stream_elements) -> list:
         """Create multiple vertex buffers for multi-stream vertex layouts.
         
@@ -708,31 +814,47 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             vertex_size = desc.get_vertex_size()
             vertex_data = bytearray(vertex_size * vertex_count)
             
+            # Format-aware packers: the cached Riot layout may store these as
+            # 16-bit half floats (formats 7/8/9) — write back what the
+            # description declares, matching the importer's decoding.
+            def _vec3_pack(fmt):
+                return '<eee' if fmt == 8 else '<fff'
+
+            def _vec2_pack(fmt):
+                return '<ee' if fmt == 7 else '<ff'
+
+            unsupported = {en: fmt for en, fmt in elem_formats.items()
+                           if fmt not in (1, 2, 4, 7, 8)}
+            if unsupported:
+                print(f"WARNING: multi-stream export of '{obj.name}': unhandled vertex "
+                      f"element format(s) {unsupported} — written as float32, layout "
+                      f"may not match the declared description")
+
             # Write vertex data for this stream
             for vert_idx, vert in enumerate(mesh.vertices):
                 buf_offset = vert_idx * vertex_size
                 current_offset = 0
-                
+
                 for en in elem_names:
                     fmt = elem_formats.get(en, 2)
                     elem_size = mapgeo_parser.VertexElement.get_format_size(fmt)
                     write_pos = buf_offset + current_offset
-                    
+
                     if en == 0:  # POSITION
                         local_pos = vert.co
-                        struct.pack_into('<fff', vertex_data, write_pos,
+                        struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos,
                                        local_pos.x, local_pos.z, local_pos.y)
-                    
+
                     elif en == 2:  # NORMAL
                         if raw_normals_attr and vert_idx < len(raw_normals_attr.data):
                             rn = raw_normals_attr.data[vert_idx].vector
-                            struct.pack_into('<fff', vertex_data, write_pos,
+                            struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos,
                                            rn.x, rn.z, rn.y)
                         else:
                             n = vert.normal
-                            struct.pack_into('<fff', vertex_data, write_pos,
+                            struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos,
                                            n.x, n.z, n.y)
-                    
+
                     elif en == 4:  # PRIMARY_COLOR
                         if color_attr and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
                             loop_idx = vert_to_loops[vert_idx][0]
@@ -744,31 +866,31 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                             struct.pack_into('<BBBB', vertex_data, write_pos, b, g, r, a)
                         else:
                             struct.pack_into('<BBBB', vertex_data, write_pos, 255, 255, 255, 255)
-                    
+
                     elif en == 7:  # TEXCOORD0
                         if uv_layer and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
                             loop_idx = vert_to_loops[vert_idx][0]
                             uv = uv_layer.data[loop_idx].uv
-                            struct.pack_into('<ff', vertex_data, write_pos, uv[0], 1.0 - uv[1])
+                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, uv[0], 1.0 - uv[1])
                         else:
-                            struct.pack_into('<ff', vertex_data, write_pos, 0.0, 0.0)
-                    
+                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, 0.0, 0.0)
+
                     elif en == 12:  # TEXCOORD5
                         if tc5_attr and vert_idx < len(tc5_attr.data):
                             vec = tc5_attr.data[vert_idx].vector
-                            struct.pack_into('<fff', vertex_data, write_pos,
+                            struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos,
                                            vec[0], vec[2], vec[1])
                         else:
-                            struct.pack_into('<fff', vertex_data, write_pos, 0.0, 0.0, 0.0)
-                    
+                            struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos, 0.0, 0.0, 0.0)
+
                     elif en == 14:  # TEXCOORD7
                         if lightmap_uv_layer and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
                             loop_idx = vert_to_loops[vert_idx][0]
                             uv = lightmap_uv_layer.data[loop_idx].uv
-                            struct.pack_into('<ff', vertex_data, write_pos, uv[0], 1.0 - uv[1])
+                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, uv[0], 1.0 - uv[1])
                         else:
-                            struct.pack_into('<ff', vertex_data, write_pos, 0.0, 0.0)
-                    
+                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, 0.0, 0.0)
+
                     current_offset += elem_size
             
             vb = mapgeo_parser.VertexBuffer(
@@ -1027,7 +1149,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 idx += 3
         
         return mapgeo_parser.IndexBuffer(
-            data=bytes(index_data),
+            data=bytes(index_data[:idx * 2]),  # truncate slots of skipped non-tri faces
             format=0,  # U16
             index_count=idx,
             visibility=visibility
@@ -1052,9 +1174,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         # Version 18+ render region hash (visibility culling)
         if "render_region_hash" in obj:
             try:
-                mesh_entry.unknown_version18_int = int(obj["render_region_hash"], 16)
+                mesh_entry.render_region_hash = int(obj["render_region_hash"], 16)
             except (ValueError, TypeError):
-                mesh_entry.unknown_version18_int = 0
+                mesh_entry.render_region_hash = 0
         
         # Version 15+ baron hash (visibility controller)
         if "baron_hash" in obj:
@@ -1348,35 +1470,28 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
 
                         # Normalize hash field placement based on collection type.
                         # This protects export correctness even if legacy/stale custom
-                        # collections have path_hash/v18 incorrectly placed.
-                        # Correct format: render_region → path_hash (v18=0), baron → v18 (path_hash=0)
-                        v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
+                        # collections have the hashes incorrectly placed.
+                        # Correct format: render_region → path_hash (region=0),
+                        # baron → render_region_hash (path_hash=0)
                         if col_hash_type == 'render_region':
-                            if grid.path_hash == 0 and v18_uint != 0:
-                                grid.path_hash = v18_uint
-                                grid.unknown_v18_float = 0.0
-                                v18_uint = 0
+                            if grid.path_hash == 0 and grid.render_region_hash != 0:
+                                grid.path_hash = grid.render_region_hash
+                                grid.render_region_hash = 0
                         elif col_hash_type == 'baron':
-                            if grid.path_hash != 0 and v18_uint == 0:
-                                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', grid.path_hash))[0]
+                            if grid.path_hash != 0 and grid.render_region_hash == 0:
+                                grid.render_region_hash = grid.path_hash
                                 grid.path_hash = 0
-                                v18_uint = struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]
                         elif col_hash_type == 'master':
                             grid.path_hash = 0
-                            grid.unknown_v18_float = 0.0
-                            v18_uint = 0
-                        
-                        # Determine identifier: path_hash if non-zero, else v18
-                        cid = grid.path_hash
-                        if cid == 0:
-                            cid_v18 = v18_uint
-                            if cid_v18 != 0:
-                                cid = cid_v18
-                        
+                            grid.render_region_hash = 0
+
+                        # Determine identifier: path_hash if non-zero, else region hash
+                        cid = grid.path_hash or grid.render_region_hash
+
                         custom_grids.append((cid, grid))
 
                         print(f"  Custom grid: hash={cid:08X} "
-                              f"(path_hash={grid.path_hash:08X} v18={v18_uint:08X}) "
+                              f"(path_hash={grid.path_hash:08X} region={grid.render_region_hash:08X}) "
                               f"flags={grid.flags} bps={grid.buckets_per_side} "
                               f"verts={len(grid.vertices)} idx={len(grid.indices)}")
                 except (json.JSONDecodeError, TypeError) as e:
@@ -1392,8 +1507,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             zero_zero_ids = set()  # Track all zero-zero grid ids to skip extras
             master_candidates = []
             for cid, cgrid in custom_grids:
-                v18_uint = struct.unpack('<I', struct.pack('<f', cgrid.unknown_v18_float))[0]
-                if cgrid.path_hash == 0 and v18_uint == 0:
+                if cgrid.path_hash == 0 and cgrid.render_region_hash == 0:
                     bounds_area = (cgrid.max_x - cgrid.min_x) * (cgrid.max_z - cgrid.min_z)
                     master_candidates.append((bounds_area, id(cgrid), cgrid))
                     zero_zero_ids.add(id(cgrid))
@@ -1413,7 +1527,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 _, source_grid = max(custom_grids, key=lambda item: len(item[1].indices))
                 master_grid = mapgeo_parser.BucketGrid()
                 master_grid.path_hash = 0
-                master_grid.unknown_v18_float = 0.0
+                master_grid.render_region_hash = 0
                 master_grid.min_x = source_grid.min_x
                 master_grid.min_z = source_grid.min_z
                 master_grid.max_x = source_grid.max_x
@@ -1467,9 +1581,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     continue
                 # Deduplicate by identifier (non-zero hashes only)
                 if cid != 0 and cid in seen_cids:
-                    v18_uint = struct.unpack('<I', struct.pack('<f', cgrid.unknown_v18_float))[0]
                     print(f"  Skipping duplicate bucket grid (id={cid:#010x}, "
-                          f"path_hash={cgrid.path_hash:#010x}, v18={v18_uint:#010x})")
+                          f"path_hash={cgrid.path_hash:#010x}, region={cgrid.render_region_hash:#010x})")
                     skipped_dupes += 1
                     continue
                 if cid != 0:
@@ -1499,10 +1612,8 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                         grid = self._reconstruct_grid_from_json(grid_data)
                         if grid is not None:
                             imported_grids.append(grid)
-                            
-                            v18_bytes = struct.pack('<f', grid.unknown_v18_float)
-                            v18_uint = struct.unpack('<I', v18_bytes)[0]
-                            print(f"  Imported grid: hash={grid.path_hash:08X} v18={v18_uint:08X} "
+
+                            print(f"  Imported grid: hash={grid.path_hash:08X} region={grid.render_region_hash:08X} "
                                   f"flags={grid.flags} bps={grid.buckets_per_side} "
                                   f"verts={len(grid.vertices)}")
                 except (json.JSONDecodeError, TypeError) as e:
@@ -1538,13 +1649,16 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             grid.is_disabled = grid_data.get("is_disabled", False)
             grid.flags = int(grid_data.get("flags", 0))
             
-            # unknown_v18_float is stored as hex string, convert back to float
-            unknown_v18_str = grid_data.get("unknown_v18_float", "00000000")
-            if isinstance(unknown_v18_str, str):
-                uint_value = int(unknown_v18_str, 16)
-                grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', uint_value))[0]
+            # Render region hash stored as hex string.
+            # Fall back to the legacy "unknown_v18_float" key (same value,
+            # written by older addon versions).
+            rr_str = grid_data.get("render_region_hash",
+                                   grid_data.get("unknown_v18_float", "00000000"))
+            if isinstance(rr_str, str):
+                grid.render_region_hash = int(rr_str, 16)
             else:
-                grid.unknown_v18_float = float(unknown_v18_str)
+                # Legacy numeric float value: reinterpret its bits as uint32
+                grid.render_region_hash = struct.unpack('<I', struct.pack('<f', float(rr_str)))[0]
             grid.max_stickout_x = grid_data.get("max_stickout_x", 0.0)
             grid.max_stickout_z = grid_data.get("max_stickout_z", 0.0)
             
@@ -1590,13 +1704,12 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         grid.buckets_per_side = int(obj.get("buckets_per_side", 1))
         grid.path_hash = int(obj.get("path_hash", "00000000"), 16) if isinstance(obj.get("path_hash"), str) else int(obj.get("path_hash", 0))
         
-        # unknown_v18_float is stored as hex string, convert back to float
-        unknown_v18_str = obj.get("unknown_v18_float", "00000000")
-        if isinstance(unknown_v18_str, str):
-            uint_value = int(unknown_v18_str, 16)
-            grid.unknown_v18_float = struct.unpack('<f', struct.pack('<I', uint_value))[0]
+        # Render region hash stored as hex string (legacy key: unknown_v18_float)
+        rr_str = obj.get("render_region_hash", obj.get("unknown_v18_float", "00000000"))
+        if isinstance(rr_str, str):
+            grid.render_region_hash = int(rr_str, 16)
         else:
-            grid.unknown_v18_float = float(unknown_v18_str)
+            grid.render_region_hash = struct.unpack('<I', struct.pack('<f', float(rr_str)))[0]
         grid.is_disabled = obj.get("is_disabled", False)
         grid.flags = int(obj.get("flags", 0))
         grid.max_stickout_x = obj.get("stickout_x", 0.0)

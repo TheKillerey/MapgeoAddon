@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.5.0] - 2026-06-14
+
+A clean-up release: import/export verified across versions, the sidebar
+consolidated to two tabs, and the duplicated diff logic unified.
+
+### UI
+- **Two tabs instead of three** — the orphan `Mapgeo` N-panel tab (which held only
+  the Heightmap Baker and Asset Finder) is gone; both panels now live under
+  `LoL Mapgeo`. The sidebar is now just `LoL Mapgeo` (map workflow) and
+  `League Tools` (file-format editors).
+- **Stable panel order** — `LoL Mapgeo` top level is Project Manager → Mapgeo Tools
+  → Heightmap Baker → Asset Finder, each with an explicit `bl_order` so panels no
+  longer shuffle. Fixed a `bl_order` collision in `League Tools` (Materials.bin
+  Manager and Prey Categories both sat at 82).
+
+### Diff / patch
+- **Unified the duplicated diff logic** — there were two independent
+  entry-diff implementations (`map_patcher._create_diff` and
+  `map_porter.diff_materials_bins`). Both now run on one shared core,
+  `map_patcher.diff_entries`, parameterized by key/equality/copy behavior so each
+  caller keeps its exact semantics. Verified byte-for-byte identical output on the
+  SR materials.bin (688 entries) before/after. `map_auto_updater` already used the
+  shared core. The distinct workflow panels (Map Porter, Materials.prey Export,
+  Map Patcher, Map11.bin Patcher) are intentionally kept separate.
+
+### Import / export (v13–v18)
+- **Round-trip harness** — `TestCode/_mapgeo_roundtrip.py` verifies
+  read → write → read structural parity (and byte-identity where expected) for any
+  sample file. v18 (SR) confirmed byte-identical.
+- **Baked-paint channel preserved (v12–v16)** — the parser used to read the
+  per-mesh baked-paint light channel and discard it, then write an empty one back,
+  silently dropping it on round-trip. It is now stored (`Mesh.baked_paint`) and
+  written back faithfully. (v18 is unaffected — it has no baked-paint channel.)
+
+## [0.4.7-fixes] - 2026-06
+
+### Changes
+- **Mapgeo writer now matches Riot's file size** — exports were always ~5% bigger than the originals because every mesh got its own vertex/index buffer. Riot shares one buffer between all instances of a repeated prop (bushes, rocks, ...; up to 35 meshes per buffer on SR). The exporter now deduplicates byte-identical buffers and merges (ORs) their layer-visibility flags, reproducing the instancing. SR base_srx: 96.5 MB → ~92.1 MB (original: 92.13 MB).
+- **Byte-identical parser round-trip** — `MapgeoParser.read()` → `write()` of an untouched Riot v18 file now reproduces it byte-for-byte: unused vertex-declaration elements are padded with `format=XYZW_FLOAT32` like Riot does, and the per-vertex-buffer layer-visibility byte is preserved instead of being overwritten with ALL_LAYERS.
+- **Vertex buffers now carry layer visibility on export** — previously all vertex buffers were written as visible on all layers; now they inherit the mesh's `visibility_layer` like index buffers (matches Riot, lets the engine skip buffers for inactive layers).
+- **v18 "unknown int" renamed to `render_region_hash`** — the field is the render-region hash, on both meshes (`Mesh.render_region_hash`) and bucket grids (`BucketGrid.render_region_hash`, previously `unknown_v18_float`; now read/written as the uint32 it really is, removing all float-bit reinterpret juggling). Custom properties / JSON written by older versions (`unknown_v18_float`) are still read via fallback.
+- **UI cleanup** — the overloaded "Layer Management" panel is split into three: Layer Management (visibility, layers, quality, bushes), a new "Baron Hash Editor" sub-panel, and a new "Render Regions & Bucket Grid" sub-panel; sub-panel order fixed (Import → Layers → Baron → Regions → Lighting → Utilities); the duplicated "Custom Mesh Setup" box was merged into Quick Actions.
+- Heightmap Baker: new exact NavGrid baker (see 0.4.7+ navgrid.py) — parses `.aimesh_ngrid` v7 and writes 16-bit heightmap, walkability mask, combined map and meta JSON.
+
 ## [0.4.7] - 2026-05-10
 
 ### Changes

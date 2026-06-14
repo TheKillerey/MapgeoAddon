@@ -79,7 +79,7 @@ def _mapgeo_to_dict(filepath: str) -> dict:
             "index_buffer_id":    m.index_buffer_id,
             "render_flags":       m.render_flags,
             "visibility_controller_path_hash": hex(m.visibility_controller_path_hash),
-            "unknown_version18_int": m.unknown_version18_int,
+            "render_region_hash": hex(m.render_region_hash),
             "layer_transition_behavior": m.layer_transition_behavior,
             "transform_matrix":  m.transform_matrix,
         }
@@ -118,12 +118,9 @@ def _mapgeo_to_dict(filepath: str) -> dict:
         }
 
     def _bucket_grid(bg):
-        # Convert unknown_v18_float to its raw uint32 hex repr for exact comparison
-        v18_raw = struct.unpack('<I', struct.pack('<f', bg.unknown_v18_float))[0]
         return {
             "path_hash":          hex(bg.path_hash),
-            "unknown_v18_float":  bg.unknown_v18_float,
-            "unknown_v18_hex":    hex(v18_raw),
+            "render_region_hash": hex(bg.render_region_hash),
             "min_x":              bg.min_x,
             "min_z":              bg.min_z,
             "max_x":              bg.max_x,

@@ -92,16 +92,20 @@ Use Project Manager for split-file editing:
 
 ## UI Panels
 
-- LoL Mapgeo tab:
-  - import/export
-  - visibility and layer controls
-  - utilities and light tools
+- LoL Mapgeo tab (map workflow):
+  - Project Manager (load/create projects, LUT, integrity checker, auto-updater)
+  - Mapgeo Tools (import/export, layers and visibility, baron hashes, render
+    regions, lighting/baking, materials, utilities)
+  - Heightmap Baker (heightmap + NavGrid walkability maps)
+  - Asset Finder
 
-- League Tools tab:
-  - Project Manager
+- League Tools tab (file-format editors / utilities):
+  - WAD Archive Tool
+  - PropertyBin / CFGBin editors
+  - SKN/SKL, SCO/SCB mesh tools
   - Troybin Particle Editor
-  - WAD Tool
-  - Legacy and low-level format editors
+  - Materials.bin Manager, Map Porter, Materials.prey Export
+  - Map Patcher / Map11.bin Patcher, Character Bin Updater
 
 ## Screenshots
 

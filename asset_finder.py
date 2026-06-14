@@ -909,8 +909,9 @@ class ASSETFINDER_UL_missing(UIList):
 class VIEW3D_PT_asset_finder(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Mapgeo'
+    bl_category = 'LoL Mapgeo'
     bl_label = "Asset Finder"
+    bl_order = 3
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):

@@ -7,7 +7,7 @@ Description: A comprehensive tool to import, edit, and export League of Legends 
 bl_info = {
     "name": "Rey's Mapgeo Blender Addon",
     "author": "TheKillerey",
-    "version": (0, 4, 7),
+    "version": (0, 5, 0),
     "blender": (5, 0, 0),
     "location": "File > Import-Export, View3D > Sidebar > LoL Mapgeo, View3D > Sidebar > League Tools",
     "description": "Import, edit and export League of Legends .mapgeo files and more",
@@ -58,7 +58,10 @@ from . import (
     map_objects_import,
     materials_bin_manager,
     vfx_visualizer,
+    shaders_bin_ui,
     utils,
+    navgrid,
+    heightmap_ui,
 )
 
 _icon_previews = None
@@ -827,6 +830,8 @@ classes = (
     ui_panel.MAPGEO_OT_export_lightmaps,
     ui_panel.VIEW3D_PT_mapgeo_panel,
     ui_panel.VIEW3D_PT_mapgeo_layers_panel,
+    ui_panel.VIEW3D_PT_mapgeo_baron_panel,
+    ui_panel.VIEW3D_PT_mapgeo_regions_panel,
     ui_panel.VIEW3D_PT_mapgeo_experimental_panel,
     ui_panel.VIEW3D_PT_mapgeo_import_panel,
     ui_panel.VIEW3D_PT_mapgeo_export_panel,
@@ -970,6 +975,18 @@ def register():
     except Exception as e:
         print(f"[VFX Visualizer] Registration failed: {e}")
 
+    # Register experimental Shaders.bin catalog
+    try:
+        shaders_bin_ui.register()
+    except Exception as e:
+        print(f"[Shaders.bin Catalog] Registration failed: {e}")
+
+    # Register Heightmap Baker UI
+    try:
+        heightmap_ui.register()
+    except Exception as e:
+        print(f"[Heightmap Baker] Registration failed: {e}")
+
     # Register mapgeo debug tool
     try:
         mapgeo_debug.register()
@@ -1007,6 +1024,18 @@ def unregister():
         asset_finder.unregister()
     except Exception as e:
         print(f"[Asset Finder] Unregister failed: {e}")
+
+    # Unregister experimental Shaders.bin catalog
+    try:
+        shaders_bin_ui.unregister()
+    except Exception as e:
+        print(f"[Shaders.bin Catalog] Unregister failed: {e}")
+
+    # Unregister Heightmap Baker UI
+    try:
+        heightmap_ui.unregister()
+    except Exception as e:
+        print(f"[Heightmap Baker] Unregister failed: {e}")
 
     # Unregister VFX visualizer
     try:

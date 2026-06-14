@@ -1,4 +1,4 @@
-"""
+﻿"""
 Import Operator for Mapgeo Files
 Imports .mapgeo files into Blender as mesh objects
 """
@@ -1027,7 +1027,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 # Render region meshes use non-unit "normals" that contain game-specific data.
                 # Blender auto-normalizes normals to unit length, destroying this data.
                 # Store pre-swap raw normals so the exporter can write them back.
-                if normals and mesh_data.unknown_version18_int != 0:
+                if normals and mesh_data.render_region_hash != 0:
                     raw_attr = bl_mesh.attributes.new(name="raw_normals", type='FLOAT_VECTOR', domain='POINT')
                     n_verts = min(len(normals), len(bl_mesh.vertices))
                     raw_flat = [0.0] * (n_verts * 3)
@@ -1170,7 +1170,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     bushes_collection.objects.link(obj)
                 
                 # Link to RenderRegions collection if mesh has render region hash
-                if mesh_data.unknown_version18_int:
+                if mesh_data.render_region_hash:
                     render_regions_collection.objects.link(obj)
                 
                 # Apply transform
@@ -1225,8 +1225,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                     obj["baked_paint_bias"] = list(mesh_data.baked_paint_bias)
                 
                 # Version-specific fields (hex without 0x prefix)
-                if mesh_data.unknown_version18_int:
-                    obj["render_region_hash"] = f"{mesh_data.unknown_version18_int:08X}"  # Hex without 0x
+                if mesh_data.render_region_hash:
+                    obj["render_region_hash"] = f"{mesh_data.render_region_hash:08X}"  # Hex without 0x
                 if mesh_data.visibility_controller_path_hash:
                     # Baron Hash System: When set (non-zero), this OVERRIDES the dragon layer system
                     # The hash references a ChildMapVisibilityController in materials.bin
@@ -1489,12 +1489,8 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
             obj["buckets_per_side"] = grid.buckets_per_side
             obj["is_disabled"] = grid.is_disabled
             obj["flags"] = grid.flags
-            if grid.unknown_v18_float is not None:
-                # Store as hex string (interpreting float bytes as uint32)
-                import struct
-                float_bytes = struct.pack('<f', grid.unknown_v18_float)
-                uint_value = struct.unpack('<I', float_bytes)[0]
-                obj["unknown_v18_float"] = f"{uint_value:08X}"
+            # Render region hash (hex string, no 0x prefix)
+            obj["render_region_hash"] = f"{grid.render_region_hash:08X}"
             
             # Store face visibility flags if present
             if grid.face_visibility_flags:
@@ -1514,7 +1510,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 "buckets_per_side": grid.buckets_per_side,
                 "is_disabled": grid.is_disabled,
                 "flags": grid.flags,
-                "unknown_v18_float": f"{struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]:08X}" if grid.unknown_v18_float is not None else "00000000",
+                "render_region_hash": f"{grid.render_region_hash:08X}",
                 "max_stickout_x": grid.max_stickout_x,
                 "max_stickout_z": grid.max_stickout_z,
                 "vertices": [(v[0], v[1], v[2]) for v in grid.vertices],
@@ -2056,7 +2052,7 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                 return tuple(v / 255.0 for v in values)
         except Exception as e:
             # Debug: log what failed
-            log.warning("VertexBuffer", f"Failed to read element at offset {offset}, format {fmt}: {e}")
+            get_debug_log().warning("VertexBuffer", f"Failed to read element at offset {offset}, format {fmt}: {e}")
         
         return None
     
@@ -2564,7 +2560,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                                 color_attr.data[loop_idx].color = col[:4]
             
             # Raw normals preservation for render region meshes
-            if normals and mesh_data.unknown_version18_int != 0:
+            if normals and mesh_data.render_region_hash != 0:
                 raw_attr = bl_mesh.attributes.new(name="raw_normals", type='FLOAT_VECTOR', domain='POINT')
                 for vi in range(min(len(normals), len(bl_mesh.vertices))):
                     raw_attr.data[vi].vector = normals[vi]
@@ -2685,8 +2681,8 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                 obj["baked_paint_bias"] = list(mesh_data.baked_paint_bias)
             
             # Render region hash
-            if mesh_data.unknown_version18_int:
-                obj["render_region_hash"] = f"{mesh_data.unknown_version18_int:08X}"
+            if mesh_data.render_region_hash:
+                obj["render_region_hash"] = f"{mesh_data.render_region_hash:08X}"
             
             # Baron hash
             if mesh_data.visibility_controller_path_hash:

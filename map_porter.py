@@ -933,12 +933,18 @@ def diff_materials_bins(source_path: str, base_path: str) -> dict:
     src_entries = src_data.get("entries", [])
     base_entries = base_data.get("entries", [])
 
-    # Index base entries by path_hash for quick lookup
-    base_by_hash = {}
-    for e in base_entries:
-        ph = e.get("path_hash", "")
-        if ph:
-            base_by_hash[ph] = e
+    # Shared bin-diff core (single source of truth, see map_patcher.diff_entries).
+    # base = "from", source = "to": added = in source not base; modified = in both
+    # but content differs. Keeps live entry refs and treats unkeyed source entries
+    # as added, matching this module's original behavior.
+    from . import map_patcher
+    core = map_patcher.diff_entries(
+        base_entries, src_entries,
+        key_fn=lambda e: e.get("path_hash", ""),
+        equal_fn=lambda a, b: _entry_to_json_comparable(a) == _entry_to_json_comparable(b),
+        deepcopy_results=False,
+        keep_unkeyed_as_added=True,
+    )
 
     # Categorise differences
     categories = {}
@@ -946,20 +952,10 @@ def diff_materials_bins(source_path: str, base_path: str) -> dict:
                 "visibility", "banners", "jungle_camps", "navgrid", "extra"):
         categories[cat] = {"added": [], "modified": []}
 
-    for entry in src_entries:
-        ph = entry.get("path_hash", "")
-        cat = _prey_categorise(entry)
-
-        if ph not in base_by_hash:
-            # New entry — not in base
-            categories[cat]["added"].append(entry)
-        else:
-            # Exists in both — check if modified
-            base_entry = base_by_hash[ph]
-            src_json = _entry_to_json_comparable(entry)
-            base_json = _entry_to_json_comparable(base_entry)
-            if src_json != base_json:
-                categories[cat]["modified"].append(entry)
+    for entry in core["added"]:
+        categories[_prey_categorise(entry)]["added"].append(entry)
+    for entry in core["modified"]:
+        categories[_prey_categorise(entry)]["modified"].append(entry)
 
     # Linked files diff
     src_linked = src_data.get("linked_files", [])

@@ -1,4 +1,4 @@
-# Developer Guide: Import/Export Mapgeo Files
+﻿# Developer Guide: Import/Export Mapgeo Files
 
 This guide covers how to programmatically import and export League of Legends `.mapgeo` files using the Rey's Mapgeo Blender Addon.
 
@@ -70,7 +70,7 @@ Bucket grids subdivide map geometry for efficient spatial queries:
 ```
 BucketGrid {
     path_hash: uint32              # Baron/visibility_controller hash (or 0 for render regions)
-    unknown_v18_float: float       # Render region hash (or 0 for baron/VC grids)
+    render_region_hash: int       # Render region hash (or 0 for baron/VC grids)
     flags: uint32                  # Bit 1 = has face_visibility_flags
     buckets: 2D array              # Per-bucket vertex/index subsets
     face_visibility_flags: bytes   # Per-face visibility bitmask
@@ -79,9 +79,9 @@ BucketGrid {
 
 ### Hash Field Placement Rules
 
-The placement of hashes in `path_hash` vs `unknown_v18_float` depends on grid type:
+The placement of hashes in `path_hash` vs `render_region_hash` depends on grid type:
 
-| Grid Type | path_hash | unknown_v18_float | flags |
+| Grid Type | path_hash | render_region_hash | flags |
 |-----------|-----------|------------------|-------|
 | Render Region | 0 | Region hash | Variable |
 | Baron/VC | Baron or VC hash | 0 | Variable |
@@ -89,7 +89,7 @@ The placement of hashes in `path_hash` vs `unknown_v18_float` depends on grid ty
 
 **Important:** The master grid must:
 - Cover the entire map (largest bounds)
-- Have path_hash = 0 and unknown_v18_float = 0
+- Have path_hash = 0 and render_region_hash = 0
 - Have flags = 1 (face_visibility_flags present)
 - Contain all map faces via face visibility bitmask
 
@@ -136,7 +136,7 @@ bucket_grid_obj = bpy.data.objects["MapGeo.BucketGrid.0"]
 # Access metadata
 bucket_count = bucket_grid_obj.get("bucket_count")  # int
 path_hash = bucket_grid_obj.get("path_hash")        # hex string "0xDEADBEEF"
-unknown_v18 = bucket_grid_obj.get("unknown_v18_float")  # hex string or float
+render_region_hash = bucket_grid_obj.get("render_region_hash")  # hex string or float
 flags = bucket_grid_obj.get("flags")                # uint32
 buckets_per_side = bucket_grid_obj.get("buckets_per_side")  # int
 ```
@@ -186,8 +186,8 @@ custom_grids["hash_type"] = "render_region"  # or "baron", "master"
 ```
 
 Supported `hash_type` values:
-- `"render_region"` — unknown_v18_float contains region hash, path_hash = 0
-- `"baron"` — path_hash contains baron/VC hash, unknown_v18_float = 0
+- `"render_region"` — render_region_hash contains region hash, path_hash = 0
+- `"baron"` — path_hash contains baron/VC hash, render_region_hash = 0
 - `"master"` — Both hashes 0, flags = 1, covers full map
 
 ---
@@ -263,7 +263,7 @@ custom_grid["flags"] = 1                    # Face visibility flags present
 
 # Hash metadata (stored as hex strings for precision)
 custom_grid["path_hash"] = "0x0DD1C956"
-custom_grid["unknown_v18_float"] = "0x8E6A128E"
+custom_grid["render_region_hash"] = "0x8E6A128E"
 
 # Visibility (stored as hex)
 custom_grid["face_visibility_flags_hex"] = "FF..."  # Per-face bitmask
@@ -409,7 +409,7 @@ Check via JSON export:
 python mapgeo_debug.py custom.mapgeo custom.mapgeo.json
 ```
 
-Look for grid with "path_hash": 0 and "unknown_v18_float": 0.
+Look for grid with "path_hash": 0 and "render_region_hash": 0.
 
 #### Issue: Missing face visibility flags
 
@@ -504,7 +504,7 @@ grids_collection = bpy.data.collections.get("MapGeo.BucketGrids")
 for grid_obj in grids_collection.objects:
     if grid_obj.name.startswith("MapGeo.BucketGrid"):
         path_hash = grid_obj.get("path_hash")
-        v18 = grid_obj.get("unknown_v18_float")
+        v18 = grid_obj.get("render_region_hash")
         bucket_count = grid_obj.get("bucket_count")
         
         print(f"{grid_obj.name}:")

@@ -792,7 +792,8 @@ class VIEW3D_PT_mapgeo_panel(Panel):
     bl_category = 'LoL Mapgeo'
     bl_label = "Mapgeo Tools"
     bl_idname = "VIEW3D_PT_mapgeo_panel"
-    
+    bl_order = 1
+
     def draw(self, context):
         layout = self.layout
         settings = context.scene.mapgeo_settings
@@ -827,6 +828,7 @@ class VIEW3D_PT_mapgeo_panel(Panel):
         col.operator("import_scene.mapgeo", text="Import Mapgeo", icon='IMPORT')
         col.operator("export_scene.mapgeo", text="Export Mapgeo", icon='EXPORT')
         col.operator("mapgeo.setup_mesh", text="Setup Wizard", icon='PREFERENCES')
+        col.operator("mapgeo.initialize_custom_mesh", text="Quick Initialize Mesh", icon='CHECKMARK')
         if _operator_exists("mapgeo.reverse_selected_faces"):
             col.operator("mapgeo.reverse_selected_faces", text="Reverse Faces", icon='MOD_NORMALEDIT')
         if _operator_exists("mapgeo.select_same_oriented_faces"):
@@ -908,19 +910,7 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         
         # Layer operations
         layout.separator()
-        
-        # Custom mesh initialization
-        box = layout.box()
-        box.label(text="Custom Mesh Setup", icon='MESH_CUBE')
-        row = box.row()
-        row.scale_y = 1.2
-        row.operator("mapgeo.setup_mesh", text="Open Setup Wizard", icon='PREFERENCES')
-        row = box.row()
-        row.operator("mapgeo.initialize_custom_mesh", text="Quick Initialize", icon='CHECKMARK')
-        box.label(text="Wizard sets all mapgeo fields", icon='INFO')
-        
-        layout.separator()
-        
+
         box = layout.box()
         box.label(text="Layer Operations", icon='OUTLINER_DATA_MESH')
         
@@ -979,10 +969,22 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
         op.enable = True
         op = col.operator("mapgeo.assign_bush", text="Remove Bush from Selected")
         op.enable = False
-        
-        layout.separator()
-        
-        # ── Baron Hash Editor ──
+
+
+class VIEW3D_PT_mapgeo_baron_panel(Panel):
+    """Baron / visibility-controller hash editor"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "Baron Hash Editor"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 3
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.mapgeo_settings
+
         box = layout.box()
         box.label(text="Baron Hash Editor", icon='LIGHTPROBE_VOLUME')
 
@@ -1052,12 +1054,25 @@ class VIEW3D_PT_mapgeo_layers_panel(Panel):
             col.label(text=f"Computed Hash: {settings.baron_editor_computed_hash}", icon='KEYTYPE_JITTER_VEC')
         col.separator()
         col.operator("mapgeo.baron_create_new", text="Create & Assign to Selected", icon='PLUS')
-        
-        layout.separator()
-        
+
+
+class VIEW3D_PT_mapgeo_regions_panel(Panel):
+    """Render regions and bucket grid tools"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'LoL Mapgeo'
+    bl_label = "Render Regions & Bucket Grid"
+    bl_parent_id = "VIEW3D_PT_mapgeo_panel"
+    bl_order = 4
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.mapgeo_settings
+
         # Render Region Hash Assignment
         box = layout.box()
-        box.label(text="Render Region Hash Assignment", icon='MESH_GRID')
+        box.label(text="Render Regions", icon='MESH_GRID')
         
         col = box.column(align=True)
         col.prop(settings, "show_render_regions", text="Show Render Regions", toggle=True, icon='HIDE_OFF' if settings.show_render_regions else 'HIDE_ON')
@@ -1463,7 +1478,7 @@ class VIEW3D_PT_mapgeo_utilities_panel(Panel):
     bl_category = 'LoL Mapgeo'
     bl_label = "Utilities"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
-    bl_order = 4
+    bl_order = 6
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -1540,7 +1555,7 @@ class VIEW3D_PT_mapgeo_lightgrid_panel(Panel):
     bl_label = "Lighting & Baking"
     bl_idname = "VIEW3D_PT_mapgeo_lightgrid_panel"
     bl_parent_id = "VIEW3D_PT_mapgeo_panel"
-    bl_order = 3
+    bl_order = 5
     bl_options = {'DEFAULT_CLOSED'}
     
     def draw(self, context):
@@ -2403,7 +2418,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
 
     include_render_regions: bpy.props.BoolProperty(
         name="Include Render Regions",
-        description="Include meshes with render_region_hash (unknown_version18_int) in bucket grid generation",
+        description="Include meshes with a render region hash in bucket grid generation",
         default=True
     )
     
@@ -2558,7 +2573,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             # Determine path_hash/v18 and layer suffix based on hash type
             # Correct format: render_region hash → path_hash (v18=0)
             #                 baron/visibility hash → v18 (path_hash=0)
-            v18_hash = 0  # unknown_v18_float stored as uint32 bit pattern
+            v18_hash = 0  # render_region_hash (uint32)
             if hash_type == 'master':
                 path_hash = 0
                 v18_hash = 0
@@ -2903,9 +2918,9 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
             bucket_count = sum(len(row) for row in bucket_data) if bucket_data else 0
             grid_obj["bucket_count"] = bucket_count
             
-            # Store path_hash and unknown_v18_float matching import format
+            # Store path_hash and render_region_hash matching import format
             grid_obj["path_hash"] = f"{path_hash:08X}"
-            grid_obj["unknown_v18_float"] = f"{v18_hash:08X}"
+            grid_obj["render_region_hash"] = f"{v18_hash:08X}"
             grid_obj["flags"] = 1 if hash_type == 'master' else 0
             
             # Store detailed bucket grid data as JSON on the collection level (matches import structure)
@@ -2922,7 +2937,7 @@ class MAPGEO_OT_create_bucket_grid(bpy.types.Operator):
                 'buckets_per_side': buckets_per_side,
                 'is_disabled': False,
                 'flags': 1 if hash_type == 'master' else 0,
-                'unknown_v18_float': f"{v18_hash:08X}",  # Stored as hex string
+                'render_region_hash': f"{v18_hash:08X}",  # Stored as hex string
                 'max_stickout_x': global_max_stickout_x,
                 'max_stickout_z': global_max_stickout_z,
                 'vertices': [(v.x, v.z, v.y) for v in final_vertices],  # Blender→mapgeo coord swap
@@ -3330,7 +3345,7 @@ class MAPGEO_OT_import_render_regions_from_mapgeo(bpy.types.Operator):
     """Import render region meshes from another mapgeo file with full pipeline"""
     bl_idname = "mapgeo.import_render_regions_from_mapgeo"
     bl_label = "Import Render Regions from Mapgeo"
-    bl_description = "Import meshes with render region hash (unknown_version18_int != 0) with full materials/UVs/lightmaps"
+    bl_description = "Import meshes with render region hash (render_region_hash != 0) with full materials/UVs/lightmaps"
     bl_options = {'REGISTER', 'UNDO'}
     
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
@@ -3343,7 +3358,7 @@ class MAPGEO_OT_import_render_regions_from_mapgeo(bpy.types.Operator):
             # Filter: only meshes with render region hash != 0
             count, error = import_mapgeo.import_filtered_meshes(
                 context, self.filepath,
-                mesh_filter_fn=lambda idx, md, mgeo: (hasattr(md, 'unknown_version18_int') and md.unknown_version18_int != 0),
+                mesh_filter_fn=lambda idx, md, mgeo: (getattr(md, 'render_region_hash', 0) != 0),
                 collection_suffix="_RenderRegions"
             )
         except Exception as e:
@@ -3357,7 +3372,7 @@ class MAPGEO_OT_import_render_regions_from_mapgeo(bpy.types.Operator):
             return {'CANCELLED'}
         
         if count == 0:
-            self.report({'WARNING'}, "No render region meshes found (no unknown_version18_int != 0)")
+            self.report({'WARNING'}, "No render region meshes found (no render_region_hash != 0)")
             return {'CANCELLED'}
         
         self.report({'INFO'}, f"Imported {count} render region meshes from {os.path.basename(self.filepath)}")
@@ -3520,12 +3535,8 @@ class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
             obj["is_disabled"] = grid.is_disabled
             obj["flags"] = grid.flags
             
-            # Convert unknown_v18_float to hex string for consistency
-            if grid.unknown_v18_float is not None:
-                import struct
-                float_bytes = struct.pack('<f', grid.unknown_v18_float)
-                uint_value = struct.unpack('<I', float_bytes)[0]
-                obj["unknown_v18_float"] = f"{uint_value:08X}"
+            # Render region hash as hex string for consistency
+            obj["render_region_hash"] = f"{grid.render_region_hash:08X}"
             
             # Store face visibility flags
             if grid.face_visibility_flags:
@@ -3578,7 +3589,7 @@ class MAPGEO_OT_import_bucket_grid_from_mapgeo(bpy.types.Operator):
                 "buckets_per_side": grid.buckets_per_side,
                 "is_disabled": grid.is_disabled,
                 "flags": grid.flags,
-                "unknown_v18_float": f"{struct.unpack('<I', struct.pack('<f', grid.unknown_v18_float))[0]:08X}",
+                "render_region_hash": f"{grid.render_region_hash:08X}",
                 "max_stickout_x": grid.max_stickout_x,
                 "max_stickout_z": grid.max_stickout_z,
                 "vertices": [(v[0], v[1], v[2]) for v in grid.vertices] if grid.vertices else [],
@@ -5148,6 +5159,8 @@ classes = (
     MAPGEO_OT_enable_decal_transparency_overlap,
     VIEW3D_PT_mapgeo_panel,
     VIEW3D_PT_mapgeo_layers_panel,
+    VIEW3D_PT_mapgeo_baron_panel,
+    VIEW3D_PT_mapgeo_regions_panel,
     VIEW3D_PT_mapgeo_experimental_panel,
     VIEW3D_PT_mapgeo_import_panel,
     VIEW3D_PT_mapgeo_export_panel,

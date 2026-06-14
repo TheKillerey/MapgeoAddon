@@ -1275,7 +1275,7 @@ def run_checks(project_settings, checker_settings=None) -> list:
         # bucket grids.
         render_region_hashes = set()
         for mesh in mapgeo_data.meshes:
-            rr = mesh.unknown_version18_int
+            rr = mesh.render_region_hash
             if rr and rr != 0:
                 render_region_hashes.add(f"0x{rr:08x}")
 

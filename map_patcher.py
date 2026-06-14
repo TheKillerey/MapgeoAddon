@@ -205,25 +205,65 @@ def _load_bin_entries(path: str) -> list:
 # Diff creation / apply (in-memory variant for chaining)
 # ---------------------------------------------------------------------------
 
-def _create_diff(from_entries: list, to_entries: list) -> dict:
-    """Create an in-memory diff dict from two entry lists."""
-    from_index = {_entry_key(e): e for e in from_entries if _entry_key(e)}
-    to_index = {_entry_key(e): e for e in to_entries if _entry_key(e)}
+def diff_entries(from_entries: list, to_entries: list, key_fn, equal_fn,
+                 deepcopy_results: bool = False,
+                 keep_unkeyed_as_added: bool = False) -> dict:
+    """Generic entry-level diff — the single shared bin-diff primitive.
+
+    Indexes both entry lists by ``key_fn`` and classifies every ``to`` entry as
+    added (key absent in ``from``) or modified (present but ``equal_fn`` is
+    False), plus the keys present only in ``from`` as removed.
+
+    Callers supply their own ``key_fn`` / ``equal_fn`` so each preserves its own
+    notion of identity and equality (``map_patcher`` keys on a normalized
+    path_hash + fingerprint equality; ``map_porter`` keys on the raw path_hash +
+    JSON-comparable equality).
+
+    Args:
+        deepcopy_results: deep-copy entries placed into added/modified
+            (``map_patcher`` needs this; ``map_porter`` keeps live references).
+        keep_unkeyed_as_added: when a ``to`` entry has a falsy key, treat it as
+            added instead of skipping it (``map_porter`` behavior).
+    """
+    _c = copy.deepcopy if deepcopy_results else (lambda x: x)
+
+    from_index = {}
+    for e in from_entries:
+        k = key_fn(e)
+        if k:
+            from_index[k] = e
 
     added, modified, removed = [], [], []
-
-    for key, to_entry in to_index.items():
-        if key not in from_index:
-            added.append(copy.deepcopy(to_entry))
+    seen_to = set()
+    for e in to_entries:
+        k = key_fn(e)
+        if not k:
+            if keep_unkeyed_as_added:
+                added.append(_c(e))
             continue
-        if _entry_fingerprint(from_index[key]) != _entry_fingerprint(to_entry):
-            modified.append(copy.deepcopy(to_entry))
+        seen_to.add(k)
+        if k not in from_index:
+            added.append(_c(e))
+        elif not equal_fn(from_index[k], e):
+            modified.append(_c(e))
 
-    for key in from_index:
-        if key not in to_index:
-            removed.append(key)
+    for k in from_index:
+        if k not in seen_to:
+            removed.append(k)
 
-    return {"added": added, "modified": modified, "removed": sorted(removed)}
+    return {"added": added, "modified": modified, "removed": removed}
+
+
+def _create_diff(from_entries: list, to_entries: list) -> dict:
+    """Create an in-memory diff dict from two entry lists."""
+    diff = diff_entries(
+        from_entries, to_entries,
+        key_fn=_entry_key,
+        equal_fn=lambda a, b: _entry_fingerprint(a) == _entry_fingerprint(b),
+        deepcopy_results=True,
+    )
+    diff["removed"] = sorted(diff["removed"])
+    return diff
 
 
 def _apply_diff_to_entries(entries: list, diff: dict, options: dict | None = None) -> list:
@@ -304,6 +344,26 @@ def create_diff_file(from_path: str, to_path: str, diff_path: str,
         "removed": len(diff["removed"]),
         "path": diff_path,
     }
+
+
+def _build_map11bin_url(channel: str) -> str:
+    ch = (channel or "latest").strip().strip("/")
+    return f"{_CDRAGON_BASE}/{ch}/game/data/maps/shipping/map11/map11.bin"
+
+
+def _download_map11bin(channel: str) -> str:
+    """Download map11.bin from CommunityDragon. Returns local path."""
+    url = _build_map11bin_url(channel)
+    out_dir = os.path.join(_get_download_dir(), "map11", "shipping")
+    os.makedirs(out_dir, exist_ok=True)
+    safe_ch = channel.replace("/", "_").replace("\\", "_")
+    out_path = os.path.join(out_dir, f"{safe_ch}.map11.bin")
+    req = request.Request(url, headers=_USER_AGENT)
+    with request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return out_path
 
 
 def apply_diff_file(diff_path: str, target_bin_path: str, options: dict | None = None) -> dict:
@@ -819,17 +879,266 @@ class VIEW3D_PT_map_patcher(Panel):
 
 
 # ---------------------------------------------------------------------------
+# Map11.bin Patcher – standalone sequential patcher for map11.bin
+# ---------------------------------------------------------------------------
+
+class Map11BinPatcherSettings(PropertyGroup):
+    old_channel: StringProperty(
+        name="Old Patch",
+        description="CommunityDragon channel for the old patch (e.g. 16.9)",
+        default="16.9",
+    )
+    new_channel: StringProperty(
+        name="New Patch",
+        description="CommunityDragon channel for the new patch (e.g. latest)",
+        default="latest",
+    )
+    apply_target_file: StringProperty(
+        name="Apply To",
+        description="Local map11.bin to patch",
+        subtype="FILE_PATH",
+        default="",
+    )
+    status_text: StringProperty(name="Status", default="")
+    apply_added: BoolProperty(
+        name="Apply Added",
+        description="Apply newly added entries from the diff",
+        default=True,
+    )
+    apply_modified: BoolProperty(
+        name="Apply Modified",
+        description="Apply modified entries from the diff",
+        default=True,
+    )
+    apply_removed: BoolProperty(
+        name="Apply Removed",
+        description="Remove entries listed as removed in the diff",
+        default=True,
+    )
+    preserve_texture_paths: BoolProperty(
+        name="Preserve Custom Textures (Prey)",
+        description="Keep existing texture asset paths from the target file when applying modifications",
+        default=False,
+    )
+
+
+class MAP11BIN_OT_pick_file(Operator):
+    """Select the local map11.bin to patch"""
+
+    bl_idname = "map11bin_patcher.pick_file"
+    bl_label = "Pick map11.bin"
+
+    filepath: StringProperty(subtype="FILE_PATH")
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        context.scene.map11bin_patcher_settings.apply_target_file = self.filepath
+        return {"FINISHED"}
+
+
+class MAP11BIN_OT_patch_all(Operator):
+    """Download every intermediate map11.bin, diff, and apply sequentially"""
+
+    bl_idname = "map11bin_patcher.patch_all"
+    bl_label = "Patch All Steps"
+    bl_description = (
+        "Downloads all intermediate map11.bin versions between Old and New, "
+        "then applies each diff step-by-step to the target file"
+    )
+
+    def execute(self, context):
+        settings = context.scene.map11bin_patcher_settings
+        target_path = bpy.path.abspath(settings.apply_target_file)
+
+        if not target_path or not os.path.isfile(target_path):
+            self.report({"ERROR"}, "Apply To file not set or not found")
+            return {"CANCELLED"}
+
+        old_ch = settings.old_channel.strip()
+        new_ch = settings.new_channel.strip()
+        if not old_ch or not new_ch:
+            self.report({"ERROR"}, "Old Patch and New Patch channels must be set")
+            return {"CANCELLED"}
+
+        options = {
+            "apply_added": bool(settings.apply_added),
+            "apply_modified": bool(settings.apply_modified),
+            "apply_removed": bool(settings.apply_removed),
+            "preserve_texture_paths": bool(settings.preserve_texture_paths),
+        }
+
+        # 1. Fetch available versions -----------------------------------------
+        settings.status_text = "Fetching CDragon version list..."
+        try:
+            all_versions = _fetch_cdragon_versions()
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to fetch CDragon versions: {e}")
+            settings.status_text = "Error fetching versions"
+            return {"CANCELLED"}
+
+        # 2. Build patch chain ------------------------------------------------
+        chain = _build_patch_chain(old_ch, new_ch, all_versions)
+        if len(chain) < 2:
+            self.report({"ERROR"}, f"No patches found between {old_ch} and {new_ch}")
+            settings.status_text = ""
+            return {"CANCELLED"}
+
+        total_steps = len(chain) - 1
+        settings.status_text = f"Patch chain: {' → '.join(chain)} ({total_steps} steps)"
+        print(f"[Map11Bin Patcher] Patch chain: {' → '.join(chain)}")
+
+        # 3. Download all versions in the chain --------------------------------
+        downloaded = {}
+        for i, ver in enumerate(chain):
+            settings.status_text = f"Downloading {ver} ({i+1}/{len(chain)})..."
+            try:
+                path = _download_map11bin(ver)
+                downloaded[ver] = path
+                print(f"[Map11Bin Patcher] Downloaded {ver} → {path}")
+            except Exception as e:
+                self.report({"ERROR"}, f"Download failed for patch {ver}: {e}")
+                settings.status_text = f"Error downloading {ver}"
+                return {"CANCELLED"}
+
+        # 4. Backup the target file once before patching -----------------------
+        backup_path = target_path + ".bak_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(target_path, backup_path)
+        print(f"[Map11Bin Patcher] Backup created: {backup_path}")
+
+        # 5. Apply diffs step by step ------------------------------------------
+        data = propertybin_parser.parse_bin(target_path)
+        entries = list(data.get("entries", []))
+
+        total_added = 0
+        total_modified = 0
+        total_removed = 0
+
+        diff_dir = os.path.join(_get_download_dir(), "map11", "shipping", "diffs")
+        os.makedirs(diff_dir, exist_ok=True)
+
+        for step in range(total_steps):
+            ver_a = chain[step]
+            ver_b = chain[step + 1]
+            settings.status_text = f"Diffing {ver_a} → {ver_b} (step {step+1}/{total_steps})..."
+
+            entries_a = _load_bin_entries(downloaded[ver_a])
+            entries_b = _load_bin_entries(downloaded[ver_b])
+            diff = _create_diff(entries_a, entries_b)
+
+            n_add_raw = len(diff["added"])
+            n_mod_raw = len(diff["modified"])
+            n_rem_raw = len(diff["removed"])
+            n_add = n_add_raw if options.get("apply_added") else 0
+            n_mod = _count_applied_modified_entries(diff, options)
+            n_rem = n_rem_raw if options.get("apply_removed") else 0
+            print(
+                f"[Map11Bin Patcher] {ver_a} → {ver_b}: "
+                f"raw +{n_add_raw} ~{n_mod_raw} -{n_rem_raw} | "
+                f"applied +{n_add} ~{n_mod} -{n_rem}"
+            )
+
+            if n_add_raw == 0 and n_mod_raw == 0 and n_rem_raw == 0:
+                print(f"[Map11Bin Patcher] {ver_a} → {ver_b}: no changes, skipping")
+                continue
+
+            # Save diff file for reference
+            diff_data = {
+                "format": _DIFF_FORMAT,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "old_channel": ver_a,
+                "new_channel": ver_b,
+                "from_file": f"{ver_a}.map11.bin",
+                "to_file": f"{ver_b}.map11.bin",
+                **diff,
+            }
+            diff_file_path = os.path.join(diff_dir, f"{ver_a}_to_{ver_b}.map11_patch.json")
+            with open(diff_file_path, "w", encoding="utf-8") as f:
+                json.dump(diff_data, f, indent=2, ensure_ascii=True)
+
+            entries = _apply_diff_to_entries(entries, diff, options=options)
+            total_added += n_add
+            total_modified += n_mod
+            total_removed += n_rem
+
+        # 6. Write the final result -------------------------------------------
+        data["entries"] = entries
+        data["entry_count"] = len(entries)
+        propertybin_parser.write_bin(data, target_path)
+
+        summary = (
+            f"Done! {total_steps} steps ({chain[0]} → {chain[-1]}): "
+            f"+{total_added} ~{total_modified} -{total_removed}"
+        )
+        settings.status_text = summary
+        self.report({"INFO"}, summary)
+        print(f"[Map11Bin Patcher] {summary}")
+        return {"FINISHED"}
+
+
+class VIEW3D_PT_map11bin_patcher(Panel):
+    """Map11.bin Patcher – sequential patch updater for map11.bin"""
+
+    bl_label = "Map11.bin Patcher"
+    bl_idname = "VIEW3D_PT_map11bin_patcher"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "League Tools"
+    bl_order = 91
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.map11bin_patcher_settings
+
+        box = layout.box()
+        box.label(text="CommunityDragon Channels", icon="URL")
+        row = box.row(align=True)
+        split = row.split(factor=0.5, align=True)
+        split.prop(settings, "old_channel")
+        split.prop(settings, "new_channel")
+
+        box = layout.box()
+        box.label(text="Target map11.bin", icon="FILE")
+        row = box.row(align=True)
+        row.prop(settings, "apply_target_file", text="")
+        row.operator("map11bin_patcher.pick_file", text="", icon="FILEBROWSER")
+
+        box = layout.box()
+        box.label(text="Options", icon="PREFERENCES")
+        row = box.row(align=True)
+        row.prop(settings, "apply_added")
+        row.prop(settings, "apply_modified")
+        row.prop(settings, "apply_removed")
+        box.prop(settings, "preserve_texture_paths")
+
+        layout.operator("map11bin_patcher.patch_all", text="Patch All Steps", icon="PLAY")
+
+        if settings.status_text:
+            info = layout.box()
+            info.scale_y = 0.7
+            for line in settings.status_text.split("\n"):
+                info.label(text=line)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 classes = (
     MapPatcherSettings,
+    Map11BinPatcherSettings,
     MAPPATCHER_OT_pick_file,
     MAPPATCHER_OT_download,
     MAPPATCHER_OT_create_diff,
     MAPPATCHER_OT_apply_diff,
     MAPPATCHER_OT_patch_all,
     VIEW3D_PT_map_patcher,
+    MAP11BIN_OT_pick_file,
+    MAP11BIN_OT_patch_all,
+    VIEW3D_PT_map11bin_patcher,
 )
 
 
@@ -837,9 +1146,12 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.map_patcher_settings = bpy.props.PointerProperty(type=MapPatcherSettings)
+    bpy.types.Scene.map11bin_patcher_settings = bpy.props.PointerProperty(type=Map11BinPatcherSettings)
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "map11bin_patcher_settings"):
+        del bpy.types.Scene.map11bin_patcher_settings
     if hasattr(bpy.types.Scene, "map_patcher_settings"):
         del bpy.types.Scene.map_patcher_settings
     for cls in reversed(classes):

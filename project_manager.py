@@ -5824,7 +5824,7 @@ class VIEW3D_PT_prey_categories(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "League Tools"
-    bl_order = 82
+    bl_order = 83
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
