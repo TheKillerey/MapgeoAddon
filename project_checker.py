@@ -249,6 +249,13 @@ def _tex_exists(tex_path: str, roots: list) -> bool:
     extension (e.g. materials.bin references foo.dds but the project
     actually contains foo.tex \u2014 still considered present).
     """
+    from . import wad_links
+    if wad_links.is_link_hex(tex_path):
+        # Unnamed type-18 link (16.17+): match by hash against <root>/assets
+        asset_dirs = [os.path.join(r, 'assets') for r in roots if r]
+        return wad_links.find_file_for_link(
+            tex_path, [d for d in asset_dirs if os.path.isdir(d)]) is not None
+
     tex_norm = tex_path.replace('\\', '/')
     base, ext = os.path.splitext(tex_norm)
     # Candidate extensions: the requested one first (case-insensitive), then
@@ -304,7 +311,9 @@ def _is_known_riot_texture_path(tex_path: str):
         _riot_hash_bootstrap_done = True
 
     try:
-        h = wad_tool.xxhash64_path(norm)
+        from . import wad_links
+        # An unnamed type-18 link is already the WAD hash
+        h = int(norm, 16) if wad_links.is_link_hex(norm) else wad_tool.xxhash64_path(norm)
         ok = wad_tool.resolve_wad_hash(h) is not None
     except Exception:
         ok = None

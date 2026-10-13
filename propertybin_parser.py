@@ -13,6 +13,11 @@ import struct
 from pathlib import Path
 import re
 
+try:
+    from . import wad_links as _wad_links
+except ImportError:  # standalone use outside the add-on package
+    import wad_links as _wad_links
+
 
 # ============================================================================
 # FNV-1a Hash
@@ -1183,6 +1188,10 @@ def _format_leaf_value(node: dict) -> str:
     if type_id == TYPE_F32:
         return f"{val:.6g}"
 
+    if type_id == TYPE_FILE:
+        # WAD link: show the path when a hash table / asset folder names it
+        return _wad_links.link_to_text(val) or str(val)
+
     if isinstance(val, str):
         return val
 
@@ -1244,7 +1253,8 @@ def parse_leaf_value(type_id: int, text: str):
         return text
 
     if type_id == TYPE_FILE:
-        return text  # Keep as hex string
+        # WAD link: keep "0x%016x" as is, hash a typed path (lowercased xxh64)
+        return _wad_links.text_to_link(text)
 
     return text
 

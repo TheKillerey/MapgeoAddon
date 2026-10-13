@@ -34,104 +34,15 @@ from pathlib import Path
 
 
 # ============================================================================
-# XXHash64 Implementation (pure Python, no external deps)
+# XXHash64 (shared pure-Python implementation lives in wad_links)
 # ============================================================================
 
-_XXHASH64_PRIME1 = 0x9E3779B185EBCA87
-_XXHASH64_PRIME2 = 0xC2B2AE3D27D4EB4F
-_XXHASH64_PRIME3 = 0x165667B19E3779F9
-_XXHASH64_PRIME4 = 0x85EBCA77C2B2AE63
-_XXHASH64_PRIME5 = 0x27D4EB2F165667C5
-_U64 = 0xFFFFFFFFFFFFFFFF
-
-
-def _rotl64(v: int, n: int) -> int:
-    return ((v << n) | (v >> (64 - n))) & _U64
-
-
-def _round64(acc: int, inp: int) -> int:
-    acc = (acc + inp * _XXHASH64_PRIME2) & _U64
-    acc = _rotl64(acc, 31)
-    acc = (acc * _XXHASH64_PRIME1) & _U64
-    return acc
-
-
-def _merge_round64(acc: int, val: int) -> int:
-    val = _round64(0, val)
-    acc = (acc ^ val) & _U64
-    acc = (acc * _XXHASH64_PRIME1 + _XXHASH64_PRIME4) & _U64
-    return acc
-
-
-def xxhash64(data: bytes, seed: int = 0) -> int:
-    """Compute XXHash64 of bytes with optional seed. Returns u64."""
-    length = len(data)
-    idx = 0
-    h64 = 0
-
-    if length >= 32:
-        v1 = (seed + _XXHASH64_PRIME1 + _XXHASH64_PRIME2) & _U64
-        v2 = (seed + _XXHASH64_PRIME2) & _U64
-        v3 = seed & _U64
-        v4 = (seed - _XXHASH64_PRIME1) & _U64
-
-        while idx <= length - 32:
-            k1 = struct.unpack_from('<Q', data, idx)[0]
-            k2 = struct.unpack_from('<Q', data, idx + 8)[0]
-            k3 = struct.unpack_from('<Q', data, idx + 16)[0]
-            k4 = struct.unpack_from('<Q', data, idx + 24)[0]
-            v1 = _round64(v1, k1)
-            v2 = _round64(v2, k2)
-            v3 = _round64(v3, k3)
-            v4 = _round64(v4, k4)
-            idx += 32
-
-        h64 = (_rotl64(v1, 1) + _rotl64(v2, 7) + _rotl64(v3, 12) + _rotl64(v4, 18)) & _U64
-        h64 = _merge_round64(h64, v1)
-        h64 = _merge_round64(h64, v2)
-        h64 = _merge_round64(h64, v3)
-        h64 = _merge_round64(h64, v4)
-    else:
-        h64 = (seed + _XXHASH64_PRIME5) & _U64
-
-    h64 = (h64 + length) & _U64
-
-    # Process remaining 8-byte chunks
-    while idx <= length - 8:
-        k1 = struct.unpack_from('<Q', data, idx)[0]
-        k1 = (k1 * _XXHASH64_PRIME2) & _U64
-        k1 = _rotl64(k1, 31)
-        k1 = (k1 * _XXHASH64_PRIME1) & _U64
-        h64 = (h64 ^ k1) & _U64
-        h64 = (_rotl64(h64, 27) * _XXHASH64_PRIME1 + _XXHASH64_PRIME4) & _U64
-        idx += 8
-
-    # Process remaining 4-byte chunk
-    if idx <= length - 4:
-        k1 = struct.unpack_from('<I', data, idx)[0]
-        h64 = (h64 ^ (k1 * _XXHASH64_PRIME1)) & _U64
-        h64 = (_rotl64(h64, 23) * _XXHASH64_PRIME2 + _XXHASH64_PRIME3) & _U64
-        idx += 4
-
-    # Process remaining bytes
-    while idx < length:
-        h64 = (h64 ^ (data[idx] * _XXHASH64_PRIME5)) & _U64
-        h64 = (_rotl64(h64, 11) * _XXHASH64_PRIME1) & _U64
-        idx += 1
-
-    # Avalanche
-    h64 = (h64 ^ (h64 >> 33)) & _U64
-    h64 = (h64 * _XXHASH64_PRIME2) & _U64
-    h64 = (h64 ^ (h64 >> 29)) & _U64
-    h64 = (h64 * _XXHASH64_PRIME3) & _U64
-    h64 = (h64 ^ (h64 >> 32)) & _U64
-
-    return h64
-
-
-def xxhash64_path(path: str) -> int:
-    """Compute XXHash64 of a League file path (lowercased, forward slashes)."""
-    return xxhash64(path.lower().replace('\\', '/').encode('utf-8'))
+try:
+    from .wad_links import xxhash64, xxhash64_path
+    from . import wad_links as _wad_links
+except ImportError:  # standalone use outside the add-on package
+    from wad_links import xxhash64, xxhash64_path
+    import wad_links as _wad_links
 
 
 # ============================================================================
@@ -770,29 +681,18 @@ def extract_wad(wad: WadArchive, output_dir: str, filter_ext: str = "",
 def _guess_extension(wad: WadArchive, entry: WadEntry) -> str:
     """Try to guess file extension from file header magic bytes."""
     try:
-        with open(wad.filepath, 'rb') as f:
-            f.seek(entry.offset)
-            header = f.read(min(entry.compressed_size, 16))
-
-        # If compressed, decompress a small chunk for detection
-        if entry.entry_type == ENTRY_GZIP:
+        if entry.entry_type in (ENTRY_UNCOMPRESSED, ENTRY_SATELLITE):
+            with open(wad.filepath, 'rb') as f:
+                f.seek(entry.offset)
+                header = f.read(min(entry.compressed_size, 16))
+        else:
+            # A truncated compressed prefix does not decode (a zstd block can be
+            # far larger than any fixed sample), which left every compressed
+            # unnamed chunk - textures included - as ".dat".  Decode the entry.
             try:
-                header = gzip.decompress(header[:256] if entry.compressed_size > 256 else header)[:16]
+                header = read_entry_data(wad, entry)[:16]
             except Exception:
-                pass
-        elif entry.entry_type in (ENTRY_ZSTD, ENTRY_ZSTD_CHUNKED):
-            try:
-                import zstandard as zstd
-                import io as _io
-                dctx = zstd.ZstdDecompressor()
-                sample = header[:256] if entry.compressed_size > 256 else header
-                try:
-                    reader = dctx.stream_reader(_io.BytesIO(sample), read_across_frames=True)
-                    header = reader.read(64)[:16]
-                except TypeError:
-                    header = dctx.decompress(sample, max_output_size=64)[:16]
-            except Exception:
-                pass
+                header = b''
 
         # Check common magic bytes
         if header[:4] == b'PROP':
@@ -1711,11 +1611,14 @@ def register():
 
     # Auto-load cached WAD hashes
     load_wad_hashes()
+    # Let bin type-18 links (texturePath since 16.17) resolve through these tables
+    _wad_links.register_resolver(resolve_wad_hash)
 
     print("[WAD Tool] Registered")
 
 
 def unregister():
+    _wad_links.unregister_resolver(resolve_wad_hash)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import_wad)
     del bpy.types.Scene.wad_entry_list
     del bpy.types.Scene.wad_tool_settings

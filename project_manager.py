@@ -25,6 +25,8 @@ from bpy.props import (
 from bpy.types import PropertyGroup, Operator, Panel, UIList
 from pathlib import Path
 
+from . import wad_links
+
 
 # ============================================================================
 # Constants — Known Map IDs
@@ -1285,8 +1287,11 @@ def convert_bin_entry_to_material_dict(entry: dict) -> dict | None:
             sampler = {
                 'textureName': tex_name_f['value'] if tex_name_f else '',
                 'TextureName': tex_name_f['value'] if tex_name_f else '',
-                'texturePath': tex_path_f['value'] if tex_path_f else '',
+                # 16.17+: type-18 WAD link -> readable path (or "0x%016x" if unnamed)
+                'texturePath': wad_links.field_text(tex_path_f),
             }
+            if tex_path_f:
+                sampler['texturePathType'] = tex_path_f.get('type', wad_links.TYPE_STRING)
             if addr_u_f:
                 sampler['addressU'] = addr_u_f['value']
             if addr_v_f:
@@ -2449,8 +2454,9 @@ def _update_bin_material_from_blender(entry: dict, blender_mat) -> bool:
                     if sv_entry:
                         sf = sv_entry.get('fields', [])
                         tp = _get_embedded_field_by_hash(sf, HASH_TEXTURE_PATH)
-                        if tp and tp['value'] != tex_path:
-                            tp['value'] = tex_path
+                        # Keeps the field's wire type: a type-18 link gets the
+                        # hash of the (lowercased) path, a String the path.
+                        if tp and wad_links.set_field_text(tp, tex_path):
                             changed = True
                         # Update address modes if present
                         for addr_key, addr_hash in [('addressU', HASH_ADDRESS_U),
@@ -3546,13 +3552,13 @@ def _migrate_legacy_sampler_field(dst_sampler_field: dict, ref_sampler_field: di
             if dst_path_f is None:
                 dst_path_f = {
                     'name_hash': f"0x{HASH_TEXTURE_PATH:08x}",
-                    'type': 16,
-                    'value': new_path,
+                    'type': wad_links.NEW_TEXTURE_PATH_TYPE,
+                    'value': wad_links.text_to_field_value(wad_links.NEW_TEXTURE_PATH_TYPE, new_path),
                     'name_hash_int': HASH_TEXTURE_PATH,
                 }
                 dst_fields.append(dst_path_f)
             else:
-                dst_path_f['value'] = new_path
+                wad_links.set_field_text(dst_path_f, new_path)
 
             # Remove legacy samplerName field
             dst_fields[:] = [f for f in dst_fields
@@ -3598,14 +3604,13 @@ def _migrate_legacy_sampler_field(dst_sampler_field: dict, ref_sampler_field: di
     if dst_path_f is None:
         dst_path_f = {
             'name_hash': f"0x{HASH_TEXTURE_PATH:08x}",
-            'type': 16,
-            'value': new_path,
+            'type': wad_links.NEW_TEXTURE_PATH_TYPE,
+            'value': wad_links.text_to_field_value(wad_links.NEW_TEXTURE_PATH_TYPE, new_path),
             'name_hash_int': HASH_TEXTURE_PATH,
         }
         dst_fields.append(dst_path_f)
         changed = True
-    elif dst_path_f.get('value') != new_path:
-        dst_path_f['value'] = new_path
+    elif wad_links.set_field_text(dst_path_f, new_path):
         changed = True
 
     return changed

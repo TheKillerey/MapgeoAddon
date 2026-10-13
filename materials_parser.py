@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict, field
 
+try:
+    from . import wad_links
+except ImportError:  # standalone use outside the add-on package
+    import wad_links
+
 # ============================================================================
 # Data Classes
 # ============================================================================
@@ -21,7 +26,10 @@ class MaterialSampler:
     addressU: Optional[int] = None  # None = not present in original
     addressV: Optional[int] = None
     addressW: Optional[int] = None
-    
+    # Wire type of texturePath: 16 = String, 18 = WAD link ("file", 16.17+).
+    # None = unknown; written as a link (the current schema).
+    texturePathType: Optional[int] = None
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -326,12 +334,14 @@ class MaterialsParser:
         for sampler_content in self._iter_blocks(content, "StaticMaterialShaderSamplerDef"):
             
             tex_name_match = re.search(r'textureName:\s*string\s*=\s*"([^"]*)"', sampler_content)
-            tex_path_match = re.search(r'texturePath:\s*string\s*=\s*"([^"]*)"', sampler_content)
-            
+            # String before 16.17, "file" (WAD link) since
+            tex_path_match = wad_links.parse_text_path_field(sampler_content, 'texturePath')
+
             if tex_name_match:
                 sampler = MaterialSampler(
                     textureName=tex_name_match.group(1),
-                    texturePath=tex_path_match.group(1) if tex_path_match else ""
+                    texturePath=tex_path_match[0] if tex_path_match else "",
+                    texturePathType=tex_path_match[1] if tex_path_match else None,
                 )
                 
                 # Parse address modes
@@ -617,7 +627,9 @@ class MaterialsExporter:
             for sampler in material.samplerValues:
                 lines.append("            StaticMaterialShaderSamplerDef {")
                 lines.append(f'                textureName: string = "{sampler.textureName}"')
-                lines.append(f'                texturePath: string = "{sampler.texturePath}"')
+                path_type = sampler.texturePathType or wad_links.NEW_TEXTURE_PATH_TYPE
+                lines.append('                ' + wad_links.format_text_path_field(
+                    'texturePath', sampler.texturePath, path_type))
                 if sampler.addressU is not None:
                     lines.append(f"                addressU: u32 = {sampler.addressU}")
                 if sampler.addressV is not None:

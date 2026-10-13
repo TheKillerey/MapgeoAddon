@@ -18,6 +18,16 @@ from . import utils
 from . import import_mapgeo
 
 
+def _league_material_name(mat):
+    """Material name to write into a primitive.
+
+    The importer gives Blender materials unique names per lightmap / texture
+    override ("<name>_lm<hash>", "<name>_to<hash>") and keeps the League name
+    in "league_material_name"; the mapgeo must reference the League name or the
+    game cannot find the StaticMaterialDef."""
+    return mat.get("league_material_name") or mat.name
+
+
 class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
     """Export to League of Legends Mapgeo file"""
     bl_idname = "export_scene.mapgeo"
@@ -540,9 +550,9 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                         offset=offset
                     )
                     elements.append(elem)
-                    # Calculate offset for next element
-                    fmt_sizes = {0: 4, 1: 8, 2: 12, 3: 16, 4: 4, 5: 4, 6: 4, 7: 4, 8: 6, 9: 8, 10: 2, 11: 3, 12: 4}
-                    offset += fmt_sizes.get(elem_data["format"], 4)
+                    # Offset of the next element: one size table for the whole
+                    # add-on (XYZ_PACKED161616 is 8 bytes - padded - in real files)
+                    offset += mapgeo_parser.VertexElement.get_format_size(elem_data["format"]) or 4
                 desc = mapgeo_parser.VertexBufferDescription(
                     usage=desc_data["usage"],
                     elements=elements
@@ -731,6 +741,54 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         print(f"Buffer dedup (instancing): {vb_saved} vertex + {ib_saved} index "
               f"buffer(s) shared, {saved_bytes:,} bytes saved")
 
+    @staticmethod
+    def _lightmap_file_uvs(mesh, obj, lightmap_uv_layer, vert_to_loops):
+        """Per-vertex TEXCOORD7 in FILE space, or None without a LightmapUV layer.
+
+        Import shows LightmapUV in atlas space: uv = raw * BakedLight.scale + bias
+        (V flipped).  The mesh entry re-emits that scale/bias, so the vertex
+        buffer must hold the raw value again or the game applies it twice.
+        Unchanged vertices write the raw value the importer kept (exact
+        round-trip); edited ones invert scale/bias; with a zero scale the
+        transform cannot be inverted and the raw value is kept."""
+        if lightmap_uv_layer is None:
+            return None
+        su, sv = (tuple(obj["lightmap_scale"]) if "lightmap_scale" in obj else (1.0, 1.0))[:2]
+        bu, bv = (tuple(obj["lightmap_bias"]) if "lightmap_bias" in obj else (0.0, 0.0))[:2]
+        raw_attr = mesh.attributes.get(import_mapgeo.RAW_LIGHTMAP_UV_ATTR)
+        if raw_attr is not None and (raw_attr.domain != 'POINT' or raw_attr.data_type != 'FLOAT2'):
+            raw_attr = None
+        n = len(mesh.vertices)
+        raw = None
+        if raw_attr is not None and len(raw_attr.data) == n:
+            raw = [0.0] * (n * 2)
+            raw_attr.data.foreach_get("vector", raw)
+        n_loops = len(lightmap_uv_layer.data)
+        loop_uv = [0.0] * (n_loops * 2)
+        lightmap_uv_layer.data.foreach_get("uv", loop_uv)
+
+        def _close(a, b):
+            return abs(a - b) <= 1e-5 * max(1.0, abs(a), abs(b))
+
+        out = []
+        for vi in range(n):
+            loops = vert_to_loops.get(vi)
+            if not loops:
+                out.append((raw[vi * 2], raw[vi * 2 + 1]) if raw else (0.0, 0.0))
+                continue
+            li = loops[0]
+            uu, vv = loop_uv[li * 2], loop_uv[li * 2 + 1]
+            atlas_v = 1.0 - vv                      # back to file V orientation
+            if raw:
+                ru, rv = raw[vi * 2], raw[vi * 2 + 1]
+                if _close(ru * su + bu, uu) and _close(rv * sv + bv, atlas_v):
+                    out.append((ru, rv))
+                    continue
+            fu = (uu - bu) / su if su else (raw[vi * 2] if raw else uu)
+            fv = (atlas_v - bv) / sv if sv else (raw[vi * 2 + 1] if raw else atlas_v)
+            out.append((fu, fv))
+        return out
+
     def create_multi_stream_vertex_buffers(self, mesh, obj, stream_elements) -> list:
         """Create multiple vertex buffers for multi-stream vertex layouts.
         
@@ -792,7 +850,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 if vert_idx not in vert_to_loops:
                     vert_to_loops[vert_idx] = []
                 vert_to_loops[vert_idx].append(loop_idx)
-        
+
+        # TEXCOORD7 back in file space (undo the import's BakedLight scale/bias)
+        lightmap_file_uvs = self._lightmap_file_uvs(mesh, obj, lightmap_uv_layer, vert_to_loops)
+
         # Create one VB per stream
         result_vbs = []
         for stream_idx, elem_names in enumerate(stream_elements):
@@ -883,11 +944,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                         else:
                             struct.pack_into(_vec3_pack(fmt), vertex_data, write_pos, 0.0, 0.0, 0.0)
 
-                    elif en == 14:  # TEXCOORD7
-                        if lightmap_uv_layer and vert_idx in vert_to_loops and vert_to_loops[vert_idx]:
-                            loop_idx = vert_to_loops[vert_idx][0]
-                            uv = lightmap_uv_layer.data[loop_idx].uv
-                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, uv[0], 1.0 - uv[1])
+                    elif en == 14:  # TEXCOORD7 (file space, see _lightmap_file_uvs)
+                        if lightmap_file_uvs is not None:
+                            struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos,
+                                             *lightmap_file_uvs[vert_idx])
                         else:
                             struct.pack_into(_vec2_pack(fmt), vertex_data, write_pos, 0.0, 0.0)
 
@@ -1010,7 +1070,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                 if vert_idx not in vert_to_loops:
                     vert_to_loops[vert_idx] = []
                 vert_to_loops[vert_idx].append(loop_idx)
-        
+
+        # TEXCOORD7 back in file space (undo the import's BakedLight scale/bias)
+        lightmap_file_uvs = self._lightmap_file_uvs(mesh, obj, lightmap_uv_layer, vert_to_loops)
+
         # Write vertex data
         for vert_idx, vert in enumerate(mesh.vertices):
             offset = vert_idx * vertex_size
@@ -1076,17 +1139,10 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                                vec[0], vec[2], vec[1])
                 current_offset += 12
             
-            # TEXCOORD7 - lightmap UV
+            # TEXCOORD7 - lightmap UV, in file space (see _lightmap_file_uvs)
             if lightmap_uv_layer:
-                # Get first loop for this vertex
-                if vert_idx in vert_to_loops and len(vert_to_loops[vert_idx]) > 0:
-                    loop_idx = vert_to_loops[vert_idx][0]
-                    uv = lightmap_uv_layer.data[loop_idx].uv
-                    # Flip V coordinate
-                    struct.pack_into('<ff', vertex_data, offset + current_offset,
-                                   uv[0], 1.0 - uv[1])
-                else:
-                    struct.pack_into('<ff', vertex_data, offset + current_offset, 0.0, 0.0)
+                struct.pack_into('<ff', vertex_data, offset + current_offset,
+                               *lightmap_file_uvs[vert_idx])
                 current_offset += 8
         
         return mapgeo_parser.VertexBuffer(
@@ -1288,7 +1344,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
                     # Fallback: use material from first face in this group
                     first_poly = mesh.polygons[poly_indices[0]]
                     mat_idx = first_poly.material_index
-                    mat_name = mesh.materials[mat_idx].name if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
+                    mat_name = _league_material_name(mesh.materials[mat_idx]) if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
                 
                 all_verts = set()
                 for poly_idx in poly_indices:
@@ -1314,7 +1370,7 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
             
             for poly_idx, poly in enumerate(mesh.polygons):
                 mat_idx = poly.material_index
-                mat_name = mesh.materials[mat_idx].name if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
+                mat_name = _league_material_name(mesh.materials[mat_idx]) if mat_idx < len(mesh.materials) and mesh.materials[mat_idx] else "Default"
                 
                 if mat_name not in material_groups:
                     material_groups[mat_name] = []

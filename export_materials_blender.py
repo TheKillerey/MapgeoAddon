@@ -163,7 +163,8 @@ def _convert_blender_to_league(blender_mat: bpy.types.Material) -> Material:
                     texturePath=s.get("texturePath", ""),
                     addressU=s.get("addressU"),
                     addressV=s.get("addressV"),
-                    addressW=s.get("addressW")
+                    addressW=s.get("addressW"),
+                    texturePathType=s.get("texturePathType"),
                 )
                 league_mat.samplerValues.append(sampler)
         except json.JSONDecodeError:

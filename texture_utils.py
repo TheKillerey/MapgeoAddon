@@ -377,6 +377,31 @@ class TexConverter:
         return hdr + pixels
 
 
+def is_tex_file(path: str) -> bool:
+    """True for a Riot .tex texture, by extension or by its 'TEX\\0' magic.
+
+    Unnamed WAD chunks are extracted as raw/<hash>.<ext>, and caches made
+    before the extension sniffing was fixed hold textures as '.dat'."""
+    if not path:
+        return False
+    if path.lower().endswith('.tex'):
+        return True
+    if path.lower().endswith(('.dds', '.png', '.tga', '.jpg', '.jpeg')):
+        return False
+    try:
+        with open(path, 'rb') as f:
+            return f.read(4) == b'TEX\0'
+    except OSError:
+        return False
+
+
+def _find_linked_file(wad_links, link_value, assets_folder, custom_assets_folder, prioritize_custom):
+    """Locate the file for a WAD link by hash in the asset folders (and their raw/)."""
+    folders = [custom_assets_folder, assets_folder] if prioritize_custom \
+        else [assets_folder, custom_assets_folder]
+    return wad_links.find_file_for_link(link_value, [f for f in folders if f])
+
+
 def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_folder: str = "", prioritize_custom: bool = False) -> Optional[str]:
     """
     Resolve a texture path from the materials file.
@@ -393,6 +418,30 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
         Full resolved path to texture file, or None if not found
     """
     original_texture_path = texture_path
+
+    # Since 16.17 texturePath is a WAD chunk link (bin type 18).  An unnamed
+    # link reaches us as "0x" + 16 hex digits: name it through the hash tables,
+    # or find the file by hashing the asset folders' own paths.
+    try:
+        from . import wad_links
+    except ImportError:
+        import wad_links
+    for _f in (assets_folder, custom_assets_folder):
+        wad_links.add_search_root(_f)
+    link_value = None
+    if wad_links.is_link_hex(texture_path):
+        link_value = texture_path
+        named = wad_links.resolve_link(texture_path)
+        if named:
+            texture_path = named
+        else:
+            hit = _find_linked_file(wad_links, link_value, assets_folder,
+                                    custom_assets_folder, prioritize_custom)
+            if hit:
+                _log().info("Texture", f"Resolved link: {original_texture_path}", hit)
+                return hit
+            _log().texture_missing(original_texture_path, "Unresolved WAD link (no hash name, no file with this hash)")
+            return None
 
     # Remove "ASSETS/" prefix if present (case-insensitive — custom maps may use lowercase)
     upper_path = texture_path.upper()
@@ -447,6 +496,14 @@ def resolve_texture_path(texture_path: str, assets_folder: str, custom_assets_fo
                 _log().info("Texture", f"Resolved: {original_texture_path}", test_path)
                 return test_path
     
+    # A named link whose file sits elsewhere (e.g. raw/<hash>.tex) - find it by hash
+    if link_value:
+        hit = _find_linked_file(wad_links, link_value, assets_folder,
+                                custom_assets_folder, prioritize_custom)
+        if hit:
+            _log().info("Texture", f"Resolved link: {original_texture_path}", hit)
+            return hit
+
     tried_str = ", ".join(attempted_paths[:4])
     _log().texture_missing(original_texture_path, f"Tried: {tried_str}")
 

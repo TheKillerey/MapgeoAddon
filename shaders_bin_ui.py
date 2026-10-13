@@ -1,4 +1,4 @@
-"""shaders_bin_ui.py — Experimental Shaders.bin Catalog UI
+r"""shaders_bin_ui.py — Experimental Shaders.bin Catalog UI
 =========================================================
 Blender operators and panel for loading and browsing the Shaders.bin
 catalog.  The catalog provides authoritative shader metadata from the

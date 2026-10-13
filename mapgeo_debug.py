@@ -256,4 +256,5 @@ if __name__ == "__main__":
             print(f"File not found: {path}")
             continue
         out = mapgeo_to_json_file(path)
-        print(f"  {path}  →  {out}")
+        # ASCII only: a Windows cp1252 console cannot print an arrow glyph
+        print(f"  {path}  ->  {out}")

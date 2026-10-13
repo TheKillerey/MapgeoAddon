@@ -218,6 +218,29 @@ def _extract_visibility_controller_layers(materials_path: str) -> dict:
     return layer_map
 
 
+# Per-vertex copy of the file's TEXCOORD7 (lightmap UV) in FILE space.  The
+# "LightmapUV" layer shows rawUV * BakedLight.scale + bias (atlas space); the
+# exporter writes this attribute back for vertices whose LightmapUV is
+# unchanged, and inverts the scale/bias for edited ones.
+RAW_LIGHTMAP_UV_ATTR = "raw_lightmap_uv"
+
+
+def _store_raw_lightmap_uv(bl_mesh, uv_data):
+    """Store TEXCOORD7 as read (u, v) on the mesh's vertices.
+
+    ``uv_data`` entries are (u, 1 - v) as produced by the vertex parser."""
+    n = len(bl_mesh.vertices)
+    flat = [0.0] * (n * 2)
+    for vi in range(min(n, len(uv_data))):
+        u, flipped_v = uv_data[vi]
+        flat[vi * 2] = u
+        flat[vi * 2 + 1] = 1.0 - flipped_v
+    attr = bl_mesh.attributes.get(RAW_LIGHTMAP_UV_ATTR)
+    if attr is None:
+        attr = bl_mesh.attributes.new(name=RAW_LIGHTMAP_UV_ATTR, type='FLOAT2', domain='POINT')
+    attr.data.foreach_set("vector", flat)
+
+
 def _resolve_materials_path(settings, mapgeo_filepath: str = "") -> str:
     """Return the materials file path taking linked-materials mode into account.
 
@@ -994,6 +1017,9 @@ class IMPORT_SCENE_OT_mapgeo(bpy.types.Operator, ImportHelper):
                                         uv_flat[i * 2] = raw_u * lm_scale_u + lm_bias_u
                                         uv_flat[i * 2 + 1] = 1.0 - (orig_v * lm_scale_v + lm_bias_v)
                                 uv_layer.data.foreach_set("uv", uv_flat)
+                                # Keep the file's TEXCOORD7 so export can write it back
+                                # exactly (the LightmapUV layer above is in atlas space)
+                                _store_raw_lightmap_uv(bl_mesh, uv_data)
                             else:
                                 uv_layer = bl_mesh.uv_layers.new(name=f"UVMap{uv_idx}" if uv_idx > 0 else "UVMap")
                                 uv_flat = [0.0] * (n_loops * 2)
@@ -2537,6 +2563,7 @@ def import_filtered_meshes(context, filepath, mesh_filter_fn, collection_suffix=
                                     final_u = raw_u * lm_scale[0] + lm_bias[0]
                                     final_v = orig_v * lm_scale[1] + lm_bias[1]
                                     uv_layer.data[loop_idx].uv = (final_u, 1.0 - final_v)
+                        _store_raw_lightmap_uv(bl_mesh, uv_data)
                     else:
                         uv_layer = bl_mesh.uv_layers.new(name=f"UVMap{uv_idx}" if uv_idx > 0 else "UVMap")
                         for face in bl_mesh.polygons:

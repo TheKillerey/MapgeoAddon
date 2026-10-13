@@ -20,6 +20,17 @@ import json
 import os
 from typing import Optional
 
+try:
+    from . import wad_links
+except ImportError:  # standalone use outside the add-on package
+    import wad_links
+
+# Wire type of StaticMaterialDef.type (materialType) for entries the add-on
+# creates.  Riot's 16.20 materials bins store it as u8 (type 3); older bins used
+# u32 (type 7).  Existing entries keep their own wire type via
+# "_materialTypeWireType".
+_MATERIAL_TYPE_WIRE_TYPE = 3
+
 # ============================================================================
 # Version
 # ============================================================================
@@ -209,9 +220,14 @@ def _bin_material_to_prey(entry: dict) -> dict:
             tn = _efld(flds, 0xb311d4ef)
             if tn is not None:
                 sampler["textureName"] = tn
-            tp = _efld(flds, 0xf0a363e3)
-            if tp is not None:
-                sampler["texturePath"] = tp
+            tp_f = next((f for f in flds
+                         if f.get('name_hash_int', 0) == 0xf0a363e3
+                         or f.get('name_hash') == "0xf0a363e3"), None)
+            if tp_f is not None:
+                # 16.17+: type-18 WAD link -> readable path ("0x%016x" if unnamed);
+                # the wire type is kept so the writer emits the same type.
+                sampler["texturePath"] = wad_links.field_text(tp_f)
+                sampler["texturePathType"] = tp_f.get('type', wad_links.TYPE_STRING)
             au = _efld(flds, 0x111ec6d2)
             if au is not None:
                 sampler["addressU"] = au
@@ -322,6 +338,9 @@ def _bin_material_to_prey(entry: dict) -> dict:
     result["_pathHash"] = entry.get('path_hash', '')
     result["_presentFields"] = _present_fields
     result["_containerTypes"] = _container_types
+    if type_f is not None:
+        # materialType wire type: u32 in older bins, u8 in 16.20 - keep it
+        result["_materialTypeWireType"] = type_f.get('type', 7)
     if raw_extra_fields:
         result["_extraFields"] = raw_extra_fields
 
@@ -349,9 +368,12 @@ def _prey_material_to_bin(mat: dict) -> dict:
     # name (string)
     fields.append(_mkfield(0x8d39bde6, 16, mat["name"]))
 
-    # materialType (u32) — always write if it was present in original
+    # materialType — always write if it was present in original, with the
+    # original's wire type (u8 in current Riot bins, u32 in older ones)
     if f"0x{0x5127f14d:08x}" in present or mat.get("type", 0) != 0:
-        fields.append(_mkfield(0x5127f14d, 7, mat.get("type", 0)))
+        fields.append(_mkfield(0x5127f14d,
+                               mat.get("_materialTypeWireType", _MATERIAL_TYPE_WIRE_TYPE),
+                               mat.get("type", 0)))
 
     # defaultTechnique (string) — write before samplers/techniques to match original field order
     dt_hash = f"0x{0x28da4278:08x}"
@@ -365,7 +387,10 @@ def _prey_material_to_bin(mat: dict) -> dict:
         for s in mat.get("samplers", []):
             sflds = []
             sflds.append(_mkfield(0xb311d4ef, 16, s.get("textureName", "")))
-            sflds.append(_mkfield(0xf0a363e3, 16, s.get("texturePath", "")))
+            # Keep the recorded wire type (18 = WAD link since 16.17)
+            path_type = s.get("texturePathType") or wad_links.NEW_TEXTURE_PATH_TYPE
+            sflds.append(_mkfield(0xf0a363e3, path_type, wad_links.text_to_field_value(
+                path_type, s.get("texturePath", ""))))
             if "addressU" in s:
                 sflds.append(_mkfield(0x111ec6d2, 7, s["addressU"]))
             if "addressV" in s:
@@ -2629,6 +2654,8 @@ def _prey_material_to_db(prey_mat: dict) -> dict:
             'TextureName': s.get('textureName', s.get('TextureName', '')),
             'texturePath': s.get('texturePath', ''),
         }
+        if s.get('texturePathType') is not None:
+            sampler['texturePathType'] = s['texturePathType']
         if 'addressU' in s:
             sampler['addressU'] = s['addressU']
         if 'addressV' in s:
@@ -2902,7 +2929,9 @@ def _extract_old_samplers(entry: dict) -> list:
         #             textureName (0xb311d4ef) has the path
         legacy_name = _get_field_value(flds, _HASH_SAMPLER_NAME_LEGACY)
         texture_name = _get_field_value(flds, _HASH_TEXTURE_NAME)
-        texture_path = _get_field_value(flds, _HASH_TEXTURE_PATH)
+        tp_f = _get_field(flds, _HASH_TEXTURE_PATH)
+        # 16.17+: type-18 WAD link -> readable path ("0x%016x" if unnamed)
+        texture_path = wad_links.field_text(tp_f) if tp_f else None
 
         if legacy_name is not None:
             # Old format: samplerName = semantic, textureName = path
@@ -3194,8 +3223,8 @@ def migrate_material_entry(entry: dict, templates: dict = None,
     # name
     new_fields.append(_mkfield(_HASH_NAME, 16, mat_name))
 
-    # materialType
-    new_fields.append(_mkfield(_HASH_MATERIAL_TYPE, 7, mat_type))
+    # materialType (migrated output targets the current schema)
+    new_fields.append(_mkfield(_HASH_MATERIAL_TYPE, _MATERIAL_TYPE_WIRE_TYPE, mat_type))
 
     # samplerValues
     if merged_samplers:
@@ -3203,7 +3232,11 @@ def migrate_material_entry(entry: dict, templates: dict = None,
         for s in merged_samplers:
             sflds = [
                 _mkfield(_HASH_TEXTURE_NAME, 16, s.get("textureName", "")),
-                _mkfield(_HASH_TEXTURE_PATH, 16, s.get("texturePath", "")),
+                # Migrated output targets the current schema: texturePath is a
+                # WAD link (type 18) since 16.17
+                _mkfield(_HASH_TEXTURE_PATH, wad_links.NEW_TEXTURE_PATH_TYPE,
+                         wad_links.text_to_field_value(wad_links.NEW_TEXTURE_PATH_TYPE,
+                                                       s.get("texturePath", ""))),
             ]
             if s.get("addressU") is not None and s["addressU"] != 1:
                 sflds.append(_mkfield(_HASH_ADDRESS_U, 7, s["addressU"]))

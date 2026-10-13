@@ -9,7 +9,8 @@ import os
 import re
 import bpy
 from typing import Dict, Optional
-from .texture_utils import TexConverter, resolve_texture_path
+from .texture_utils import TexConverter, resolve_texture_path, is_tex_file
+from . import wad_links
 
 
 def _log():
@@ -57,7 +58,10 @@ class MaterialLoader:
         self.tex_converter = TexConverter()
         self.materials_cache = {}  # Cache loaded materials
         self._grass_tint_cache = None  # Cache parsed grass tint info
-    
+        # Asset folders can name type-18 texture links that no hash table knows
+        for folder in (assets_folder, custom_assets_folder):
+            wad_links.add_search_root(folder)
+
     def load_materials(self, file_path: str) -> Dict[str, dict]:
         """
         Load materials from a .materials.bin file.
@@ -385,9 +389,11 @@ class MaterialLoader:
                         sampler['TextureName'] = tex_name.group(1)
                         sampler['textureName'] = tex_name.group(1)
                     
-                    tex_path = re.search(r'texturePath:\s*string\s*=\s*"([^"]+)"', sampler_body)
-                    if tex_path:
-                        sampler['texturePath'] = tex_path.group(1)
+                    # String before 16.17, "file" (WAD link) since
+                    tex_path = wad_links.parse_text_path_field(sampler_body, 'texturePath')
+                    if tex_path and tex_path[0]:
+                        sampler['texturePath'] = tex_path[0]
+                        sampler['texturePathType'] = tex_path[1]
                     
                     # Parse address modes (0=Repeat/default, 1=Clamp)
                     addr_u = re.search(r'addressU:\s*u32\s*=\s*(\d+)', sampler_body)
@@ -836,7 +842,8 @@ class MaterialLoader:
             # Base grass tint texture
             base_f = _get_field(fields, self._HASH_GRASS_TINT_TEXTURE)
             if base_f:
-                result['base'] = str(base_f.get('value', ''))
+                # 16.17+: a type-18 WAD link (path or "0x%016x" when unnamed)
+                result['base'] = wad_links.field_text(base_f)
                 _log().info("GrassTint", f"Base: {result['base']}")
 
             # Alternate assets (dragon grass tints)
@@ -850,7 +857,7 @@ class MaterialLoader:
                     flag_f = _get_field(alt_fields, self._HASH_VISIBILITY_FLAG_NAME)
                     if tint_f and flag_f:
                         flag_name = str(flag_f.get('value', ''))
-                        tint_path = str(tint_f.get('value', ''))
+                        tint_path = wad_links.field_text(tint_f)
                         if flag_name and tint_path:
                             result['alternates'][flag_name] = tint_path
                             _log().info("GrassTint", f"{flag_name}: {tint_path}")
@@ -899,7 +906,7 @@ class MaterialLoader:
         # Modern Riot bins often store the base tint as an ASSETS path, while
         # older files stored only a filename that lives under levels/.../info.
         if base_name:
-            if str(base_name).upper().startswith('ASSETS/'):
+            if str(base_name).upper().startswith('ASSETS/') or wad_links.is_link_hex(base_name):
                 resolved = self._resolve_assets_path(base_name)
                 if resolved:
                     _log().info("GrassTint", f"Using base ASSETS path: {os.path.basename(resolved)}")
@@ -923,6 +930,12 @@ class MaterialLoader:
             search_roots.extend([self.custom_assets_folder, self.assets_folder])
         else:
             search_roots.extend([self.assets_folder, self.custom_assets_folder])
+
+        if wad_links.is_link_hex(asset_path):
+            # Unnamed WAD link: find the file by hashing the folders' own paths
+            levels = getattr(self, 'levels_folder', '') or ''
+            return wad_links.find_file_for_link(
+                asset_path, [r for r in search_roots + [levels] if r]) or ''
 
         for root in search_roots:
             if not root:
@@ -1202,7 +1215,7 @@ class MaterialLoader:
         
         # Load the image
         try:
-            if new_path.lower().endswith('.tex'):
+            if is_tex_file(new_path):
                 new_img = loader.tex_converter.load_tex_as_blender_image(new_path)
             else:
                 new_img = bpy.data.images.load(new_path, check_existing=True)
@@ -1322,13 +1335,16 @@ class MaterialLoader:
             tex_path = sampler.get('texturePath', '')
             if not tex_name and not tex_path:
                 continue
-            samplers_json.append({
+            entry_json = {
                 "textureName": tex_name,
                 "texturePath": tex_path,
                 "addressU": sampler.get('addressU', 1),
                 "addressV": sampler.get('addressV', 1),
                 "addressW": sampler.get('addressW', 1),
-            })
+            }
+            if sampler.get('texturePathType') is not None:
+                entry_json["texturePathType"] = sampler['texturePathType']
+            samplers_json.append(entry_json)
         bl_mat["samplers"] = json.dumps(samplers_json)
 
         params_json = []
@@ -2229,7 +2245,7 @@ class MaterialLoader:
                 # Load the texture (supports .tex, .dds, .png)
                 if grass_tint_path:
                     try:
-                        if grass_tint_path.lower().endswith('.tex'):
+                        if is_tex_file(grass_tint_path):
                             img = self.tex_converter.load_tex_as_blender_image(grass_tint_path)
                         else:
                             img = bpy.data.images.load(grass_tint_path, check_existing=True)
@@ -3277,7 +3293,7 @@ class MaterialLoader:
         tex_node.extension = extension
         
         try:
-            if full_tex_path.lower().endswith('.tex'):
+            if is_tex_file(full_tex_path):
                 img = self.tex_converter.load_tex_as_blender_image(full_tex_path)
             else:
                 img = bpy.data.images.load(full_tex_path, check_existing=True)
@@ -3330,7 +3346,7 @@ class MaterialLoader:
         
         # Load image
         try:
-            if full_tex_path.lower().endswith('.tex'):
+            if is_tex_file(full_tex_path):
                 img = self.tex_converter.load_tex_as_blender_image(full_tex_path)
             else:
                 img = bpy.data.images.load(full_tex_path, check_existing=True)

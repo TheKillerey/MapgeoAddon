@@ -13,7 +13,7 @@ Supported hash files:
 - hashes.binfields.txt   - Field/property name hashes (e.g. mName, mPath, ...)
 - hashes.binhashes.txt   - General string hashes used in bin values
 - hashes.bintypes.txt    - Class/type hashes (e.g. StaticMaterialDef, ...)
-- hashes.game.txt        - Game string hashes (split into .0 and .1)
+- hashes.game.txt        - Game path hashes (split into .0 ... .8)
 """
 
 import os
@@ -32,10 +32,12 @@ BIN_HASH_FILES = {
     "bintypes":   "hashes.bintypes.txt",
 }
 
-# Additional game string hashes (split into two files due to size)
+# Game path hashes (WAD xxh64), split by CommunityDragon into hashes.game.txt.0..8.
+# Same shard set wad_tool downloads into the same hashes/ folder; a partial set
+# leaves most type-18 links (asset paths since 16.17) unnamed.
+_GAME_HASH_SHARDS = 9
 GAME_HASH_FILES = {
-    "game0": "hashes.game.txt.0",
-    "game1": "hashes.game.txt.1",
+    f"game{i}": f"hashes.game.txt.{i}" for i in range(_GAME_HASH_SHARDS)
 }
 
 # All downloadable hash files
@@ -409,8 +411,16 @@ def resolve(hash_val: int | str) -> str:
             hash_val = int(hash_val, 16)
         except (ValueError, TypeError):
             return ""
-    
-    return _all_hashes.get(hash_val, "")
+
+    name = _all_hashes.get(hash_val, "")
+    if not name and hash_val > 0xFFFFFFFF:
+        # 64-bit WAD path hash (type-18 link): wad_tool's game tables
+        try:
+            from . import wad_links
+        except ImportError:
+            import wad_links
+        name = wad_links.resolve_link(hash_val) or ""
+    return name
 
 
 def resolve_entry(hash_val: int | str) -> str:
@@ -501,7 +511,10 @@ def get_cache_age() -> float | None:
 def _auto_load():
     """Attempt to load cached hashes on module import."""
     if has_cached_hashes():
-        count = load_cached_hashes("all")
+        # Bin names only: the game path tables (hashes.game.txt.0..8, several
+        # hundred MB) are already held by wad_tool and reached through
+        # resolve() -> wad_links, so a second in-memory copy is not loaded here.
+        count = load_cached_hashes("bin")
         if count > 0:
             print(f"[CommunityHashes] Auto-loaded {count} hashes from cache")
 

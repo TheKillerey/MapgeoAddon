@@ -127,6 +127,8 @@ def _store_custom_properties(mat: bpy.types.Material, league_material: Material,
             "addressV": sampler.addressV,
             "addressW": sampler.addressW,
         }
+        if getattr(sampler, "texturePathType", None) is not None:
+            sampler_dict["texturePathType"] = sampler.texturePathType
         samplers_data.append(sampler_dict)
     mat["samplers"] = json.dumps(samplers_data)
     
