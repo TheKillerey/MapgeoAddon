@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### ReyEngine live link (protocol 3)
+- **MapgeoAddon is ReyEngine's Blender add-on** and replaces the old single-file "ReyEngine Bridge".
+  A new **ReyEngine** panel in the LoL Mapgeo tab connects to the map ReyEngine serves
+  (Tools > Blender link), pulls it - meshes with their submesh materials, UV0, LightmapUV +
+  `raw_lightmap_uv`, vertex colour and normals, every material of the materials.bin through
+  `material_loader`, and the textures fetched from ReyEngine's own mounts into a temp cache - and pushes
+  transforms, changed shapes, material assignments and material editor changes back as ReyEngine edits.
+  ReyEngine stays the only writer of the .mapgeo and .materials.bin; nothing is written to its project.
+- `reyengine_link_protocol.py` (wire, no bpy), `reyengine_link.py` (panel and operators),
+  `docs/reyengine-link-protocol.md` (the specification, identical in ReyEngine's repository).
+
 ## [Released]
 
 ## [0.5.0] - 2026-06-14

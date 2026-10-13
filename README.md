@@ -17,6 +17,8 @@ Import, edit, and export League of Legends maps in Blender, including map geomet
 - Edit transforms in Blender and write back to .bin or .prey
 - Project Manager workflow for variant loading and export
 - League Tools suite (Troybin, WAD, SCO/SCB, SKN/SKL, PropertyBin, CFGBin)
+- Live link with ReyEngine: pull the open map with its materials and textures, push transforms, shapes,
+  material assignments and material edits back (see docs/reyengine-link-protocol.md)
 
 ## Credits
 
@@ -98,6 +100,7 @@ Use Project Manager for split-file editing:
     regions, lighting/baking, materials, utilities)
   - Heightmap Baker (heightmap + NavGrid walkability maps)
   - Asset Finder
+  - ReyEngine (live link: Connect, Pull Map, Push Changes - ReyEngine writes the files)
 
 - League Tools tab (file-format editors / utilities):
   - WAD Archive Tool

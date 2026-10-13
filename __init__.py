@@ -62,6 +62,7 @@ from . import (
     utils,
     navgrid,
     heightmap_ui,
+    reyengine_link,
 )
 
 _icon_previews = None
@@ -987,6 +988,12 @@ def register():
     except Exception as e:
         print(f"[Heightmap Baker] Registration failed: {e}")
 
+    # Register the ReyEngine live link panel (LoL Mapgeo > ReyEngine)
+    try:
+        reyengine_link.register()
+    except Exception as e:
+        print(f"[ReyEngine Link] Registration failed: {e}")
+
     # Register mapgeo debug tool
     try:
         mapgeo_debug.register()
@@ -1007,6 +1014,12 @@ def register():
 
 def unregister():
     """Unregister all addon classes and handlers"""
+    # Unregister the ReyEngine live link
+    try:
+        reyengine_link.unregister()
+    except Exception as e:
+        print(f"[ReyEngine Link] Unregister failed: {e}")
+
     # Unregister character bin updater
     try:
         character_bin_updater.unregister()
