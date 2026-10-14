@@ -1264,26 +1264,28 @@ class EXPORT_SCENE_OT_mapgeo(bpy.types.Operator, ExportHelper):
         ]
         
         if mesh.vertices:
-            # Convert local vertex positions to League coords: Blender(X, Y, Z) -> Mapgeo(X, Z, Y)
-            local_positions = []
+            # The bounding box is WORLD space, as Riot's files hold it: every vertex through the mesh
+            # transform, then Blender(X, Y, Z) -> Mapgeo(X, Z, Y). The game culls on this box as stored;
+            # a local-space box on a transformed mesh culls it from the wrong place.
+            mw = obj.matrix_world
+            world_positions = []
             for v in mesh.vertices:
-                local_positions.append((v.co.x, v.co.z, v.co.y))
+                w = mw @ v.co
+                world_positions.append((w.x, w.z, w.y))
             
-            min_x = min(p[0] for p in local_positions)
-            min_y = min(p[1] for p in local_positions)
-            min_z = min(p[2] for p in local_positions)
-            max_x = max(p[0] for p in local_positions)
-            max_y = max(p[1] for p in local_positions)
-            max_z = max(p[2] for p in local_positions)
+            min_x = min(p[0] for p in world_positions)
+            min_y = min(p[1] for p in world_positions)
+            min_z = min(p[2] for p in world_positions)
+            max_x = max(p[0] for p in world_positions)
+            max_y = max(p[1] for p in world_positions)
+            max_z = max(p[2] for p in world_positions)
             
-            # Bounding box in local space (same coordinate space as vertex data).
-            # The game applies the transform_matrix at runtime to get world bounds.
             mesh_entry.bounding_box = mapgeo_parser.BoundingBox(
                 min=(min_x, min_y, min_z),
                 max=(max_x, max_y, max_z)
             )
             
-            # Bounding sphere from local AABB
+            # Bounding sphere from the (world) AABB
             center_x = (min_x + max_x) / 2
             center_y = (min_y + max_y) / 2
             center_z = (min_z + max_z) / 2

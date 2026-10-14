@@ -42,6 +42,8 @@ SUBMESH_MATERIALS_KEY = "rey_submesh_materials"
 SUBMESH_SLOTS_KEY = "rey_submesh_slots"
 MATERIAL_SNAPSHOT_KEY = "rey_link_snapshot"
 MATERIAL_PROPS = ("samplers", "parameters", "switches", "shader_macros")
+GRASS_ATTR = "TEXCOORD5"
+RAW_LIGHTMAP_ATTR = "raw_lightmap_uv"
 
 # Summoner's Rift's dragon layers - what the importer names its layer collections.
 DEFAULT_LAYERS = [("Base", 1), ("Inferno", 2), ("Mountain", 4), ("Ocean", 8),
@@ -352,7 +354,18 @@ def build_object(entry, info, collection, layer_collections, regions_collection,
     colors = entry.get("colors") or ()
     if len(colors) == vertex_count * 4 and face_count:
         attr = mesh.color_attributes.new(name="Color", type="BYTE_COLOR", domain="CORNER")
-        attr.data.foreach_set("color", wire.per_loop(colors, wound, 4))
+        # color_srgb: the bytes as the file holds them, so a push writes back exactly what was pulled
+        attr.data.foreach_set("color_srgb", wire.per_loop(colors, wound, 4))
+
+    # TEXCOORD5, the grass clump pivot of a VertexDeform bush: a position, in the vertices' own space
+    grass = entry.get("grass_pivots") or ()
+    if len(grass) == vertex_count * 3:
+        g = [0.0] * len(grass)
+        g[0::3] = grass[0::3]
+        g[1::3] = grass[2::3]
+        g[2::3] = grass[1::3]
+        attr = mesh.attributes.new(name=GRASS_ATTR, type="FLOAT_VECTOR", domain="POINT")
+        attr.data.foreach_set("vector", g)
 
     mesh.update()
 
@@ -368,7 +381,7 @@ def build_object(entry, info, collection, layer_collections, regions_collection,
     obj = bpy.data.objects.new(entry["name"] or ("mesh_%d" % entry["index"]), mesh)
     obj[INDEX_KEY] = int(entry["index"])
     obj[PIVOT_KEY] = [float(v) for v in entry["pivot"]]
-    obj[SHAPE_KEY] = wire.fingerprint(mesh)
+    obj[SHAPE_KEY] = shape_fingerprint(mesh)
     obj[SUBMESH_MATERIALS_KEY] = json.dumps([s["material"] for s in submeshes])
     obj[SUBMESH_SLOTS_KEY] = json.dumps(submesh_slots)
     if len(submeshes) > 1:
@@ -422,6 +435,9 @@ def pull_map(context, report=None):
         paths = _texture_requests(materials_db, mesh_info.values())
         fetched, missing, total_bytes = fetch_textures(conn, paths, cache_root)
 
+        # the navgrid comes along (protocol 4, shown read-only); a map without one says so
+        nav_header, nav_body = conn.request({"op": "navgrid"}, want_body=True)
+
     for note in header.get("notes", []):
         if report:
             report({"WARNING"}, "ReyEngine: %s" % note)
@@ -466,6 +482,17 @@ def pull_map(context, report=None):
     finally:
         wm.progress_end()
 
+    nav_stats = {}
+    if nav_header.get("found"):
+        from . import reyengine_link_navgrid as nav
+        nav.build_navgrid(context, nav_header, nav_body, root)   # shown as ReyEngine shows it right now
+        nav_stats["navgrid"] = "%dx%d cells, %d layer(s) (%s)" % (nav_header["count_x"], nav_header["count_z"],
+                                                                  len(nav_header.get("layers") or []),
+                                                                  nav_header.get("path", ""))
+    else:
+        nav_stats["navgrid"] = nav_header.get("message") or "the map has no navgrid"
+    s.navgrid_status = nav_stats["navgrid"]
+
     # every map material exists in Blender, so any can be assigned to a slot
     for name in materials_db:
         _material_for(loader, materials_db, name, {}, lightmap_scale, material_cache)
@@ -483,6 +510,7 @@ def pull_map(context, report=None):
         "images": images_with_data,
         "seconds": round(time.time() - started, 1),
         "root": root_name, "cache": cache_root,
+        "navgrid": nav_stats["navgrid"],
     }
     s.last_pull = json.dumps(stats)
     s.map_name = info.get("map", "")
@@ -572,12 +600,27 @@ def material_changes(materials, owners=None):
     return edits, notes
 
 
+def shape_fingerprint(mesh):
+    """Coordinates, topology AND each face's material slot: moving faces from one material to another is a
+    change of the mesh (its submeshes), even when no vertex moved."""
+    import struct
+    import zlib
+    mats = [0] * len(mesh.polygons)
+    mesh.polygons.foreach_get("material_index", mats)
+    return "%s:%d" % (wire.fingerprint(mesh), zlib.crc32(struct.pack("<%di" % len(mats), *mats)))
+
+
 def has_changed_shape(obj):
     if SHAPE_KEY not in obj:
         return True
     if len(obj.modifiers) > 0:
         return True
-    return wire.fingerprint(obj.data) != str(obj[SHAPE_KEY])
+    stored = str(obj[SHAPE_KEY])
+    if ":" not in stored:
+        # a .blend pulled with protocol 3 stored the geometry signature alone: compare just that part,
+        # or every mesh of an old file would read as changed (and be pushed as a reshape)
+        return wire.fingerprint(obj.data) != stored
+    return shape_fingerprint(obj.data) != stored
 
 
 def mesh_to_league(obj):
@@ -606,24 +649,69 @@ def mesh_to_league(obj):
         if uv_layer:
             uv_layer.data.foreach_get("uv", loop_uv)
 
+        # the channels a reshape keeps (M842): raw lightmap UV and grass pivot per vertex, colour per corner
+        raw_lm = None
+        attr = mesh.attributes.get(RAW_LIGHTMAP_ATTR)
+        if attr is not None and attr.domain == "POINT" and attr.data_type == "FLOAT2":
+            raw_lm = [0.0] * (vertex_count * 2)
+            attr.data.foreach_get("vector", raw_lm)
+        grass = None
+        attr = mesh.attributes.get(GRASS_ATTR)
+        if attr is not None and attr.domain == "POINT" and attr.data_type == "FLOAT_VECTOR":
+            grass = [0.0] * (vertex_count * 3)
+            attr.data.foreach_get("vector", grass)
+        loop_col = None
+        col_attr = mesh.color_attributes.get("Color")
+        if col_attr is not None and col_attr.domain == "CORNER":
+            loop_col = [0.0] * (loop_count * 4)
+            col_attr.data.foreach_get("color_srgb" if col_attr.data_type == "BYTE_COLOR" else "color", loop_col)
+
         cx, cy, cz = wire.to_league_axes(co)
         nx, ny, nz = wire.to_league_axes(no)
+        if grass is not None:
+            gx, gy, gz = wire.to_league_axes(grass)
         unique = {}
-        positions, normals, uvs, indices = [], [], [], []
-        for loop_index in wire.reverse_winding(tri_loops):
-            v = loop_vertex[loop_index]
-            u, w = loop_uv[loop_index * 2], 1.0 - loop_uv[loop_index * 2 + 1]
-            key = (v, round(u, 6), round(w, 6))
-            at = unique.get(key)
-            if at is None:
-                at = len(positions) // 3
-                unique[key] = at
-                positions += (cx[v], cy[v], cz[v])
-                normals += (nx[v], ny[v], nz[v])
-                uvs += (u, w)
-            indices.append(at)
+        positions, normals, uvs, lightmap, colors, pivots = [], [], [], [], [], []
+        by_material = {}
+        wound = wire.reverse_winding(tri_loops)
+        for t in range(tri_count):
+            tri = []
+            for loop_index in wound[t * 3:t * 3 + 3]:
+                v = loop_vertex[loop_index]
+                u, w = loop_uv[loop_index * 2], 1.0 - loop_uv[loop_index * 2 + 1]
+                c = tuple(round(x, 4) for x in loop_col[loop_index * 4:loop_index * 4 + 4]) if loop_col else ()
+                # a vertex with two UVs (or two corner colours) has to become two vertices
+                key = (v, round(u, 6), round(w, 6), c)
+                at = unique.get(key)
+                if at is None:
+                    at = len(positions) // 3
+                    unique[key] = at
+                    positions += (cx[v], cy[v], cz[v])
+                    normals += (nx[v], ny[v], nz[v])
+                    uvs += (u, w)
+                    if raw_lm is not None:
+                        lightmap += (raw_lm[v * 2], raw_lm[v * 2 + 1])
+                    if loop_col:
+                        colors += c
+                    if grass is not None:
+                        if gx[v] == 0.0 and gy[v] == 0.0 and gz[v] == 0.0:
+                            # a vertex added in Blender has no pivot (the attribute defaults to zero, the
+                            # object origin): it becomes its own pivot, as ReyEngine reads a missing one
+                            pivots += (cx[v], cy[v], cz[v])
+                        else:
+                            pivots += (gx[v], gy[v], gz[v])
+                tri.append(at)
+            by_material.setdefault(tri_material[t], []).extend(tri)
+
+        indices, submeshes = [], []
+        for slot in sorted(by_material):
+            submeshes.append({"slot": slot, "start": len(indices), "count": len(by_material[slot])})
+            indices += by_material[slot]
         return {"positions": positions, "normals": normals, "uvs": uvs, "indices": indices,
-                "materials": sorted(set(tri_material))}
+                "lightmap_uvs": lightmap if raw_lm is not None else [],
+                "colors": colors if loop_col else [],
+                "grass_pivots": pivots if grass is not None else [],
+                "submeshes": submeshes, "materials": sorted(by_material)}
     finally:
         evaluated.to_mesh_clear()
 
@@ -693,9 +781,18 @@ def push_changes(context, transforms=True, materials=True, geometry=True, select
                 shape = mesh_to_league(o)
                 if shape is None:
                     continue
-                if len(shape["materials"]) > 1:
-                    stats["refused"].append("shape: %s uses %d materials - ReyEngine reshapes one-material meshes only"
-                                            % (o.name, len(shape["materials"])))
+                # one submesh per material slot the faces use, named by the slot's ReyEngine material
+                named, bad = [], None
+                for sub in shape["submeshes"]:
+                    mat = o.material_slots[sub["slot"]].material if sub["slot"] < len(o.material_slots) else None
+                    league = _league_name(mat) if mat is not None and "league_material_name" in mat else None
+                    if league is None:
+                        bad = "faces use slot %d (%s), which holds no ReyEngine material" % (
+                            sub["slot"], mat.name if mat is not None else "empty")
+                        break
+                    named.append({"material": league, "start": sub["start"], "count": sub["count"]})
+                if bad:
+                    stats["refused"].append("shape: %s - %s" % (o.name, bad))
                     continue
                 if len(shape["positions"]) // 3 > wire.MAX_VERTICES_PER_MESH:
                     stats["refused"].append("shape: %s has %d vertices after splitting seams - the limit is %d (16-bit "
@@ -706,7 +803,9 @@ def push_changes(context, transforms=True, materials=True, geometry=True, select
                                 "pivot": (0.0, 0.0, 0.0), "location": (0.0, 0.0, 0.0),
                                 "rotation": (0.0, 0.0, 0.0), "scale": (1.0, 1.0, 1.0),
                                 "positions": shape["positions"], "normals": shape["normals"],
-                                "uvs": shape["uvs"], "indices": shape["indices"]})
+                                "uvs": shape["uvs"], "indices": shape["indices"],
+                                "lightmap_uvs": shape["lightmap_uvs"], "colors": shape["colors"],
+                                "grass_pivots": shape["grass_pivots"], "submeshes": named})
                 pushed.append(o)
             if entries:
                 body = wire.encode_meshes(entries)
@@ -718,9 +817,10 @@ def push_changes(context, transforms=True, materials=True, geometry=True, select
                 # only what ReyEngine queued counts as sent; a refused shape stays "changed" and is sent again
                 for i, o in enumerate(pushed):
                     if i not in refused_index:
-                        o[SHAPE_KEY] = wire.fingerprint(o.data)
+                        o[SHAPE_KEY] = shape_fingerprint(o.data)
 
     s.last_push = json.dumps(stats)
+    s.last_refused = json.dumps(stats["refused"])
     _log("pushed %(transforms)d transform(s), %(assignments)d assignment(s), %(material_edits)d material edit(s), "
          "%(geometry)d shape(s)" % stats)
     for line in stats["refused"] + stats["notes"]:
@@ -811,11 +911,21 @@ class MAPGEO_OT_rey_link_push(bpy.types.Operator):
         except (wire.LinkError, OSError, ValueError) as ex:
             self.report({"ERROR"}, "ReyEngine: %s" % ex)
             return {"CANCELLED"}
-        for line in stats["refused"][:5]:
-            self.report({"WARNING"}, "ReyEngine refused %s" % line)
-        self.report({"INFO"}, "ReyEngine: %d transform(s), %d assignment(s), %d material edit(s), %d shape(s)"
-                    % (stats["transforms"], stats["assignments"], stats["material_edits"], stats["geometry"]))
+        summary = ("ReyEngine: %d transform(s), %d assignment(s), %d material edit(s), %d shape(s)"
+                   % (stats["transforms"], stats["assignments"], stats["material_edits"], stats["geometry"]))
+        if stats["refused"]:
+            # one WARNING with every reason (Blender shows the latest report in the status bar, the full text in
+            # the Info editor), and the list stays in the ReyEngine panel until the next push
+            self.report({"WARNING"}, "ReyEngine refused %d item(s):\n%s" % (len(stats["refused"]), "\n".join(stats["refused"][:30])))
+            self.report({"WARNING"}, "%s - %d REFUSED, see the ReyEngine panel" % (summary, len(stats["refused"])))
+        else:
+            self.report({"INFO"}, summary)
         return {"FINISHED"}
+
+
+def _navgrid_show_update(self, context):
+    from . import reyengine_link_navgrid as nav
+    nav.master_update(self, context)
 
 
 class ReyEngineLinkSettings(bpy.types.PropertyGroup):
@@ -833,6 +943,12 @@ class ReyEngineLinkSettings(bpy.types.PropertyGroup):
     read_only: StringProperty(default="")
     last_pull: StringProperty(default="")
     last_push: StringProperty(default="")
+    last_refused: StringProperty(default="")
+    navgrid_status: StringProperty(default="")
+    navgrid_show: BoolProperty(
+        name="Show NavGrid", default=False,
+        update=_navgrid_show_update,
+        description="Show the pulled navgrid (ReyEngine's navgrid overlay switch); the layers below choose what")
 
 
 class MAPGEO_PT_reyengine_link(bpy.types.Panel):
@@ -880,20 +996,55 @@ class MAPGEO_PT_reyengine_link(bpy.types.Panel):
                              % (p["meshes"], p["materials"], p["textures_received"], p["textures_requested"]))
             except (ValueError, KeyError):
                 pass
+        try:
+            refused = json.loads(s.last_refused) if s.last_refused else []
+        except ValueError:
+            refused = []
+        if refused:
+            box = layout.box()
+            row = box.row()
+            row.alert = True
+            row.label(text="%d refused by the last push:" % len(refused), icon="ERROR")
+            row.operator("mapgeo.rey_link_clear_refused", text="", icon="X")
+            for line in refused[:12]:
+                box.label(text=line)
+            if len(refused) > 12:
+                box.label(text="... and %d more (Info editor)" % (len(refused) - 12))
+
+        from . import reyengine_link_navgrid as nav
+        nav.draw_panel(layout, context, s)
         layout.label(text="ReyEngine writes the files; Save there.", icon="INFO")
 
 
+class MAPGEO_OT_rey_link_clear_refused(bpy.types.Operator):
+    bl_idname = "mapgeo.rey_link_clear_refused"
+    bl_label = "Clear Refusals"
+    bl_description = "Hide the list of what ReyEngine refused in the last push"
+
+    def execute(self, context):
+        _settings(context).last_refused = ""
+        return {"FINISHED"}
+
+
 CLASSES = (ReyEngineLinkSettings, MAPGEO_OT_rey_link_connect, MAPGEO_OT_rey_link_disconnect,
-           MAPGEO_OT_rey_link_pull, MAPGEO_OT_rey_link_push, MAPGEO_PT_reyengine_link)
+           MAPGEO_OT_rey_link_pull, MAPGEO_OT_rey_link_push, MAPGEO_OT_rey_link_clear_refused,
+           MAPGEO_PT_reyengine_link)
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    from . import reyengine_link_navgrid as nav
+    nav.register()
     bpy.types.Scene.reyengine_link = bpy.props.PointerProperty(type=ReyEngineLinkSettings)
 
 
 def unregister():
+    try:
+        from . import reyengine_link_navgrid as nav
+        nav.unregister()
+    except Exception:
+        pass
     try:
         del bpy.types.Scene.reyengine_link
     except AttributeError:

@@ -22,7 +22,7 @@ import socket
 import struct
 import zlib
 
-PROTOCOL = 3
+PROTOCOL = 4
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 47800
 MAX_HEADER_BYTES = 16 * 1024 * 1024
@@ -161,7 +161,7 @@ def encode_meshes(entries):
     """Pack meshes into the protocol 3 mesh block (what ``push_geometry`` carries).
 
     Per mesh: name, index, pivot, location, rotation, scale, then positions,
-    normals, uvs, lightmap uvs, colours and indices (each length-prefixed), then
+    normals, uvs, lightmap uvs, colours, grass pivots (protocol 4) and indices (each length-prefixed), then
     the submesh table (material, start index, index count).
     """
     out = bytearray()
@@ -176,6 +176,7 @@ def encode_meshes(entries):
         out += _pack_floats(e.get("uvs"))
         out += _pack_floats(e.get("lightmap_uvs"))
         out += _pack_floats(e.get("colors"))
+        out += _pack_floats(e.get("grass_pivots"))
         indices = list(e.get("indices") or ())
         out += struct.pack("<i", len(indices)) + struct.pack("<%dI" % len(indices), *indices)
         submeshes = e.get("submeshes") or ()
@@ -225,6 +226,7 @@ def decode_meshes(body):
         uvs = floats(i32())
         lightmap = floats(i32())
         colors = floats(i32())
+        grass = floats(i32())
         index_count = i32()
         indices = struct.unpack_from("<%dI" % index_count, body, at)
         at += 4 * index_count
@@ -238,7 +240,7 @@ def decode_meshes(body):
             "name": name, "index": index, "pivot": pivot,
             "location": location, "rotation": rotation, "scale": scale,
             "positions": positions, "normals": normals, "uvs": uvs,
-            "lightmap_uvs": lightmap, "colors": colors,
+            "lightmap_uvs": lightmap, "colors": colors, "grass_pivots": grass,
             "indices": indices, "submeshes": submeshes,
         })
     if at != len(body):

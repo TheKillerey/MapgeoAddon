@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ReyEngine live link, protocol 4
+- Shape pushes keep the raw lightmap UV, the vertex colour and the bush pivot (TEXCOORD5), carry one submesh
+  per material slot, and notice faces moved between material slots. ReyEngine gives an instanced mesh its own
+  buffers instead of refusing it.
+- Everything ReyEngine refuses is listed in the ReyEngine panel and reported as a warning, per item.
+- NavGrid, shown read-only as ReyEngine's navgrid overlay shows it: one wireframe object per flag layer
+  (ReyEngine sends the layers, labels, colours and which are shown), cells at their height, in front of the
+  map and not selectable; "Show NavGrid" and a switch per layer in the ReyEngine panel. Nothing is sent back.
+- A vertex added to a bush in Blender gets itself as its TEXCOORD5 pivot instead of the object origin.
+- A .blend pulled with protocol 3 no longer reads every mesh as changed (old shape signatures are compared
+  by their geometry part).
+- Export: mesh bounding boxes are written in WORLD space, as Riot's files hold them (they were local, which
+  put the culling box of every transformed mesh in the wrong place).
+
 ### ReyEngine live link (protocol 3)
 - **MapgeoAddon is ReyEngine's Blender add-on** and replaces the old single-file "ReyEngine Bridge".
   A new **ReyEngine** panel in the LoL Mapgeo tab connects to the map ReyEngine serves
