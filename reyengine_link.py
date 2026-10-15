@@ -33,6 +33,8 @@ from bpy.props import BoolProperty, IntProperty, StringProperty
 from mathutils import Euler, Matrix, Vector
 
 from . import reyengine_link_protocol as wire
+from . import reyengine_link_navgrid as _nav_props     # the navgrid's dropdown callbacks (settings below)
+from . import reyengine_link_visibility as _vis_props  # ReyEngine's visibility controls (settings below)
 
 ROOT_PREFIX = "ReyLink"
 INDEX_KEY = "rey_index"
@@ -435,8 +437,15 @@ def pull_map(context, report=None):
         paths = _texture_requests(materials_db, mesh_info.values())
         fetched, missing, total_bytes = fetch_textures(conn, paths, cache_root)
 
-        # the navgrid comes along (protocol 4, shown read-only); a map without one says so
+        # the navgrid comes along (protocol 4, shown read-only); a map without one says so.  Its variants (every
+        # grid and state overlay of the map) fill the dropdowns, which start on what ReyEngine shows right now
         nav_header, nav_body = conn.request({"op": "navgrid"}, want_body=True)
+        # optional: a failure here must not abort the pull (an older ReyEngine answers an unknown op with an error)
+        try:
+            nav_variants, _ = conn.request({"op": "navgrid_variants"})
+        except wire.LinkError as ex:
+            nav_variants = {}
+            _log("navgrid variants unavailable: %s" % ex)
 
     for note in header.get("notes", []):
         if report:
@@ -481,6 +490,21 @@ def pull_map(context, report=None):
                 wm.progress_update(at)
     finally:
         wm.progress_end()
+
+    # ReyEngine's visibility: its controls and its current selection; the meshes it hides are hidden here
+    if header.get("visibility") and header["visibility"].get("found", True):
+        from . import reyengine_link_visibility as vis
+        try:
+            vis.apply_model(s, header["visibility"])
+            shown = len(header["visibility"].get("visible") or [])
+            s.vis_status = "%d of %d meshes drawn (as ReyEngine draws them)" % (shown, len(meshes))
+        except Exception as ex:  # the controls are optional; the pull stands
+            s.vis_status = "Visibility controls unavailable: %s" % ex
+    else:
+        s.vis_status = "ReyEngine sent no visibility model: the controls are unavailable."
+    if nav_variants.get("found"):
+        from . import reyengine_link_navgrid as nav_vars
+        nav_vars.apply_variants(s, nav_variants)
 
     nav_stats = {}
     if nav_header.get("found"):
@@ -945,6 +969,24 @@ class ReyEngineLinkSettings(bpy.types.PropertyGroup):
     last_push: StringProperty(default="")
     last_refused: StringProperty(default="")
     navgrid_status: StringProperty(default="")
+    # protocol 4: ReyEngine's visibility controls (reyengine_link_visibility) and the navgrid's variant lists
+    vis_axes: bpy.props.CollectionProperty(type=_vis_props.ReyVisAxis)
+    vis_events: bpy.props.CollectionProperty(type=_vis_props.ReyVisEvent)
+    vis_regions: BoolProperty(name="Render regions", default=False, update=_vis_props._changed,
+                              description="Show the meshes that belong to a render region (ReyEngine's Render Regions switch)")
+    vis_regions_available: BoolProperty(default=False)
+    vis_stages_json: StringProperty(default="")
+    vis_stage: bpy.props.EnumProperty(name="Board stage", items=_vis_props._stage_items, update=_vis_props._changed,
+                                      description="A TFT board's stage (ReyEngine's Board stage picker)")
+    vis_status: StringProperty(default="")
+    navgrid_variants_json: StringProperty(default="")
+    navgrid_grid: bpy.props.EnumProperty(
+        name="Grid", items=_nav_props._grid_items, update=_nav_props.variant_changed,
+        description="Every navigation grid this map ships; Base is the one the open geometry plays on")
+    navgrid_overlay: bpy.props.EnumProperty(
+        name="Overlay", items=_nav_props._overlay_items, update=_nav_props.variant_changed,
+        description="A state overlay shown on top of the grid; Auto follows the dragon / baron pit state selected "
+                    "in Visibility")
     navgrid_show: BoolProperty(
         name="Show NavGrid", default=False,
         update=_navgrid_show_update,
@@ -1011,6 +1053,8 @@ class MAPGEO_PT_reyengine_link(bpy.types.Panel):
             if len(refused) > 12:
                 box.label(text="... and %d more (Info editor)" % (len(refused) - 12))
 
+        from . import reyengine_link_visibility as vis
+        vis.draw_panel(layout, context, s)
         from . import reyengine_link_navgrid as nav
         nav.draw_panel(layout, context, s)
         layout.label(text="ReyEngine writes the files; Save there.", icon="INFO")
@@ -1032,6 +1076,7 @@ CLASSES = (ReyEngineLinkSettings, MAPGEO_OT_rey_link_connect, MAPGEO_OT_rey_link
 
 
 def register():
+    _vis_props.register()     # before the settings that hold its property groups
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     from . import reyengine_link_navgrid as nav
@@ -1054,3 +1099,4 @@ def unregister():
             bpy.utils.unregister_class(cls)
         except RuntimeError:
             pass
+    _vis_props.unregister()

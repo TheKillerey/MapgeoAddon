@@ -22,7 +22,7 @@ import socket
 import struct
 import zlib
 
-PROTOCOL = 4
+PROTOCOL = 5
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 47800
 MAX_HEADER_BYTES = 16 * 1024 * 1024

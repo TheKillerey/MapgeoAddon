@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### ReyEngine live link, protocol 4
+- **Visibility mirrors ReyEngine's.** A Visibility section in the ReyEngine panel shows ReyEngine's own controls -
+  Map Visibility (dragon state), Baron Pit, Events, Render regions and, on a TFT board, the Board stage - with the
+  option lists, labels and defaults ReyEngine sends. Changing one asks ReyEngine which meshes are drawn
+  (`visibility_eval`, ReyEngine's own function: layer bits, controllers that override them, events, render
+  regions) and hides the rest with hide_viewport / hide_render, so Blender cannot show a mesh ReyEngine hides.
+  The layer collections stay as an outline. "Sync from ReyEngine" adopts ReyEngine's current selection, and a
+  pull applies it.
+- **NavGrid variants.** A map ships several navigation grids and state overlays. Grid and Overlay dropdowns in the
+  NavGrid section list them (`navgrid_variants`) with ReyEngine's labels ("Dragon: Ocean", "Baron: Cup", ...) and
+  reload the layers for the choice. With the overlay on Auto, picking a dragon or baron pit state in Visibility
+  loads the overlay of the same name. Read-only, as before.
 - Shape pushes keep the raw lightmap UV, the vertex colour and the bush pivot (TEXCOORD5), carry one submesh
   per material slot, and notice faces moved between material slots. ReyEngine gives an instanced mesh its own
   buffers instead of refusing it.
