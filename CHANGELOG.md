@@ -47,6 +47,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Released]
 
+## [0.6.0] - 2026-10-16
+
+The add-on becomes ReyEngine's Blender add-on, and works again on League 16.20
+and Blender 5.1. Needs ReyEngine v0.5.2: the live link refuses other protocol
+versions.
+
+### ReyEngine link (new `ReyEngine` panel)
+- **Connect** to a running ReyEngine (loopback only, with the session code
+  ReyEngine copies to the clipboard) and **Pull** the open map with its
+  materials and textures.
+- **Material edits** (parameters, textures, switches) and **material
+  assignments** go back to ReyEngine, which stays the only program that writes
+  the project's files.
+- **Face edits** go back too, including on instanced meshes. ReyEngine gives the
+  edited mesh its own vertex buffer and keeps its second UV, vertex colours and
+  grass pivots. Refusals are shown in Blender with ReyEngine's reason.
+- **Navgrid** shown the same way as ReyEngine's overlay (view only), with
+  **Grid** and **Overlay** pickers for the map's grids and its dragon and Baron
+  state overlays. Auto follows the visibility choices.
+- **Visibility** section that mirrors ReyEngine's rules: Map Visibility, Baron
+  pit, events and render regions, plus **Sync from ReyEngine**.
+
+### League 16.20 / Blender 5.1
+- Texture paths stored as 64-bit WAD chunk links are resolved (new
+  `wad_links.py`).
+- The lightmap UV round trip no longer transforms the UVs twice.
+- `XYZ_PACKED161616` vertices are 8 bytes; the material type is read as a byte.
+- Exported meshes write world-space bounding boxes, as Riot's do.
+
 ## [0.5.0] - 2026-06-14
 
 A clean-up release: import/export verified across versions, the sidebar
